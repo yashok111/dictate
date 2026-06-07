@@ -2,72 +2,81 @@
 #
 # Copy this to ~/.config/whisper/dictionary.txt and edit. The daemon reads it once at
 # startup and seeds whisper's decoder with these words, raising recognition of YOUR
-# vocabulary — names, tech terms, English words spoken inside Russian — without changing
-# the model. Re-read requires a daemon restart:
+# vocabulary without changing the model. Re-read requires a daemon restart:
 #     launchctl kickstart -k gui/$(id -u)/com.user.dictate
+#
+# WHAT TO PUT HERE (highest value first — a tight, targeted list beats a long generic one):
+#   1. ACTION VERBS / workflow words you say all day inside Russian — their English roots
+#      get transliterated wrong ("закоммить", "отрефактори", "задеплой"), so biasing toward
+#      the English form fixes them. This is usually the biggest win.
+#   2. Proper nouns whisper mangles — names of people, YOUR projects, rare libraries/tools.
+#   3. English-in-Russian jargon you use a lot (prompt, endpoint, callback, async…).
+# What NOT to bother with: common framework/tool names you rarely misdictate, and generic
+# words whisper already nails. A name only earns a slot if whisper actually gets it wrong.
 #
 # Format:
 #   • one word or short phrase per line; ORDER = PRIORITY (most important first — if the
-#     ~224-token budget overflows, the earliest lines win and the rest are dropped).
+#     budget overflows, the earliest lines win and the rest are dropped).
 #   • '#' starts a comment to end of line, but only at line start or after a space, so a
 #     term like  C#  or  F#  is kept verbatim.
 #   • blank lines are ignored; exact duplicates are dropped (first one kept).
 #
-# Keep it SHORT and high-value: rare/problematic words you actually say. A long or
-# sentence-like dictionary makes the turbo model loop (project gotcha #11) — list words,
-# not prose. Toggle off with WHISPER_PROMPT=0; override the path with WHISPER_DICT, and
-# the token budget with WHISPER_PROMPT_MAXTOK.
+# Budget: the prompt is capped at ~224 tokens (a long/prose-like prompt makes the turbo
+# model loop — project gotcha #11/#21), so keep it a SHORT comma-list of words, not prose.
+# The per-entry budget estimate (src/dictate_dict.h) leans HIGH on purpose, so the real
+# whisper token count sits well under 224. If you want more entries, raise the cap via the
+# WHISPER_PROMPT_MAXTOK env (set it in the LaunchAgent plist's EnvironmentVariables) and
+# watch the daemon's logged "~N tok" — keep it near 224, not far above. Toggle the whole
+# feature off with WHISPER_PROMPT=0; override the path with WHISPER_DICT.
 #
-# This is a TEMPLATE of common-case examples. Put YOUR most frequent / most-often-misheard
-# words at the TOP and delete the rest — a tight list of words you actually say beats a
-# long generic one.
+# Below is an ILLUSTRATIVE template — replace with the words YOU actually say.
 
-# ── names: people / projects / companies you say often ───────────────────────
-#   (placeholders — replace with your own; whisper mangles unfamiliar proper nouns most)
+# ── names: people / projects you say often (replace these placeholders) ──────
+#   whisper mangles unfamiliar proper nouns most — put your real ones here, at the top
 Иван
 Петров
+my-project-name
 
-# ── DevOps / infra ───────────────────────────────────────────────────────────
-Kubernetes
-Docker
-Nginx
-Prometheus
-Grafana
-Terraform
-Kafka
-
-# ── languages / frameworks ───────────────────────────────────────────────────
-TypeScript
-Rust
-Golang
-Python
-React
-Next.js
-C#
-
-# ── databases / data ─────────────────────────────────────────────────────────
-PostgreSQL
-Redis
-SQLite
-ClickHouse
-
-# ── cloud / protocols / formats ──────────────────────────────────────────────
-gRPC
-GraphQL
-WebSocket
-OAuth
-JSON
-YAML
-
-# ── dev workflow (English words spoken inside Russian) ───────────────────────
-deploy
-rollback
+# ── action verbs (English roots spoken inside Russian — usually the biggest win) ──
 commit
 merge
-pull request
-code review
+rebase
+revert
 refactor
+debug
+deploy
+rollback
+build
+compile
+lint
+format
+review
+test
+implement
+optimize
+
+# ── workflow / dev jargon (English-in-Russian) ──────────────────────────────
+prompt
+context
 endpoint
-middleware
-latency
-throughput
+callback
+async
+await
+component
+props
+function
+
+# ── git / VCS ─────────────────────────────────────────────────────────────────
+diff
+push
+pull request
+PR
+stash
+checkout
+
+# ── only-if-you-misdictate-them: languages / libraries / tools ───────────────
+#   keep these ONLY if whisper actually gets them wrong for you — otherwise delete
+TypeScript
+PostgreSQL
+gRPC
+C#
