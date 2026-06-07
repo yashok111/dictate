@@ -1,0 +1,16 @@
+/dictate
+/dictate-tsan
+/dictate-asan
+/tests/run
+*.o
+*.dSYM/
+*.wav
+*.aiff
+
+# local working docs (plans/specs/research) — not published
+/docs/
+
+# third-party agent skills installed via scripts/install-skills.sh
+# (skills-lock.json IS committed; .claude/skills/ is repopulated from the lockfile).
+# If you hand-write a project skill, carve it out, e.g. !.claude/skills/my-skill/
+.claude/skills/

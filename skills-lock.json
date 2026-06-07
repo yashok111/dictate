@@ -1,0 +1,227 @@
+{
+  "version": 1,
+  "skills": {
+    "Objective-C ARC Patterns": {
+      "source": "thebushidocollective/han",
+      "sourceType": "github",
+      "skillPath": "plugins/languages/objective-c/skills/objc-arc-patterns/SKILL.md",
+      "computedHash": "690121e0d281173992137276e5c67c066c3a2bafaef6eaf125f382683721c1c5"
+    },
+    "Objective-C Blocks and GCD": {
+      "source": "thebushidocollective/han",
+      "sourceType": "github",
+      "skillPath": "plugins/languages/objective-c/skills/objc-blocks-gcd/SKILL.md",
+      "computedHash": "79ade3ea28fff0299aa7289fb25189a8f02ffbc066328f92519c19cb4cc9e981"
+    },
+    "Objective-C Protocols and Categories": {
+      "source": "thebushidocollective/han",
+      "sourceType": "github",
+      "skillPath": "plugins/languages/objective-c/skills/objc-protocols-categories/SKILL.md",
+      "computedHash": "2f637a4c8d89682e2f251a5e8accde2b3de72c5e3ae36033c83f2754c885663b"
+    },
+    "brainstorming": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "skillPath": "skills/brainstorming/SKILL.md",
+      "computedHash": "8df9b47092524833138b58682d03f2e153a242e550d1693657afdbee0cc9cdb0"
+    },
+    "build-acceleration": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/build-systems/build-acceleration/SKILL.md",
+      "computedHash": "c93105065a73e1043091d263d6cc81d37eb2a316ba0949131ec3c9de4d6bb010"
+    },
+    "c-memory-management": {
+      "source": "thebushidocollective/han",
+      "sourceType": "github",
+      "skillPath": "plugins/languages/c/skills/c-memory-management/SKILL.md",
+      "computedHash": "56b7c796d8475925fd7d414c0f39960b13de0f0ea54ae44ca252ea424ebe6cdb"
+    },
+    "c-systems-programming": {
+      "source": "thebushidocollective/han",
+      "sourceType": "github",
+      "skillPath": "plugins/languages/c/skills/c-systems-programming/SKILL.md",
+      "computedHash": "b94317463048c9b35768dbcb63065c715ff2ecf9ebcea5c063fc9cf4c526239c"
+    },
+    "clang": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/compilers/clang/SKILL.md",
+      "computedHash": "7a585a4af02b439314efb24dae5e44efee7e09a8c9872b8fa1df129c12632251"
+    },
+    "cmake": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/build-systems/cmake/SKILL.md",
+      "computedHash": "ca5d2b6e4df8cc503ac624a44d61bf5d823abba1eb1fbc0de0d6969eba351db6"
+    },
+    "codebase-onboarding": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/codebase-onboarding/SKILL.md",
+      "computedHash": "ab347207dc6d26c7489ba382aa25a1430c7d07321c75dbe69f2617f33ea3c893"
+    },
+    "concurrency-debugging": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/debuggers/concurrency-debugging/SKILL.md",
+      "computedHash": "c1f6fef68c52b40e4c035ec359d2a7728d29e1ff5cd59adfc4ddd060bc48daaf"
+    },
+    "cpp-coding-standards": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/cpp-coding-standards/SKILL.md",
+      "computedHash": "46787c93ed565e48ab670ddbf8204fd144437e66ee9246fa0c651aa7a1f5bf45"
+    },
+    "cpp-modern-features": {
+      "source": "thebushidocollective/han",
+      "sourceType": "github",
+      "skillPath": "plugins/languages/cpp/skills/cpp-modern-features/SKILL.md",
+      "computedHash": "1f0c868b84cfa2f069769cf0b76a15e6a617ded5b0780a09521ab836f33cf845"
+    },
+    "cpp-smart-pointers": {
+      "source": "thebushidocollective/han",
+      "sourceType": "github",
+      "skillPath": "plugins/languages/cpp/skills/cpp-smart-pointers/SKILL.md",
+      "computedHash": "a5cc9fc2bf6e277ac364272206b69b58911307355aaa9cb7e8be3e34019d29b2"
+    },
+    "cpp-templates-metaprogramming": {
+      "source": "thebushidocollective/han",
+      "sourceType": "github",
+      "skillPath": "plugins/languages/cpp/skills/cpp-templates-metaprogramming/SKILL.md",
+      "computedHash": "7579807f2a88ab2f0c11d61cf4de4e8c5fde0d2a6efdb04e4ab700fd193225fd"
+    },
+    "cpp-testing": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/cpp-testing/SKILL.md",
+      "computedHash": "e0050751df5d5a963019856a234aa9adf4aabc244795799ba2afeb72e5608250"
+    },
+    "documentation-lookup": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/documentation-lookup/SKILL.md",
+      "computedHash": "7191a5a017a44a461d9bd0002b4ae85b69ff60858745a18a9b27b4aebf9ac551"
+    },
+    "dynamic-linking": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/binaries/dynamic-linking/SKILL.md",
+      "computedHash": "b1ef5abe3d568aa458ffd87d6130f0d08e7cf06e6d4d3ac127ac28bc491272c9"
+    },
+    "executing-plans": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "skillPath": "skills/executing-plans/SKILL.md",
+      "computedHash": "b41c919caf1bb07fbacb0e29899ac513f9eb11cd4dd695975ad352c2c03cc4d7"
+    },
+    "flamegraphs": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/profilers/flamegraphs/SKILL.md",
+      "computedHash": "1ce56ac9a172cc7dd42c51da8347ec83fef7c336b47fdeca1cae382c881fd92e"
+    },
+    "latency-critical-systems": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/latency-critical-systems/SKILL.md",
+      "computedHash": "dbad9023795049357dc4008b6bda0cd7b3b7a54274031fb609952b55c1af04ac"
+    },
+    "lldb": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/debuggers/lldb/SKILL.md",
+      "computedHash": "805399301b6e51df2c0d05d40c93356c9d746eb3c9a699d273c8c31093bb8c6a"
+    },
+    "make": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/build-systems/make/SKILL.md",
+      "computedHash": "3d636ca3eed2802a3ab4afbcd2f5cbaacc0b5c460cf5ceac2b69e1802b24a908"
+    },
+    "memory-model": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/low-level-programming/memory-model/SKILL.md",
+      "computedHash": "9765d28a57a91092b6fb4f71a90a2302c6e674184d62619bd5b67bfce6459b48"
+    },
+    "receiving-code-review": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "skillPath": "skills/receiving-code-review/SKILL.md",
+      "computedHash": "2760c85d4f4117b0006e7ba755f4bbd61f8f4c185f347999763c97f507274e30"
+    },
+    "requesting-code-review": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "skillPath": "skills/requesting-code-review/SKILL.md",
+      "computedHash": "874f3786b05007a8b4a60452a4cd89b9917c645d34b6b1e40ea05037d12f0e67"
+    },
+    "safety-guard": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/safety-guard/SKILL.md",
+      "computedHash": "c59c7a800f5dfaee0dabeb431782d425abe8d1eaeac46f3ce476e8e3f48455e8"
+    },
+    "sanitizers": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/runtimes/sanitizers/SKILL.md",
+      "computedHash": "ed53e7797677817d7abecbf244a52e1c709d2634573151dd98c4c7cb4e10bcd4"
+    },
+    "search-first": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/search-first/SKILL.md",
+      "computedHash": "a78f8e77d5f8d9cf2a38682f4a707404f56a74e3040af4b090a3a769b3ffff23"
+    },
+    "security-review": {
+      "source": "affaan-m/everything-claude-code",
+      "sourceType": "github",
+      "skillPath": "skills/security-review/SKILL.md",
+      "computedHash": "997a20d294003157511b86c72487c6193c524fb2977677f245e89ccdfc7202be"
+    },
+    "simd-intrinsics": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/low-level-programming/simd-intrinsics/SKILL.md",
+      "computedHash": "8ea3239cbdf4d6fc88f5db6208a1aaca23cac21648fcc3de1f0f144e706deaff"
+    },
+    "skill-creator": {
+      "source": "anthropics/skills",
+      "sourceType": "github",
+      "skillPath": "skills/skill-creator/SKILL.md",
+      "computedHash": "5ea13a6d9f0d4bb694405d79acd00cadec0d21bb138c4dd10fcf3c500cb835c2"
+    },
+    "static-analysis": {
+      "source": "mohitmishra786/low-level-dev-skills",
+      "sourceType": "github",
+      "skillPath": "skills/build-systems/static-analysis/SKILL.md",
+      "computedHash": "5e37d6ae89ce6c66b0010d14f303a88c4df2a1e1f9a603dfbf6442dbf0e100b8"
+    },
+    "systematic-debugging": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "skillPath": "skills/systematic-debugging/SKILL.md",
+      "computedHash": "7246fdd3a795fc3daff0af72044ca99bf836e4e6a46844742858786fdfb86488"
+    },
+    "test-driven-development": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "skillPath": "skills/test-driven-development/SKILL.md",
+      "computedHash": "126f1ebf6ccd414f42544f6e83d8cc5adb089e1108eaffb7c400701e37eecd9f"
+    },
+    "verification-before-completion": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "skillPath": "skills/verification-before-completion/SKILL.md",
+      "computedHash": "9b446f0c7fe1cfb560b1d34439523b1a76d5f177290007b2c053a1c749a4a8ba"
+    },
+    "writing-plans": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "skillPath": "skills/writing-plans/SKILL.md",
+      "computedHash": "2b986445454a025ca2c3839f8a2024747e8cce0517948437232cd113d2719060"
+    }
+  }
+}

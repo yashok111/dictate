@@ -1,0 +1,73 @@
+# dictate — user dictionary for whisper initial_prompt (lexical bias)
+#
+# Copy this to ~/.config/whisper/dictionary.txt and edit. The daemon reads it once at
+# startup and seeds whisper's decoder with these words, raising recognition of YOUR
+# vocabulary — names, tech terms, English words spoken inside Russian — without changing
+# the model. Re-read requires a daemon restart:
+#     launchctl kickstart -k gui/$(id -u)/com.user.dictate
+#
+# Format:
+#   • one word or short phrase per line; ORDER = PRIORITY (most important first — if the
+#     ~224-token budget overflows, the earliest lines win and the rest are dropped).
+#   • '#' starts a comment to end of line, but only at line start or after a space, so a
+#     term like  C#  or  F#  is kept verbatim.
+#   • blank lines are ignored; exact duplicates are dropped (first one kept).
+#
+# Keep it SHORT and high-value: rare/problematic words you actually say. A long or
+# sentence-like dictionary makes the turbo model loop (project gotcha #11) — list words,
+# not prose. Toggle off with WHISPER_PROMPT=0; override the path with WHISPER_DICT, and
+# the token budget with WHISPER_PROMPT_MAXTOK.
+#
+# This is a TEMPLATE of common-case examples. Put YOUR most frequent / most-often-misheard
+# words at the TOP and delete the rest — a tight list of words you actually say beats a
+# long generic one.
+
+# ── names: people / projects / companies you say often ───────────────────────
+#   (placeholders — replace with your own; whisper mangles unfamiliar proper nouns most)
+Иван
+Петров
+
+# ── DevOps / infra ───────────────────────────────────────────────────────────
+Kubernetes
+Docker
+Nginx
+Prometheus
+Grafana
+Terraform
+Kafka
+
+# ── languages / frameworks ───────────────────────────────────────────────────
+TypeScript
+Rust
+Golang
+Python
+React
+Next.js
+C#
+
+# ── databases / data ─────────────────────────────────────────────────────────
+PostgreSQL
+Redis
+SQLite
+ClickHouse
+
+# ── cloud / protocols / formats ──────────────────────────────────────────────
+gRPC
+GraphQL
+WebSocket
+OAuth
+JSON
+YAML
+
+# ── dev workflow (English words spoken inside Russian) ───────────────────────
+deploy
+rollback
+commit
+merge
+pull request
+code review
+refactor
+endpoint
+middleware
+latency
+throughput

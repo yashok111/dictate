@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.dictate</string>
+    <!-- Must live OUTSIDE ~/Documents, ~/Desktop, ~/Downloads: those are TCC-protected,
+         and a launchd-spawned process hangs in dyld trying to open a binary there
+         (see CLAUDE.md gotcha #13). Install the built binary to ~/.local/bin.
+         NOTE: launchd does NOT expand `~`, so this path must be absolute. Replace
+         YOUR_USERNAME with your macOS user — the install step in the README/CLAUDE.md
+         does it for you (`sed "s|/Users/YOUR_USERNAME|$HOME|" …`). -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOUR_USERNAME/.local/bin/dictate</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Free the resident ~573 MB Metal model after this many seconds idle (gotcha #7).
+         0/unset = stay resident. First take after an unload pays a ~600 ms-1 s reload. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DICTATE_IDLE_UNLOAD_SEC</key>
+        <string>300</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/dictate.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/dictate.log</string>
+</dict>
+</plist>
