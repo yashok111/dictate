@@ -137,7 +137,14 @@ the editor supersedes live-preview-during-take.)
 - **`EditorView`** (in `dictate.mm`): tokenizes the transcript into words + gaps; the
   cursor is ON a word (highlighted) or IN a gap (a «] [» caret). ←/→ step words+gaps,
   ↑/↓ jump to the nearest word a line up/down (the view owns its own wrapped layout, so
-  the same geometry drives drawing + line nav). ⏎ or ⌘⇧D accept, Esc cancels. The word
+  the same geometry drives drawing + line nav). ⏎ or ⌘⇧D accept, Esc cancels, ⌘Z/⌃Z
+  undo and ⌘⇧Z/⌃⇧Z redo the last content edit (a mini-take splice or a delete — NOT
+  navigation; restores words+cursor+confidence exactly). The two-stack `EditHistory`
+  (pure in `src/dictate_editmodel.h`, unit-tested) holds pre-edit snapshots: each edit
+  (`applyResult:`/`deleteCurrent:`) snapshots BEFORE mutating and `recordEdit`s only if the
+  document actually changed (snapshot compare — no phantom undo on a same-text re-dictation),
+  which also forks the redo stack; undo/redo park the current state on the opposite stack so
+  the pair round-trips losslessly. The word
   body is **clipped to the region between the header and the footer legend and scrolls
   vertically**: navigation/insert auto-scrolls minimally to keep the cursor line on-screen
   (`_followCaret`), the scroll wheel scrolls freely, and a faint right-margin knob shows

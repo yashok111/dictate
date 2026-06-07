@@ -251,6 +251,23 @@ inline std::string em_spoken_punct(const std::string &raw) {
     return "";
 }
 
+// ── undo (voice editor) ───────────────────────────────────────────────────────────────
+// A snapshot of the editor's mutable document — exactly the fields a CONTENT edit changes:
+// the word list, the per-word confidence, and the cursor. Cursor moves (←/→ ↑/↓) are NOT
+// edits and are never snapshotted, so undo reverts content changes (mini-take splices,
+// deletes), not navigation. Pure + unit-tested (gotcha #19).
+struct EditSnapshot {
+    std::vector<std::string> words;
+    std::vector<float>       conf;
+    int                      pos = 0;
+    // Document equality — drives "did this edit actually change anything?" (skip a no-op undo entry).
+    // conf is compared too: re-dictating the SAME text over an uncertain word clears its amber
+    // highlight (conf → EM_CONF_SURE) with words/pos unchanged — a real change that must be undoable.
+    // Exact float compare is right here: conf is copied verbatim or set to exactly EM_CONF_SURE.
+    bool operator==(const EditSnapshot &o) const { return pos == o.pos && words == o.words && conf == o.conf; }
+    bool operator!=(const EditSnapshot &o) const { return !(*this == o); }
+};
+
 // ── the editor's word list + cursor as one value (used by EditorView via NSString↔std::string
 //    bridging at the boundary, and tested directly here) ──
 struct EditModel {
@@ -275,6 +292,10 @@ struct EditModel {
     void stepRight() { pos = em_clamp_step(pos, +1, maxPos()); }
 
     std::string joined() const { return em_join(words); }
+
+    // Capture / restore the document for undo (src/dictate_editmodel.h, EditHistory below).
+    EditSnapshot snapshot() const { return EditSnapshot{words, conf, pos}; }
+    void restore(const EditSnapshot &s) { words = s.words; conf = s.conf; pos = s.pos; }
 
     // Splice already-tokenized words in at the cursor: replace the current word (on a word)
     // or insert at the current gap. Empty → no change. Cursor lands on the first new word.
@@ -362,4 +383,43 @@ struct EditModel {
         int gi = gapIndex(); if (gi >= (int)words.size()) return;  // trailing gap → nothing ahead
         eraseAt(gi);
     }
+};
+
+// Bounded undo/redo history for the editor. `recordEdit(before)` is called by the view on a real
+// content edit: it pushes the PRE-edit snapshot for undo and invalidates the redo stack (a fresh
+// edit forks history). undo()/redo() swap the current document against the top of one stack and
+// park it on the other, so the pair round-trips losslessly. Both stacks are capacity-bounded
+// (oldest dropped) so a long session can't grow without bound. Pure + unit-tested (gotcha #19);
+// EditorView (dictate.mm) owns one and bridges NSArray↔snapshot.
+struct EditHistory {
+    std::vector<EditSnapshot> undoStack;
+    std::vector<EditSnapshot> redoStack;
+    std::size_t cap = 200;                                  // per stack; an editor take is short-lived
+
+    static void boundedPush(std::vector<EditSnapshot> &v, const EditSnapshot &s, std::size_t cap) {
+        v.push_back(s);
+        if (v.size() > cap) v.erase(v.begin());             // drop the oldest beyond the cap
+    }
+    // A real content edit happened: record the pre-edit state for undo, and drop any redo future.
+    void recordEdit(const EditSnapshot &before) { boundedPush(undoStack, before, cap); redoStack.clear(); }
+
+    bool canUndo() const { return !undoStack.empty(); }
+    bool canRedo() const { return !redoStack.empty(); }
+
+    // Undo: return the previous state in `out`, parking `current` on the redo stack. Returns false
+    // (out untouched) when there is nothing to undo. `current` and `out` must NOT alias.
+    bool undo(const EditSnapshot &current, EditSnapshot &out) {
+        if (undoStack.empty()) return false;
+        out = undoStack.back(); undoStack.pop_back();
+        boundedPush(redoStack, current, cap);
+        return true;
+    }
+    // Redo: the inverse — return the next state in `out`, parking `current` back on the undo stack.
+    bool redo(const EditSnapshot &current, EditSnapshot &out) {
+        if (redoStack.empty()) return false;
+        out = redoStack.back(); redoStack.pop_back();
+        boundedPush(undoStack, current, cap);
+        return true;
+    }
+    void clear() { undoStack.clear(); redoStack.clear(); }
 };
