@@ -24,7 +24,8 @@ daemon** keeps the model in GPU memory (no per-take reload) and enables
   `Segmenter` + the VAD tuning constants + cap arithmetic), `dictate_editmodel.h` (editor
   tokenize/cursor/apply + line-nav search), `dictate_authgen.h` (peer-uid + paste-gen checks),
   `dictate_dict.h` (user-dictionary parse + token-budgeted `initial_prompt` build — gotcha #21),
-  `dictate_idle.h` (idle-unload gate + poll-cadence arithmetic — gotcha #7).
+  `dictate_idle.h` (idle-unload gate + poll-cadence arithmetic — gotcha #7),
+  `dictate_edscroll.h` (editor vertical-scroll clamp / cursor-follow arithmetic).
 - `tests/` — doctest unit tests (`tests/doctest.h` vendored; `tests/test_*.cpp`). `make test`.
 - `Makefile` — clang++ build; bakes `-DGGML_LIBEXEC` from `brew --prefix ggml`. Also the
   `test` target (host `c++`, no brew/whisper needed — gotcha #19).
@@ -136,7 +137,13 @@ the editor supersedes live-preview-during-take.)
 - **`EditorView`** (in `dictate.mm`): tokenizes the transcript into words + gaps; the
   cursor is ON a word (highlighted) or IN a gap (a «] [» caret). ←/→ step words+gaps,
   ↑/↓ jump to the nearest word a line up/down (the view owns its own wrapped layout, so
-  the same geometry drives drawing + line nav). ⏎ or ⌘⇧D accept, Esc cancels.
+  the same geometry drives drawing + line nav). ⏎ or ⌘⇧D accept, Esc cancels. The word
+  body is **clipped to the region between the header and the footer legend and scrolls
+  vertically**: navigation/insert auto-scrolls minimally to keep the cursor line on-screen
+  (`_followCaret`), the scroll wheel scrolls freely, and a faint right-margin knob shows
+  position — so a long transcript can't overrun the legend or the window edge. The pure
+  clamp/cursor-follow arithmetic is `ed_scroll_clamp` (`src/dictate_edscroll.h`, unit-tested);
+  the editor window is sized to a screen-fraction (taller than the old fixed 460 px).
 - **Uncertain-word highlight (whisper logprob)**: words whose min per-token confidence
   is below `ED_CONF_THRESHOLD` (0.60) are drawn amber (`ed_conf_color`), leading the eye
   to likely errors. whisper's per-token `p` (`whisper_full_get_token_p`) is pulled in
@@ -228,7 +235,11 @@ the editor supersedes live-preview-during-take.)
    + enqueue). Heavy work (whisper) belongs on the worker. Blocking the tap drops
    audio. `feed()`/`processFrame` only does the VAD RMS + segment buffering + an
    enqueue (a `std::move` of the closed segment under `qmu_`) — no decode, no
-   allocation on the steady-state path (`full_`/`pending_` are pre-`reserve`d).
+   allocation on the steady-state path. ALL tap-path buffers are pre-`reserve`d:
+   `full_`/`pending_`, AND `cur_`/`preroll_`; on segment close `rotateSegment` swaps
+   in a buffer from a worker-recycled pool (`recycle_`, guarded by `qmu_`) instead of
+   re-growing `cur_`, and the `Recorder` tap reuses one `AVAudioPCMBuffer` (`convOut`)
+   across callbacks — so a closed segment costs no heap allocation on the realtime thread.
 
 7. **Resident model = ~573 MB Metal while the daemon runs — by default.** Intentional
    (that's the speed win): the memory is not a leak. Opt OUT with **idle-unload**:

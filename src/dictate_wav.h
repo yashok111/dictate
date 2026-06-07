@@ -30,21 +30,22 @@ inline bool load_wav_pcm16(const char *path, std::vector<float> &out, uint32_t *
         char id[4]; uint32_t csz;
         if (fread(id,1,4,f)!=4 || fread(&csz,4,1,f)!=1) break;
         if (!memcmp(id,"fmt ",4)) {
-            uint8_t b[16]={0}; uint32_t n = csz<16?csz:16;
-            if (fread(b,1,n,f)!=n) break;
+            if (csz<16) break;                    // canonical PCM fmt is ≥16 bytes; a short chunk is malformed → reject explicitly
+            uint8_t b[16]={0};
+            if (fread(b,1,16,f)!=16) break;
             channels=(uint16_t)(b[2]|(b[3]<<8));
             srate=(uint32_t)(b[4]|(b[5]<<8)|(b[6]<<16)|((uint32_t)b[7]<<24));
             bits=(uint16_t)(b[14]|(b[15]<<8));
             got_fmt=true;
-            if (csz>n) fseek(f,(long)(csz-n)+(csz&1),SEEK_CUR);
+            if (csz>16) fseek(f,(long)(csz-16)+(csz&1),SEEK_CUR);
         } else if (!memcmp(id,"data",4)) {
-            if (!got_fmt || bits!=16 || channels==0) break;
+            if (!got_fmt || bits!=16 || channels==0 || channels>256) break;   // reject absurd channel counts (real formats ≤ 8; ambisonics ≤ 64)
             if (csz > 256u*1024*1024) break;   // refuse an absurd data chunk (>256 MB) → no huge alloc / bad_alloc abort
             std::vector<int16_t> pcm(csz/2);
             if (fread(pcm.data(),2,pcm.size(),f)!=pcm.size()) break;
             out.clear(); out.reserve(pcm.size()/channels);
             for (size_t i=0; i+channels<=pcm.size(); i+=channels) {
-                int acc=0; for (int c=0;c<channels;c++) acc+=pcm[i+c];
+                int64_t acc=0; for (int c=0;c<channels;c++) acc+=pcm[i+c];   // 64-bit so the per-frame sum can't overflow on a high channel count
                 out.push_back((float)acc/((float)channels*32768.0f));   // average in float (no integer truncation)
             }
             ok=true; break;

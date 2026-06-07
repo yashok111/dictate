@@ -79,6 +79,7 @@
 #include "dictate_authgen.h"
 #include "dictate_dict.h"
 #include "dictate_idle.h"
+#include "dictate_edscroll.h"
 
 // Homebrew ships ggml's CPU/Metal backends as separate plugin .so files loaded at
 // runtime (otherwise the registry is empty → whisper_init aborts, devices=0).
@@ -232,6 +233,12 @@ public:
         : ctx_(ctx), lang_(std::move(lang)), nthreads_(nthreads) {
         full_.reserve((size_t)MAX_TAKE_SEC * WHISPER_SAMPLE_RATE); // reserve the whole capped take → no realloc on the realtime tap thread
         pending_.reserve((size_t)FRAME * 16);             // steady-state remainder buffer; no first-frame realloc on the tap
+        // cur_/preroll_ also live on the realtime tap path (processFrame), so reserve them too, and
+        // pre-seed a small pool the worker recycles — closing a segment then swaps in a ready buffer
+        // instead of allocating/regrowing cur_ on the tap thread (gotcha #6).
+        cur_.reserve(SEG_SAMPLES);
+        preroll_.reserve((size_t)(PREROLL_FR + 1) * FRAME);   // +1 frame: the insert precedes the overflow trim
+        for (int i = 0; i < RECYCLE_SEED; i++) { std::vector<float> b; b.reserve(SEG_SAMPLES); recycle_.push_back(std::move(b)); }
         worker_ = std::thread([this]{ this->workerLoop(); });
     }
 
@@ -340,8 +347,7 @@ private:
             cur_.insert(cur_.end(), fr, fr+FRAME);
             bool tooLong = seg_exceeds_max(cur_.size());
             if (seg_.observeSpeech(rms, tooLong)) {   // closes the segment (silence or forced cut)
-                enqueue(std::move(cur_));
-                cur_.clear();
+                rotateSegment();                      // hand cur_ to the worker, swap in a recycled buffer (alloc-free; gotcha #6)
                 // tooLong forced a cut mid-utterance (seg_ armed contiguousReopen): drop the
                 // pre-roll so the contiguous next segment can't duplicate audio at the seam.
                 if (tooLong) preroll_.clear();
@@ -351,6 +357,22 @@ private:
 
     void enqueue(std::vector<float> seg) {
         { std::lock_guard<std::mutex> lk(qmu_); q_.push(std::move(seg)); } qcv_.notify_all();
+    }
+
+    // Close the open segment on the REALTIME tap thread: hand cur_'s buffer to the worker and
+    // swap in a recycled, pre-reserved buffer so the tap performs NO heap allocation in steady
+    // state (gotcha #6). The worker returns decoded buffers to recycle_ (workerLoop); only a cold
+    // start or a backed-up queue (pool drained) falls back to a bounded reserve, off the lock.
+    void rotateSegment() {
+        {
+            std::lock_guard<std::mutex> lk(qmu_);
+            q_.push(std::move(cur_));
+            if (!recycle_.empty()) { cur_ = std::move(recycle_.back()); recycle_.pop_back(); }
+            else cur_ = std::vector<float>{};
+        }
+        qcv_.notify_all();
+        if (cur_.capacity() < SEG_SAMPLES) cur_.reserve(SEG_SAMPLES);   // warmup/exhaustion only — never in steady state
+        cur_.clear();                                                   // reused buffer keeps its capacity
     }
 
     // The single worker: decode each closed segment in order as it arrives (this is the
@@ -369,13 +391,21 @@ private:
             WhisperOut wt = run_whisper_tok(ctx_, seg, lang_.c_str(), nthreads_);
             std::vector<float> cw;   // per-word confidence (computed outside tmu_ to keep the lock tight)
             if (!wt.text.empty()) cw = conf::words_confidence(wt.tokens);
-            std::lock_guard<std::mutex> lk(tmu_);
-            if (!wt.text.empty()) { parts_.push_back(wt.text); partsConf_.push_back(std::move(cw)); }
+            { std::lock_guard<std::mutex> lk(tmu_);
+              if (!wt.text.empty()) { parts_.push_back(wt.text); partsConf_.push_back(std::move(cw)); } }
+            // Return the (capacity-retaining) segment buffer to the pool so the realtime tap reuses
+            // it on the next close instead of allocating (gotcha #6). Separate lock scope from tmu_
+            // above → never holds both, so no lock-order inversion. Bounded by RECYCLE_MAX.
+            { std::lock_guard<std::mutex> lk(qmu_); if (recycle_.size() < RECYCLE_MAX) { seg.clear(); recycle_.push_back(std::move(seg)); } }
         }
     }
 
     whisper_context *ctx_; std::string lang_; int nthreads_;
+    static constexpr size_t SEG_SAMPLES  = (size_t)MAX_SEG_FR * FRAME;  // max open-segment length (the seg_exceeds_max bound)
+    static constexpr int    RECYCLE_SEED = 4;                          // segment buffers pre-allocated so the first closes don't alloc on the tap
+    static constexpr size_t RECYCLE_MAX  = 8;                          // cap on retained recycled buffers (bounded memory)
     std::vector<float> full_, pending_, cur_, preroll_;
+    std::vector<std::vector<float>> recycle_;   // pool of pre-reserved segment buffers the worker returns and the tap reuses (guarded by qmu_; gotcha #6)
     Segmenter seg_;                      // pure energy-VAD scalar state machine (src/dictate_vad.h)
     std::atomic<bool> capped_{false};    // feed() hit MAX_TAKE_SEC and dropped audio (set on the tap thread, relaxed)
     std::queue<std::vector<float>> q_;
@@ -444,33 +474,37 @@ static void on_capture_lost(void);   // mid-take capture rebuild failed → stop
     AVAudioFormat *outFmt = _outFmt; AVAudioConverter *conv = _conv; StreamingSession *sess = _sess;
     const double ratio = outFmt.sampleRate / inFmt.sampleRate;
     auto guard = _tapGuard;   // shared_ptr copy → the counter outlives the Recorder if a tap is still in flight at teardown
+    __block AVAudioPCMBuffer *convOut = nil;   // reused across tap callbacks → no per-callback alloc on the realtime thread (gotcha #6)
 
     [input installTapOnBus:0 bufferSize:4096 format:inFmt
                      block:^(AVAudioPCMBuffer *buf, AVAudioTime *when) {
         (void)when;
-        guard->fetch_add(1, std::memory_order_acquire);   // mark in-flight so -stop can wait us out before `sess` is freed (gotcha #5)
+        guard->fetch_add(1, std::memory_order_relaxed);   // mark in-flight; ordering is carried by the fetch_sub(release)/-stop load(acquire) pair (gotcha #5)
+        @autoreleasepool {   // drain the converter's transient autoreleased objects each callback (the realtime audio thread has no draining pool)
         // Feed the whole input buffer once, then DRAIN the converter: a sample-rate
         // conversion may not consume all input in one convertToBuffer: call, so loop
         // until it runs dry (idiomatic; avoids dropping samples at buffer boundaries).
         AVAudioFrameCount cap=(AVAudioFrameCount)(buf.frameLength*ratio)+64;
+        if (!convOut || convOut.frameCapacity < cap)
+            convOut=[[AVAudioPCMBuffer alloc] initWithPCMFormat:outFmt frameCapacity:cap];   // (re)allocate only when the input grows
         __block BOOL fed=NO;
         AVAudioConverterInputBlock feed = ^AVAudioBuffer * _Nullable (AVAudioPacketCount need,
                                                                       AVAudioConverterInputStatus *st){
             (void)need; if (fed){*st=AVAudioConverterInputStatus_NoDataNow;return nil;}
             fed=YES; *st=AVAudioConverterInputStatus_HaveData; return buf;
         };
-        for (;;) {
-            AVAudioPCMBuffer *out=[[AVAudioPCMBuffer alloc] initWithPCMFormat:outFmt frameCapacity:cap];
-            if (!out) break;
+        if (convOut) for (;;) {
+            convOut.frameLength=0;   // reuse: convertToBuffer writes from the start and sets frameLength to what it produced
             NSError *cErr=nil;
-            AVAudioConverterOutputStatus st=[conv convertToBuffer:out error:&cErr withInputFromBlock:feed];
+            AVAudioConverterOutputStatus st=[conv convertToBuffer:convOut error:&cErr withInputFromBlock:feed];
             if (st==AVAudioConverterOutputStatus_Error) break;
-            if (out.frameLength>0) {
+            if (convOut.frameLength>0) {
                 sess->live.store(true);                   // capture confirmed live
-                sess->feed(out.floatChannelData[0], out.frameLength);
+                sess->feed(convOut.floatChannelData[0], convOut.frameLength);
             }
             if (st!=AVAudioConverterOutputStatus_HaveData) break;   // InputRanDry / EndOfStream → done
         }
+        }   // @autoreleasepool
         guard->fetch_sub(1, std::memory_order_release);   // done touching `sess`
     }];
     [_engine prepare];
@@ -861,6 +895,11 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     NSRunningApplication *app = g_target_app; g_target_app = nil; // release the retained target once used
     if (app) [app activateWithOptions:NSApplicationActivateAllWindows];   // refocus the original app…
     NSString *t = text ?: @"";
+    // Trim trailing whitespace/newlines so an auto-paste can't end with a stray newline (which in
+    // an Enter-to-send input could submit a line the user didn't intend). Interior text is verbatim.
+    { NSCharacterSet *ws=[NSCharacterSet whitespaceAndNewlineCharacterSet]; NSUInteger e=t.length;
+      while (e>0 && [ws characterIsMember:[t characterAtIndex:e-1]]) e--;
+      if (e<t.length) t=[t substringToIndex:e]; }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.2*NSEC_PER_SEC)),  // …then paste once it's frontmost
                    dispatch_get_main_queue(), ^{ @autoreleasepool { if (t.length) paste_text(t); } });
 }
@@ -1173,6 +1212,11 @@ static int run_daemon(const std::string &modelPath) {
       if (c>=0 && connect(c,(sockaddr*)&a,sizeof(a))==0){ write_all(c,"ping\n",5); close(c);
           fprintf(stderr,"daemon already running\n"); return 0; }
       if (c>=0) close(c); }
+    // Only remove the path if it is actually a socket — defense-in-depth so a redirected
+    // $DICTATE_SOCK can't make the daemon unlink an arbitrary user file (lstat, so a symlink is
+    // seen AS a symlink and never followed). A stale socket from a dead daemon is the normal case.
+    { struct stat st; if (lstat(SOCK_PATH,&st)==0 && !S_ISSOCK(st.st_mode)) {
+          fprintf(stderr,"refusing to unlink non-socket %s\n", SOCK_PATH); return 1; } }
     unlink(SOCK_PATH);
 
     int srv=socket(AF_UNIX,SOCK_STREAM,0);
@@ -1321,6 +1365,8 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     BOOL _starting;     // awaiting corr-start ack (daemon warming the mic) — window static, not yet recording
     BOOL _decoding;     // awaiting the daemon's transcript after a mini-take stop
     std::vector<float> _conf;   // per-word confidence parallel to _words; empty → no highlighting (gotcha #21 sibling)
+    CGFloat _scrollY;           // vertical scroll offset of the word body (a long transcript scrolls — see updateScroll)
+    BOOL _followCaret;          // a cursor/content change happened → next draw scrolls minimally to reveal the cursor line
 }
 - (instancetype)initWithFrame:(NSRect)f transcript:(NSString *)t conf:(NSString *)conf {
     if ((self = [super initWithFrame:f])) {
@@ -1404,9 +1450,19 @@ static std::string editor_request(const std::string &line);  // editor → daemo
         c.rect = NSMakeRect(ED_BODY_PAD + c.rect.origin.x, top + c.line * _lineH, c.rect.size.width, textH);
     _cells = cells;
     _laidOutSize = sz; _layoutDirty = NO;
+    _followCaret = YES;   // a (re)measure means content/cursor/size changed → keep the cursor line on-screen this draw
 }
 - (EdCell *)cellForWord:(int)wi { for (EdCell *c in _cells) if (!c.isCaret && c.wordIndex == wi) return c; return nil; }
 - (EdCell *)caretCell           { for (EdCell *c in _cells) if (c.isCaret) return c; return nil; }
+// Vertical scroll: keep the body within [ED_HDR_TOP, H-ED_FTR_H] (never over the footer legend), and
+// when the cursor moved (_followCaret) scroll minimally to reveal its line. Pure math in dictate_edscroll.h.
+- (void)updateScroll {
+    EdCell *cc = [self onWord] ? [self cellForWord:[self wordIndex]] : [self caretCell];
+    EdScrollState s{ (double)(_lineCount * _lineH), (double)ED_HDR_TOP, (double)(self.bounds.size.height - ED_FTR_H),
+                     (double)(cc ? cc.rect.origin.y : 0), (double)_lineH, (double)_scrollY, (bool)(_followCaret && cc != nil) };
+    _scrollY = (CGFloat)ed_scroll_clamp(s);
+    _followCaret = NO;
+}
 - (BOOL)anchorLine:(int *)ln x:(CGFloat *)cx {
     if ([self onWord]) {
         EdCell *c = [self cellForWord:[self wordIndex]];
@@ -1531,8 +1587,16 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     edlog(@"delete (%@) → %lu word(s) pos=%d", forward ? @"fwd" : @"back", (unsigned long)_words.count, _pos);
     [self setNeedsDisplay:YES];
 }
+- (void)scrollWheel:(NSEvent *)e {
+    // Free scroll (followCaret=NO): adjust by the wheel delta and clamp; cursor-follow resumes on the
+    // next navigation. _layoutDirty is left untouched, so relayout early-returns and won't re-arm follow.
+    EdScrollState s{ (double)(_lineCount * _lineH), (double)ED_HDR_TOP, (double)(self.bounds.size.height - ED_FTR_H),
+                     0, (double)_lineH, (double)(_scrollY - e.scrollingDeltaY), false };
+    CGFloat ns = (CGFloat)ed_scroll_clamp(s);
+    if (ns != _scrollY) { _scrollY = ns; [self setNeedsDisplay:YES]; }
+}
 - (void)drawRect:(NSRect)dirty {
-    (void)dirty; [self relayout]; NSRect b = self.bounds;
+    (void)dirty; [self relayout]; [self updateScroll]; NSRect b = self.bounds;
     NSBezierPath *bg = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(b, 1, 1) xRadius:18 yRadius:18];
     [[NSColor colorWithWhite:0.06 alpha:0.96] setFill]; [bg fill];
     [[NSColor colorWithWhite:1 alpha:0.28] setStroke]; bg.lineWidth = 1; [bg stroke];
@@ -1541,6 +1605,12 @@ static std::string editor_request(const std::string &line);  // editor → daemo
         withAttributes:@{NSForegroundColorAttributeName:[NSColor whiteColor],
                          NSFontAttributeName:[NSFont boldSystemFontOfSize:18], NSParagraphStyleAttributeName:ctr}];
     NSColor *caretColor = _recording ? [NSColor systemRedColor] : [NSColor colorWithRed:0.42 green:0.78 blue:1.0 alpha:1.0];
+    // The word body is clipped to [ED_HDR_TOP, height-ED_FTR_H] and shifted by _scrollY, so a long
+    // transcript scrolls (updateScroll) instead of overrunning the footer legend or the window edge.
+    CGFloat bodyTop = ED_HDR_TOP, bodyBot = b.size.height - ED_FTR_H, vpH = bodyBot - bodyTop;
+    [NSGraphicsContext saveGraphicsState];
+    NSRectClip(NSMakeRect(0, bodyTop, b.size.width, vpH));
+    { NSAffineTransform *tr = [NSAffineTransform transform]; [tr translateXBy:0 yBy:-_scrollY]; [tr concat]; }
     for (EdCell *c in _cells) {
         if (c.isCaret) {
             [c.text drawAtPoint:c.rect.origin withAttributes:@{NSForegroundColorAttributeName:caretColor, NSFontAttributeName:[self caretFont]}];
@@ -1559,6 +1629,15 @@ static std::string editor_request(const std::string &line);  // editor → daemo
                         : [NSColor colorWithWhite:0.93 alpha:1];
             [c.text drawAtPoint:c.rect.origin withAttributes:@{NSForegroundColorAttributeName:fg, NSFontAttributeName:(hot ? [self wordFont] : [self bodyFont])}];
         }
+    }
+    [NSGraphicsContext restoreGraphicsState];
+    // Scroll indicator (faint knob, right margin) whenever the transcript exceeds one screenful.
+    CGFloat contentH = _lineCount * _lineH, maxScroll = MAX(0, contentH - vpH);
+    if (maxScroll > 0) {
+        CGFloat knobH = MAX(28, vpH * vpH / contentH);
+        CGFloat knobY = bodyTop + (vpH - knobH) * (_scrollY / maxScroll);
+        NSBezierPath *knob = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(b.size.width - 9, knobY, 3, knobH) xRadius:1.5 yRadius:1.5];
+        [[NSColor colorWithWhite:1 alpha:0.22] setFill]; [knob fill];
     }
     NSString *status = _recording ? @"🎙 запись… — пробел: стоп · Esc: отмена правки"
                      : _starting  ? @"⏳ запуск микрофона…"
@@ -1643,8 +1722,8 @@ static void spawn_editor(NSString *transcript, NSString *conf) {
     // Never call activate(IgnoringOtherApps:) anywhere in the editor — that activation is exactly what
     // switched the user to the main Space. The non-activating key panel (below) handles focus instead.
     NSScreen *scr = active_screen(); NSRect sf = scr.frame;
-    CGFloat W = 1000, H = 460;
-    CGFloat x = sf.origin.x + (sf.size.width - W) / 2.0, y = sf.origin.y + (sf.size.height - H) / 2.0 + sf.size.height * 0.04;
+    CGFloat W = 1000, H = MIN(sf.size.height * 0.78, 860);   // taller, screen-aware: many lines fit before the body needs to scroll
+    CGFloat x = sf.origin.x + (sf.size.width - W) / 2.0, y = sf.origin.y + (sf.size.height - H) / 2.0;
     _win = [[KeyWindow alloc] initWithContentRect:NSMakeRect(x, y, W, H)
                 styleMask:(NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel)
                           backing:NSBackingStoreBuffered defer:NO];
