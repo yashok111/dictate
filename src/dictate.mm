@@ -1367,6 +1367,7 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     std::vector<float> _conf;   // per-word confidence parallel to _words; empty → no highlighting (gotcha #21 sibling)
     CGFloat _scrollY;           // vertical scroll offset of the word body (a long transcript scrolls — see updateScroll)
     BOOL _followCaret;          // a cursor/content change happened → next draw scrolls minimally to reveal the cursor line
+    EditHistory _history;       // undo/redo history: pre-edit snapshots — ⌘Z/⌃Z undo, ⌘⇧Z/⌃⇧Z redo (src/dictate_editmodel.h)
 }
 - (instancetype)initWithFrame:(NSRect)f transcript:(NSString *)t conf:(NSString *)conf {
     if ((self = [super initWithFrame:f])) {
@@ -1484,6 +1485,8 @@ static std::string editor_request(const std::string &line);  // editor → daemo
         }
     }
     if ((m & NSEventModifierFlagCommand) && (m & NSEventModifierFlagShift) && e.keyCode == 2) { [self accept]; return; }
+    if ([self isUndoEvent:e]) { [self undo]; return; }                  // ⌘Z / ⌃Z — отменить правку
+    if ([self isRedoEvent:e]) { [self redo]; return; }                  // ⌘⇧Z / ⌃⇧Z — вернуть
     switch (e.keyCode) {
         case 49:  [self startTake];                 return;               // space — start a mini dictation
         case 123: _pos = em_clamp_step(_pos, -1, [self maxPos]); [self moved]; return;  // ←
@@ -1503,7 +1506,52 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     if ((m & NSEventModifierFlagCommand) && (m & NSEventModifierFlagShift) && e.keyCode == 2) {
         edlog(@"performKeyEquivalent ⌘⇧D → accept"); [self accept]; return YES;
     }
+    if ([self isUndoEvent:e]) { edlog(@"performKeyEquivalent ⌘Z → undo"); [self undo]; return YES; }
+    if ([self isRedoEvent:e]) { edlog(@"performKeyEquivalent ⌘⇧Z → redo"); [self redo]; return YES; }
     return [super performKeyEquivalent:e];
+}
+// ⌘Z / ⌃Z (no Shift) = undo; ⌘⇧Z / ⌃⇧Z = redo. keyCode 6 = physical Z, so both fire on a
+// Cyrillic layout too (like the ⌘⇧D / keycode-2 hotkey — see the Native UI notes).
+- (BOOL)isUndoEvent:(NSEvent *)e { return [self isZChord:e withShift:NO]; }
+- (BOOL)isRedoEvent:(NSEvent *)e { return [self isZChord:e withShift:YES]; }
+- (BOOL)isZChord:(NSEvent *)e withShift:(BOOL)wantShift {
+    NSEventModifierFlags m = e.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    BOOL cmdOrCtrl = (m & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) != 0;
+    BOOL shift     = (m & NSEventModifierFlagShift) != 0;   // strictly 0/1, like wantShift → direct compare is safe
+    return cmdOrCtrl && (shift == wantShift) && e.keyCode == 6;
+}
+// The current editor document as a snapshot (view → pure) — the inverse of loadWords:conf:pos:.
+// undo/redo park this on the opposite history stack so the pair round-trips losslessly.
+- (EditSnapshot)currentSnapshot {
+    EditSnapshot s; s.pos = _pos; s.conf = _conf;
+    for (NSString *w in _words) s.words.push_back(w.UTF8String ?: "");
+    return s;
+}
+// Step back / forward through the edit history (src/dictate_editmodel.h). No-op (just a log) at
+// the end of a stack. Cursor + confidence ride along with the words, so each step is exact.
+- (void)undo {
+    EditSnapshot cur = [self currentSnapshot], s;
+    if (!_history.undo(cur, s)) { edlog(@"undo → ничего отменять"); return; }
+    [self loadWords:s.words conf:s.conf pos:s.pos];   // restore the pre-edit document into the view
+    edlog(@"undo → %lu word(s) pos=%d (undo:%lu redo:%lu)", (unsigned long)_words.count, _pos,
+          (unsigned long)_history.undoStack.size(), (unsigned long)_history.redoStack.size());
+    [self setNeedsDisplay:YES];
+}
+- (void)redo {
+    EditSnapshot cur = [self currentSnapshot], s;
+    if (!_history.redo(cur, s)) { edlog(@"redo → нечего возвращать"); return; }
+    [self loadWords:s.words conf:s.conf pos:s.pos];   // re-apply the next document state
+    edlog(@"redo → %lu word(s) pos=%d (undo:%lu redo:%lu)", (unsigned long)_words.count, _pos,
+          (unsigned long)_history.undoStack.size(), (unsigned long)_history.redoStack.size());
+    [self setNeedsDisplay:YES];
+}
+// Bridge a pure model/snapshot back into the view's ivars: rebuild _words (NSArray) and reset the
+// cursor + confidence, marking the layout dirty so the next draw re-measures. Single source for the
+// model→view write shared by applyResult:/deleteCurrent:/undo.
+- (void)loadWords:(const std::vector<std::string> &)words conf:(const std::vector<float> &)conf pos:(int)pos {
+    NSMutableArray<NSString *> *w = [NSMutableArray arrayWithCapacity:words.size()];
+    for (const std::string &s : words) [w addObject:[NSString stringWithUTF8String:s.c_str()] ?: @""];
+    _words = w; _pos = pos; _conf = conf; _layoutDirty = YES;
 }
 - (void)cancelOperation:(id)sender { (void)sender; edlog(@"cancelOperation (Esc) → cancel"); [self cancel]; }
 - (void)lineMove:(int)dir {
@@ -1566,12 +1614,11 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     EditModel m; m.pos = _pos;                                  // bridge NSArray<NSString*> ↔ the pure model
     for (NSString *s in _words) m.words.push_back(s.UTF8String ?: "");
     m.conf = _conf;                                             // thread confidence so it stays aligned through the edit
+    EditSnapshot before = m.snapshot();
     BOOL wasOnWord = m.onWord(); int wi = m.wordIndex(), gi = m.gapIndex();
     m.applyMiniTake(r);   // voice edit: drop whisper's auto Capital+dot, re-case to context, map spoken punctuation (src/dictate_editmodel.h)
-    NSMutableArray<NSString *> *w = [NSMutableArray array];
-    for (const std::string &s : m.words) [w addObject:[NSString stringWithUTF8String:s.c_str()] ?: @""];
-    _words = w; _pos = m.pos; _conf = m.conf;
-    _layoutDirty = YES;                                         // _words/_pos changed → re-measure
+    if (m.snapshot() != before) _history.recordEdit(before);    // record undo only if the splice actually changed the doc (skip a same-text re-dictation); also forks redo
+    [self loadWords:m.words conf:m.conf pos:m.pos];             // model → view (re-measures)
     if (wasOnWord) edlog(@"apply → replace word %d (%lu chars)", wi, (unsigned long)res.length);
     else           edlog(@"apply → insert %lu chars at gap %d", (unsigned long)res.length, gi);
     [self setNeedsDisplay:YES];
@@ -1580,10 +1627,10 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     EditModel m; m.pos = _pos;                                  // bridge NSArray<NSString*> ↔ the pure model
     for (NSString *s in _words) m.words.push_back(s.UTF8String ?: "");
     m.conf = _conf;                                             // keep confidence aligned across the delete
+    EditSnapshot before = m.snapshot();
     if (forward) m.deleteForward(); else m.deleteToken();       // nop on empty / edge gaps
-    NSMutableArray<NSString *> *w = [NSMutableArray array];
-    for (const std::string &s : m.words) [w addObject:[NSString stringWithUTF8String:s.c_str()] ?: @""];
-    _words = w; _pos = m.pos; _conf = m.conf; _layoutDirty = YES;   // _words/_pos changed → re-measure
+    if (m.snapshot() != before) _history.recordEdit(before);    // record undo only when a token was actually removed; also forks redo
+    [self loadWords:m.words conf:m.conf pos:m.pos];             // model → view (re-measures)
     edlog(@"delete (%@) → %lu word(s) pos=%d", forward ? @"fwd" : @"back", (unsigned long)_words.count, _pos);
     [self setNeedsDisplay:YES];
 }
@@ -1647,7 +1694,7 @@ static std::string editor_request(const std::string &line);  // editor → daemo
                   : [NSColor colorWithWhite:1 alpha:0.7];
     [status drawInRect:NSMakeRect(0, b.size.height - 56, b.size.width, 22)
         withAttributes:@{NSForegroundColorAttributeName:sfg, NSFontAttributeName:[NSFont systemFontOfSize:15], NSParagraphStyleAttributeName:ctr}];
-    [@"←/→ ↑/↓ навигация · пробел — диктовка · ⌫/⌦ удалить · ⏎ принять · Esc отмена"
+    [@"←/→ ↑/↓ навигация · пробел — диктовка · ⌫/⌦ удалить · ⌘Z отменить · ⌘⇧Z вернуть · ⏎ принять · Esc отмена"
         drawInRect:NSMakeRect(0, b.size.height - 30, b.size.width, 20)
         withAttributes:@{NSForegroundColorAttributeName:[NSColor colorWithWhite:1 alpha:0.45], NSFontAttributeName:[NSFont systemFontOfSize:13], NSParagraphStyleAttributeName:ctr}];
 }

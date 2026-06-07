@@ -440,3 +440,96 @@ TEST_CASE("EditModel.conf: empty conf stays empty (text-only path)") {
     CHECK(m.conf.empty());
     CHECK(m.words.size() == 3);                               // words still edited correctly
 }
+
+// ── undo: EditSnapshot round-trip + EditHistory stack (src/dictate_editmodel.h) ──
+TEST_CASE("EditModel::snapshot/restore round-trips words, conf, and cursor") {
+    EditModel m; m.words = {"a","b","c"}; m.conf = {0.9f, 0.2f, 0.7f}; m.pos = 3;
+    EditSnapshot s = m.snapshot();
+    m.deleteToken();                                          // mutate after snapshotting
+    CHECK(m.words == std::vector<std::string>{"a","c"});
+    m.restore(s);                                             // restore brings it all back exactly
+    CHECK(m.words == std::vector<std::string>{"a","b","c"});
+    CHECK(m.pos == 3);
+    REQUIRE(m.conf.size() == 3);
+    CHECK(m.conf[1] == doctest::Approx(0.2f));
+}
+
+TEST_CASE("EditSnapshot equality compares words, conf, and pos") {
+    EditModel m; m.words = {"a","b"}; m.conf = {0.9f, 0.2f}; m.pos = 1;
+    EditSnapshot base = m.snapshot();
+    CHECK(base == m.snapshot());                                 // identical → equal
+    EditSnapshot b = m.snapshot(); b.pos = 3;     CHECK(base != b);   // pos differs
+    b = m.snapshot(); b.words[0] = "x";           CHECK(base != b);   // word differs
+    b = m.snapshot(); b.conf[0] = 0.5f;           CHECK(base != b);   // conf-only change is detected
+}
+
+TEST_CASE("undo gating: a mini-take is recorded only when it actually changes the document") {
+    // Re-dictating the SAME text over an UNCERTAIN word clears its amber highlight (conf → SURE):
+    // words/pos unchanged but conf differs → a real, undoable change.
+    EditModel u; u.words = {"да","нет"}; u.conf = {0.3f, 0.9f}; u.pos = 1;   // on "да", uncertain
+    EditSnapshot b1 = u.snapshot();
+    u.applyMiniTake("да");
+    CHECK(u.snapshot() != b1);                                  // conf changed → would be pushed
+    // Same text over an already-confident word at the same slot → nothing changes → not recorded.
+    EditModel v; v.words = {"да","нет"}; v.conf = {EM_CONF_SURE, 0.9f}; v.pos = 1;
+    EditSnapshot b2 = v.snapshot();
+    v.applyMiniTake("да");
+    CHECK(v.snapshot() == b2);                                  // identical words/conf/pos → no phantom undo entry
+}
+
+TEST_CASE("EditHistory: undo/redo step back and forward through edits (models the editor flow)") {
+    EditHistory h; EditSnapshot out;
+    EditModel m = EditModel::fromText("one two three");       // state A: 3 words, pos 1
+    EditSnapshot A = m.snapshot();
+    CHECK_FALSE(h.canUndo()); CHECK_FALSE(h.canRedo());
+    CHECK_FALSE(h.undo(A, out));                              // empty → false, out untouched
+    CHECK_FALSE(h.redo(A, out));
+
+    h.recordEdit(m.snapshot()); m.deleteToken();             // edit A→B: record pre-edit A, now "two three" pos 0
+    h.recordEdit(m.snapshot()); m.deleteForward();           // edit B→C: record pre-edit B, now "three"
+    CHECK(m.words == std::vector<std::string>{"three"});
+
+    CHECK(h.canUndo()); CHECK_FALSE(h.canRedo());
+    REQUIRE(h.undo(m.snapshot(), out)); m.restore(out);      // C→B (parks C on redo)
+    CHECK(m.words == std::vector<std::string>{"two","three"}); CHECK(m.pos == 0);
+    REQUIRE(h.undo(m.snapshot(), out)); m.restore(out);      // B→A
+    CHECK(m.words == std::vector<std::string>{"one","two","three"}); CHECK(m.pos == 1);
+    CHECK_FALSE(h.canUndo()); CHECK(h.canRedo());            // back at the start, redo available
+
+    REQUIRE(h.redo(m.snapshot(), out)); m.restore(out);      // A→B (parks A back on undo)
+    CHECK(m.words == std::vector<std::string>{"two","three"}); CHECK(m.pos == 0);
+    REQUIRE(h.redo(m.snapshot(), out)); m.restore(out);      // B→C
+    CHECK(m.words == std::vector<std::string>{"three"});
+    CHECK(h.canUndo()); CHECK_FALSE(h.canRedo());            // back at the tip, redo exhausted
+}
+
+TEST_CASE("EditHistory: a new edit forks history (drops the redo stack)") {
+    EditHistory h; EditSnapshot out;
+    EditModel m = EditModel::fromText("a b c");
+    h.recordEdit(m.snapshot()); m.deleteToken();             // edit → undo:[A]
+    REQUIRE(h.undo(m.snapshot(), out)); m.restore(out);      // step back → redo:[B]
+    CHECK(h.canRedo());
+    h.recordEdit(m.snapshot()); m.deleteForward();           // a NEW edit from here forks history → redo dropped
+    CHECK_FALSE(h.canRedo());
+    CHECK(h.canUndo());
+}
+
+TEST_CASE("EditHistory: capacity bound drops the oldest undo snapshot") {
+    EditHistory h; h.cap = 3;
+    for (int i = 0; i < 5; i++) { EditSnapshot s; s.pos = i; h.recordEdit(s); }  // 5 edits into a cap-3 undo stack
+    REQUIRE(h.undoStack.size() == 3);                        // only the newest 3 survive (pos 2,3,4)
+    EditSnapshot cur, out;
+    cur.pos = 99; REQUIRE(h.undo(cur, out)); CHECK(out.pos == 4);   // newest first (LIFO)
+    cur.pos = 98; REQUIRE(h.undo(cur, out)); CHECK(out.pos == 3);
+    cur.pos = 97; REQUIRE(h.undo(cur, out)); CHECK(out.pos == 2);   // pos 0 and 1 were evicted
+    CHECK_FALSE(h.canUndo());
+}
+
+TEST_CASE("EditHistory: clear empties both stacks") {
+    EditHistory h; EditSnapshot s; s.pos = 1; EditSnapshot out;
+    h.recordEdit(s);                                         // undo:[s]
+    REQUIRE(h.undo(s, out));                                 // → undo:[] redo:[s] (current s parked)
+    CHECK(h.canRedo()); CHECK_FALSE(h.canUndo());
+    h.clear();
+    CHECK_FALSE(h.canUndo()); CHECK_FALSE(h.canRedo());
+}
