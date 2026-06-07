@@ -45,6 +45,22 @@ inline void upper_cp_at(std::string &s, size_t i) {
     // else: already uppercase / not a handled letter → leave as-is.
 }
 
+// Lowercase the UTF-8 codepoint starting at s[i], in place, IF it is an uppercase letter
+// (ASCII A–Z, Cyrillic А–Я incl. Ё). The mirror of upper_cp_at — anything else is left
+// untouched, so it is always safe to call on any byte index. Codepoint length never
+// changes for these ranges, so callers may keep their byte offsets.
+inline void lower_cp_at(std::string &s, size_t i) {
+    if (i >= s.size()) return;
+    unsigned char c0 = (unsigned char)s[i];
+    if (c0>='A' && c0<='Z') { s[i] = (char)(c0+32); return; }                       // ASCII
+    if (i+1 >= s.size()) return;
+    unsigned char c1 = (unsigned char)s[i+1];
+    if (c0==0xD0 && c1==0x81) { s[i]=(char)0xD1; s[i+1]=(char)0x91; return; }        // Ё U+0401 → ё U+0451
+    if (c0==0xD0 && c1>=0x90 && c1<=0x9F) { s[i+1]=(char)(c1+0x20); return; }        // А–П U+0410–041F → а–п
+    if (c0==0xD0 && c1>=0xA0 && c1<=0xAF) { s[i]=(char)0xD1; s[i+1]=(char)(c1-0x20); return; } // Р–Я U+0420–042F → р–я
+    // else: already lowercase / not a handled letter → leave as-is.
+}
+
 // Length (in bytes) of a "closing" punctuation token at s[j], else 0. These never take a
 // space BEFORE them; a space immediately preceding one is dropped.
 inline int close_punct_len(const std::string &s, size_t j) {

@@ -1511,7 +1511,7 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     for (NSString *s in _words) m.words.push_back(s.UTF8String ?: "");
     m.conf = _conf;                                             // thread confidence so it stays aligned through the edit
     BOOL wasOnWord = m.onWord(); int wi = m.wordIndex(), gi = m.gapIndex();
-    m.applyResult(r);
+    m.applyMiniTake(r);   // voice edit: drop whisper's auto Capital+dot, re-case to context, map spoken punctuation (src/dictate_editmodel.h)
     NSMutableArray<NSString *> *w = [NSMutableArray array];
     for (const std::string &s : m.words) [w addObject:[NSString stringWithUTF8String:s.c_str()] ?: @""];
     _words = w; _pos = m.pos; _conf = m.conf;

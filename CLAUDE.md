@@ -152,6 +152,18 @@ the editor supersedes live-preview-during-take.)
   transcribes → editor replaces the word / inserts at the gap (async, «расшифровка…»).
   Esc mid-take → `corr-cancel` (cancels just the take). A standalone `dictate editor`
   run (no `--from-daemon`) uses a local stub instead of the daemon mic.
+- **Mini-take cleanup (`EditModel::applyMiniTake`, `src/dictate_editmodel.h`)**: whisper
+  transcribes a single dictated word as a standalone sentence — Capital + trailing period
+  («слово» → "Слово.") — which is wrong for a one-word correction. So the mini-take result
+  is cleaned before splicing (NOT via `normalize_text`, which is take-boundary-only and would
+  over-capitalize): (a) drop the spurious trailing sentence dot; (b) re-case the first letter
+  to context — on a word **replace** it inherits the replaced word's case (keeps proper nouns /
+  sentence starts capital, mid-sentence fixes lowercase), at a **gap** insert it Capitalizes
+  only at a sentence start (`atSentenceStart`); (c) **spoken punctuation**: if the whole
+  utterance names a mark (`em_spoken_punct` — «знак вопроса»→`?`, «точка»→`.`, «запятая»→`,`,
+  «тире»→`—`, «открыть скобку»→`(`, «закрыть кавычки»→`»`, …) it inserts that symbol instead
+  of the literal words. All pure + unit-tested. The plain `applyResult` (stub / text-only
+  path) stays verbatim — only the voice path runs the cleanup.
 - **Accept → paste**: the daemon saves the frontmost app at take start (`g_target_app`,
   `NSWorkspace`); on `accept <text>` it re-activates that app (`activateWithOptions:`
   `NSApplicationActivateAllWindows` — `Ignoring*` is a no-op on macOS 14+) and

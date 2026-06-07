@@ -101,6 +101,101 @@ TEST_CASE("applyResult: empty / whitespace-only result is a no-op") {
     CHECK(m.pos == 1);
 }
 
+// ── mini-take cleanup: case/punct helpers ──────────────────────────────────────
+TEST_CASE("em_is_sentence_punct: only sentence enders") {
+    CHECK(em_is_sentence_punct("."));  CHECK(em_is_sentence_punct("!"));
+    CHECK(em_is_sentence_punct("?"));  CHECK(em_is_sentence_punct("…"));
+    CHECK_FALSE(em_is_sentence_punct(",")); CHECK_FALSE(em_is_sentence_punct("слово"));
+    CHECK_FALSE(em_is_sentence_punct(""));
+}
+
+TEST_CASE("em_first_is_upper / em_first_is_letter: ASCII + Cyrillic") {
+    CHECK(em_first_is_upper("Слово"));  CHECK(em_first_is_upper("Ёлка"));  CHECK(em_first_is_upper("Hello"));
+    CHECK_FALSE(em_first_is_upper("слово")); CHECK_FALSE(em_first_is_upper("ёлка"));
+    CHECK_FALSE(em_first_is_upper("123")); CHECK_FALSE(em_first_is_upper(""));
+    CHECK(em_first_is_letter("слово")); CHECK(em_first_is_letter("X"));
+    CHECK_FALSE(em_first_is_letter("123")); CHECK_FALSE(em_first_is_letter("."));
+}
+
+TEST_CASE("em_recase_first: upper/lower the first letter only") {
+    std::string a = "слово"; em_recase_first(a, true);  CHECK(a == "Слово");
+    std::string b = "Слово"; em_recase_first(b, false); CHECK(b == "слово");
+    std::string c = "ёж";    em_recase_first(c, true);  CHECK(c == "Ёж");
+    std::string d = "Ёж";    em_recase_first(d, false); CHECK(d == "ёж");
+    std::string e = "123";   em_recase_first(e, true);  CHECK(e == "123");   // non-letter untouched
+}
+
+TEST_CASE("em_to_lower: ASCII + Cyrillic, leaves the rest") {
+    CHECK(em_to_lower("Знак Вопроса") == "знак вопроса");
+    CHECK(em_to_lower("ТОЧКА") == "точка");
+    CHECK(em_to_lower("ЁЛКА123") == "ёлка123");
+}
+
+// ── mini-take cleanup: spoken punctuation ──────────────────────────────────────
+TEST_CASE("em_spoken_punct: punctuation names → symbols (case/dot-insensitive)") {
+    CHECK(em_spoken_punct("знак вопроса") == "?");
+    CHECK(em_spoken_punct("Знак вопроса.") == "?");        // whisper's Capital + trailing dot tolerated
+    CHECK(em_spoken_punct("вопросительный знак") == "?");
+    CHECK(em_spoken_punct("запятая") == ",");
+    CHECK(em_spoken_punct("точка") == ".");
+    CHECK(em_spoken_punct("точка с запятой") == ";");
+    CHECK(em_spoken_punct("двоеточие") == ":");
+    CHECK(em_spoken_punct("восклицательный знак") == "!");
+    CHECK(em_spoken_punct("многоточие") == "\xE2\x80\xA6");   // …
+    CHECK(em_spoken_punct("тире") == "\xE2\x80\x94");          // —
+    CHECK(em_spoken_punct("открыть скобку") == "(");
+    CHECK(em_spoken_punct("закрыть кавычки") == "\xC2\xBB");   // »
+}
+TEST_CASE("em_spoken_punct: a normal word is not a punctuation name") {
+    CHECK(em_spoken_punct("привет") == "");
+    CHECK(em_spoken_punct("это точка зрения") == "");          // phrase ≠ exact name
+    CHECK(em_spoken_punct("") == "");
+}
+
+// ── mini-take cleanup: applyMiniTake (the real voice-edit path) ─────────────────
+TEST_CASE("applyMiniTake: mid-sentence replacement loses Capital + trailing dot") {
+    EditModel m = EditModel::fromText("привет старый мир");
+    m.pos = 3;                                  // on word "старый"
+    m.applyMiniTake("Новый.");                   // whisper's Capital + dot
+    CHECK(m.words == std::vector<std::string>{"привет","новый","мир"});
+}
+
+TEST_CASE("applyMiniTake: replacing a Capitalized word keeps the Capital") {
+    EditModel m = EditModel::fromText("Старый мир");
+    m.pos = 1;                                  // on word "Старый" (sentence start)
+    m.applyMiniTake("Новый.");
+    CHECK(m.words == std::vector<std::string>{"Новый","мир"});
+}
+
+TEST_CASE("applyMiniTake: insert at a sentence-start gap capitalizes") {
+    EditModel m = EditModel::fromText("конец . привет");   // tokens: конец . привет
+    m.pos = 4;                                  // gap after "." (gapIndex 2) → sentence start
+    m.applyMiniTake("новый.");
+    CHECK(m.words == std::vector<std::string>{"конец",".","Новый","привет"});
+}
+
+TEST_CASE("applyMiniTake: insert mid-sentence stays lowercase") {
+    EditModel m = EditModel::fromText("раз два");
+    m.pos = 2;                                  // gap after "раз" (gapIndex 1), mid-sentence
+    m.applyMiniTake("Три.");
+    CHECK(m.words == std::vector<std::string>{"раз","три","два"});
+}
+
+TEST_CASE("applyMiniTake: spoken punctuation inserts a symbol verbatim") {
+    EditModel m = EditModel::fromText("привет");
+    m.pos = 2;                                  // trailing gap
+    m.applyMiniTake("Знак вопроса.");
+    CHECK(m.words == std::vector<std::string>{"привет","?"});
+    CHECK(m.joined() == "привет?");             // glued, no space before ?
+}
+
+TEST_CASE("applyMiniTake: a real multi-word fix keeps inner words' case, fixes only the first") {
+    EditModel m = EditModel::fromText("я знаю это");
+    m.pos = 5;                                  // on word "это" (index 2)
+    m.applyMiniTake("Москва Сити.");             // proper nouns: only the leading one is recased to context
+    CHECK(m.words == std::vector<std::string>{"я","знаю","москва","Сити"});
+}
+
 TEST_CASE("em_nearest_word_on_line: closest mid-X on the target line") {
     std::vector<EmCell> cells = {{0,10,0},{0,50,1},{1,12,2},{1,60,3}};
     CHECK(em_nearest_word_on_line(cells, 1, 15.0) == 2);   // |12-15|=3 < |60-15|=45
