@@ -12,6 +12,7 @@
 #include <vector>
 #include <cmath>
 #include <cstddef>
+#include "dictate_text.h"   // upper_cp_at / lower_cp_at — re-case a voice-corrected word to context
 
 // ── cursor arithmetic (shared by EditorView + EditModel; single source of truth) ──
 inline int  em_max_pos(int nwords) { return nwords * 2; }
@@ -171,6 +172,85 @@ inline int em_nearest_word_on_line(const std::vector<EmCell> &cells, int targetL
 // A freshly inserted / voice-corrected word is never flagged uncertain → full confidence.
 inline constexpr float EM_CONF_SURE = 1.0f;
 
+// ── mini-take cleanup (voice edit in the editor) ──────────────────────────────────────
+// whisper transcribes a single dictated word as a standalone sentence — it Capitalizes it
+// and appends a period («слово» → "Слово."). For a one-word voice correction that is wrong:
+// the replacement must inherit the surrounding case and carry no spurious sentence dot. The
+// helpers below clean a mini-take result before it is spliced in (applyMiniTake); they are
+// pure + unit-tested (gotcha #19) and NOT applied to a normal take (normalize_text owns that).
+
+// A token that is exactly one sentence-ending mark: . ! ? or … (U+2026).
+inline bool em_is_sentence_punct(const std::string &t) {
+    return t=="." || t=="!" || t=="?" || t=="\xE2\x80\xA6";
+}
+
+// First codepoint of `t` is a letter (ASCII or — crudely — any Cyrillic/multibyte lead).
+inline bool em_first_is_letter(const std::string &t) {
+    if (t.empty()) return false;
+    unsigned char c0 = (unsigned char)t[0];
+    return (c0>='A'&&c0<='Z') || (c0>='a'&&c0<='z') || c0>=0x80;
+}
+// First codepoint of `t` is an UPPERCASE letter (ASCII A–Z or Cyrillic А–Я incl. Ё).
+inline bool em_first_is_upper(const std::string &t) {
+    if (t.empty()) return false;
+    unsigned char c0 = (unsigned char)t[0];
+    if (c0>='A' && c0<='Z') return true;
+    if (c0==0xD0 && t.size()>=2) {
+        unsigned char c1 = (unsigned char)t[1];
+        if (c1==0x81) return true;            // Ё
+        if (c1>=0x90 && c1<=0xAF) return true; // А–Я
+    }
+    return false;
+}
+// Re-case the first letter of `t` to upper/lower in place (no-op on a non-letter lead).
+inline void em_recase_first(std::string &t, bool upper) {
+    if (t.empty()) return;
+    if (upper) dictate_text_detail::upper_cp_at(t, 0);
+    else       dictate_text_detail::lower_cp_at(t, 0);
+}
+
+// Lowercase a whole UTF-8 string (ASCII + Cyrillic) for case-insensitive phrase matching.
+inline std::string em_to_lower(std::string s) {
+    std::size_t i = 0;
+    while (i < s.size()) { std::size_t st = i; em_utf8_next(s, i); dictate_text_detail::lower_cp_at(s, st); }
+    return s;
+}
+
+// Map a whole spoken mini-take to a punctuation SYMBOL when the user dictated only a
+// punctuation name (e.g. «знак вопроса» → "?", «точка» → "."). Returns "" when the phrase
+// is not a known punctuation name, so the caller falls back to inserting it as words. The
+// phrase is matched case-insensitively after dropping any punctuation whisper appended and
+// collapsing whitespace — so "Знак вопроса." still maps. Lets the user insert marks the
+// dictation otherwise can't produce on demand.
+inline std::string em_spoken_punct(const std::string &raw) {
+    std::string phrase;                                   // words only, single-spaced, lowercased
+    for (const std::string &t : em_tokenize(raw)) {
+        if (em_is_punct_token(t)) continue;
+        if (!phrase.empty()) phrase += ' ';
+        phrase += t;
+    }
+    phrase = em_to_lower(phrase);
+    if (phrase.empty()) return "";
+    struct Pair { const char *phrase; const char *sym; };
+    static const Pair table[] = {
+        {"точка с запятой", ";"},
+        {"вопросительный знак", "?"}, {"знак вопроса", "?"},
+        {"восклицательный знак", "!"}, {"знак восклицания", "!"},
+        {"двоеточие", ":"},
+        {"многоточие", "\xE2\x80\xA6"},                    // …
+        {"длинное тире", "\xE2\x80\x94"}, {"тире", "\xE2\x80\x94"}, // —
+        {"дефис", "-"},
+        {"запятая", ","},
+        {"точка", "."},
+        {"открывающая скобка", "("}, {"открыть скобку", "("},
+        {"закрывающая скобка", ")"}, {"закрыть скобку", ")"}, {"скобка", "("},
+        {"открыть кавычки", "\xC2\xAB"}, {"открывающая кавычка", "\xC2\xAB"}, // «
+        {"закрыть кавычки", "\xC2\xBB"}, {"закрывающая кавычка", "\xC2\xBB"}, // »
+    };
+    for (const Pair &p : table) if (phrase == p.phrase) return p.sym;
+    return "";
+}
+
 // ── the editor's word list + cursor as one value (used by EditorView via NSString↔std::string
 //    bridging at the boundary, and tested directly here) ──
 struct EditModel {
@@ -196,11 +276,10 @@ struct EditModel {
 
     std::string joined() const { return em_join(words); }
 
-    // Replace the current word / insert at the current gap with the tokenized result.
-    // Empty (whitespace-only) result → no change. Cursor lands on the first inserted word.
-    // Mirrors EditorView::applyResult:.
-    void applyResult(const std::string &resultText) {
-        std::vector<std::string> rw = em_tokenize(resultText);
+    // Splice already-tokenized words in at the cursor: replace the current word (on a word)
+    // or insert at the current gap. Empty → no change. Cursor lands on the first new word.
+    // Confidence stays aligned (new words → EM_CONF_SURE). Shared by applyResult/applyMiniTake.
+    void applyTokens(const std::vector<std::string> &rw) {
         if (rw.empty()) return;
         if (onWord()) {
             int wi = wordIndex();
@@ -215,6 +294,44 @@ struct EditModel {
             if (!conf.empty()) conf.insert(conf.begin() + gi, rw.size(), EM_CONF_SURE);
             pos = 2 * gi + 1;
         }
+    }
+
+    // Replace the current word / insert at the current gap with the tokenized result, verbatim
+    // (no case/punct cleanup). Used by the text-only / stub path. Mirrors EditorView::applyResult:.
+    void applyResult(const std::string &resultText) { applyTokens(em_tokenize(resultText)); }
+
+    // Is the slot at word index `start` at a sentence start? True when nothing precedes it,
+    // or the nearest preceding token (skipping closing quotes/brackets) is a sentence-ender.
+    // Drives whether a voice-corrected word should be Capitalized or lowercased.
+    bool atSentenceStart(int start) const {
+        for (int j = start - 1; j >= 0; j--) {
+            const std::string &t = words[j];
+            if (em_is_sentence_punct(t)) return true;
+            if (t=="\xC2\xBB" /*»*/ || t==")" || t=="]" || t=="\xE2\x80\x9D" /*”*/ || t=="\"") continue;
+            return false;                       // a word (or non-closing punct) → mid-sentence
+        }
+        return true;                            // nothing before → sentence start
+    }
+
+    // Apply a VOICE mini-take (editor correction): the same splice as applyResult, but first
+    //  (1) if the whole utterance names a punctuation mark → insert that symbol (em_spoken_punct);
+    //  (2) else drop the spurious trailing sentence dot whisper appends to a dictated word, and
+    //      re-case the first letter to the surrounding context (match the replaced word's case;
+    //      at a gap, Capitalize only at a sentence start) — so a mid-sentence fix stays lowercase.
+    void applyMiniTake(const std::string &raw) {
+        std::string sym = em_spoken_punct(raw);
+        if (!sym.empty()) { applyTokens({sym}); return; }
+        std::vector<std::string> rw = em_tokenize(raw);
+        if (rw.empty()) return;
+        if (rw.size() > 1 && em_is_sentence_punct(rw.back())) rw.pop_back();   // strip whisper's auto dot
+        if (em_first_is_letter(rw.front())) {
+            int start = onWord() ? wordIndex() : gapIndex();
+            bool upper = (onWord() && em_first_is_letter(words[wordIndex()]))
+                       ? em_first_is_upper(words[wordIndex()])   // replace: inherit the old word's case
+                       : atSentenceStart(start);                 // insert: capitalize only at a sentence start
+            em_recase_first(rw.front(), upper);
+        }
+        applyTokens(rw);
     }
 
     // Erase token `idx` (caller guarantees 0 ≤ idx < size) and drop the cursor into the gap

@@ -145,6 +145,17 @@ blindly — so you can catch whisper's mistakes before they land:
 - **Fix a word by voice**: press **SPACE** on a word (or in a gap) to start a mini-take,
   speak the correction, **SPACE** again to apply it — the word is replaced, or new text is
   inserted at the gap. **Esc** during a mini-take cancels just that edit.
+- **Corrections match the surrounding case.** A single dictated word comes back from whisper
+  as a mini-sentence (Capitalized, with a trailing period); the editor strips that and
+  re-cases the word to its context — a mid-sentence fix stays lowercase, while a sentence
+  start (or a replaced proper noun) keeps its capital. So fixing one word doesn't leave a
+  stray «Слово.» in the middle of a line.
+- **Insert punctuation by voice.** Say the *name* of a mark and the editor inserts the symbol
+  instead of the words: «знак вопроса» → `?`, «точка» → `.`, «запятая» → `,`,
+  «двоеточие» → `:`, «тире» → `—`, «многоточие» → `…`, «открыть/закрыть скобку» → `(` `)`,
+  «открыть/закрыть кавычки» → `«` `»`. Handy for marks dictation won't reliably produce on
+  its own — stand in the gap where you want it and dictate the name.
+- **Delete** the current word (or the one before the cursor) with **⌫**, the next one with **⌦**.
 - **Low-confidence words are highlighted** (amber): whisper's per-token probability is
   mapped to a per-word confidence, so the words most likely to be wrong draw your eye.
 - **⏎** or **⌘⇧D** accepts — the editor closes, refocuses the app you were in, and pastes.
