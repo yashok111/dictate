@@ -25,6 +25,7 @@
 
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CoreAudio/CoreAudio.h>   // HAL device enumeration: force the built-in mic (gotcha #22)
 #import <AppKit/AppKit.h>
 #import <Accelerate/Accelerate.h>
 #import <Carbon/Carbon.h>   // global hotkey: RegisterEventHotKey, kVK_*, cmdKey/shiftKey
@@ -424,6 +425,68 @@ private:
 // ── microphone capture → 16 kHz mono → StreamingSession::feed ────────────────
 static void on_capture_lost(void);   // mid-take capture rebuild failed → stop the take + notify (defined after DictateController)
 
+// Find the built-in (MacBook) microphone via the CoreAudio HAL. AVAudioEngine.inputNode
+// otherwise follows the SYSTEM default input, which switches to AirPods/headset the moment
+// they connect — and those mics are markedly worse than the built-in one. We force the
+// built-in device on the input AudioUnit instead (gotcha #22). Returns kAudioObjectUnknown
+// if none is found (→ caller keeps the system default). Disable with DICTATE_BUILTIN_MIC=0.
+static AudioDeviceID find_builtin_input_device(void) {
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    UInt32 sz = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, nullptr, &sz) != noErr || sz == 0)
+        return kAudioObjectUnknown;
+    std::vector<AudioDeviceID> devs(sz / sizeof(AudioDeviceID));
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, nullptr, &sz, devs.data()) != noErr)
+        return kAudioObjectUnknown;
+
+    for (AudioDeviceID d : devs) {
+        // Must have at least one input channel (an output-only device has an empty input
+        // stream config) — otherwise a built-in *speaker* could match the transport check.
+        AudioObjectPropertyAddress sa = {
+            kAudioDevicePropertyStreamConfiguration,
+            kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain };
+        UInt32 csz = 0;
+        if (AudioObjectGetPropertyDataSize(d, &sa, 0, nullptr, &csz) != noErr || csz == 0) continue;
+        std::vector<uint8_t> buf(csz);
+        AudioBufferList *bl = (AudioBufferList *)buf.data();
+        if (AudioObjectGetPropertyData(d, &sa, 0, nullptr, &csz, bl) != noErr) continue;
+        UInt32 chans = 0;
+        for (UInt32 i = 0; i < bl->mNumberBuffers; ++i) chans += bl->mBuffers[i].mNumberChannels;
+        if (chans == 0) continue;   // no input → not a microphone
+
+        AudioObjectPropertyAddress ta = {
+            kAudioDevicePropertyTransportType,
+            kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        UInt32 transport = 0, tsz = sizeof(transport);
+        if (AudioObjectGetPropertyData(d, &ta, 0, nullptr, &tsz, &transport) != noErr) continue;
+        if (transport == kAudioDeviceTransportTypeBuiltIn) return d;
+    }
+    return kAudioObjectUnknown;
+}
+
+// Pin the engine's input node to the built-in mic. Returns YES only if it actually CHANGED
+// the device — so the caller can swallow the single configuration-change notification that
+// setDeviceID posts (we caused it), instead of needlessly rebuilding capture on every take.
+// No-op (returns NO) if disabled / not found / already on the built-in device.
+// Must run BEFORE -inputFormatForBus: is read, since the device determines the input format.
+static BOOL prefer_builtin_input(AVAudioEngine *engine) {
+    static const bool enabled = []{ const char *e = getenv("DICTATE_BUILTIN_MIC"); return !(e && !strcmp(e, "0")); }();
+    if (!enabled) return NO;                              // DICTATE_BUILTIN_MIC=0 → keep system default
+    AudioDeviceID dev = find_builtin_input_device();
+    if (dev == kAudioObjectUnknown) return NO;
+    AUAudioUnit *au = engine.inputNode.AUAudioUnit;
+    if (au.deviceID == dev) return NO;                    // already on the built-in mic → no change, no churn
+    NSError *err = nil;
+    if (![au setDeviceID:dev error:&err]) {
+        fprintf(stderr, "⚠ could not pin built-in mic (id=%u): %s\n",
+                (unsigned)dev, err.localizedDescription.UTF8String ?: "?");
+        return NO;
+    }
+    return YES;
+}
+
 @interface Recorder : NSObject
 - (BOOL)startFeeding:(StreamingSession *)sess error:(NSError **)err;
 - (void)stop;
@@ -435,6 +498,7 @@ static void on_capture_lost(void);   // mid-take capture rebuild failed → stop
     AVAudioFormat    *_outFmt;
     StreamingSession *_sess;     // non-owning; valid for the life of the take
     id                _cfgObs;   // AVAudioEngineConfigurationChange observer token
+    BOOL              _pinReconfig;   // swallow the one config-change our own built-in-mic pin triggers (gotcha #22)
     std::shared_ptr<std::atomic<int>> _tapGuard;   // in-flight tap-callback count; -stop waits it to 0
 }
 - (instancetype)init {
@@ -449,6 +513,12 @@ static void on_capture_lost(void);   // mid-take capture rebuild failed → stop
 - (BOOL)startFeeding:(StreamingSession *)sess error:(NSError **)err {
     _engine = [[AVAudioEngine alloc] init];
     _sess   = sess;
+    // Pin to the built-in mic before the input format is read (the device determines it).
+    // Keeps capture on the good MacBook mic even when AirPods/a headset are connected. This
+    // setDeviceID posts ONE configuration-change notification (we changed the device) — record
+    // that so -reconfigure swallows it instead of rebuilding capture on every take. The tap is
+    // already built on the pinned device below, so that rebuild would be pure churn (+ a race).
+    _pinReconfig = prefer_builtin_input(_engine);
     // A device/route change (unplug AirPods, switch default input, sample-rate change)
     // STOPS the engine and silences the tap. Without this the take would dribble to a
     // truncated/empty transcript with no signal to the user. Rebuild + restart on change.
@@ -512,6 +582,10 @@ static void on_capture_lost(void);   // mid-take capture rebuild failed → stop
 }
 - (void)reconfigure {
     if (!_engine) return;                                 // already stopped
+    if (_pinReconfig) {                                   // this notification is our own built-in-mic pin
+        _pinReconfig = NO;                                // (gotcha #22) — the tap was already built on the
+        return;                                           // pinned device in startFeeding; don't rebuild
+    }
     fprintf(stderr, "audio configuration changed → rebuilding capture\n");
     [_engine.inputNode removeTapOnBus:0];
     [_engine stop];
