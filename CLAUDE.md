@@ -187,239 +187,20 @@ the editor supersedes live-preview-during-take.)
   A `waitpid` watcher recovers (re-register ⌘⇧D, clear `g_editor_open`, reap the child)
   if the editor dies without accept/cancel — see gotcha #15.
 
-## CRITICAL GOTCHAS (hard-won — read before changing things)
+## Architecture decisions & gotchas → Notion
 
-1. **ggml backends load at runtime from `libexec`.** Homebrew ships the CPU/Metal
-   backends as separate `.so` plugins in `$(brew --prefix ggml)/libexec`. You MUST
-   call `ggml_backend_load_all_from_path(GGML_LIBEXEC)` **before** `whisper_init`,
-   or it aborts: `devices=0 … GGML_ASSERT(device) failed` in `ggml_backend_dev_init`.
-   The path is baked from the Makefile (version-independent via the `opt/ggml`
-   symlink); override with `$DICTATE_GGML_BACKENDS`.
+The hard-won macOS / whisper / concurrency **gotchas** that used to fill this section
+were really ADRs, so they now live in Notion (one ADR per gotcha) to keep this file lean:
 
-2. **Microphone is TCC-gated and inherits the launcher's grant.** A CLI gets the
-   mic permission of whoever launched it. The launchd daemon therefore needs its
-   OWN grant: approve the prompt on first `⌘⇧D`, or System Settings → Privacy &
-   Security → Microphone → enable `dictate`. (The binary embeds
-   `NSMicrophoneUsageDescription` via `src/Info.plist` — gotcha #16 — so the prompt shows
-   a reason instead of a blank/suppressed dialog.) NB: pre-granting by running from a
-   terminal does NOT help once the **launchd** daemon is the process actually
-   calling the mic — the mic call happens in that process, attributed to it. Empty
-   transcripts almost always = missing mic permission. **Auto-paste additionally
-   needs an Accessibility grant** (System Settings → Privacy & Security →
-   Accessibility → enable `dictate`) to synthesize ⌘V; the daemon prompts for it once
-   at startup. Without it the transcript still lands on the clipboard and the banner
-   says «готово — вставь ⌘V» (graceful degrade) — nothing breaks.
+→ **[Dictate ADRs](https://app.notion.com/p/164ad9f8d7ad4529a6291b9039aa45e2)**
+(HQ › Projects › [Dictate](https://app.notion.com/p/379e684244ab81b196abcc223eb8bb56);
+also indexed in the HQ **ADR Registry**).
 
-3. **Silence hallucination «Продолжение следует…».** whisper invents this phrase on
-   silence/low noise. `suppress_nst` alone does NOT stop it. The fix (and what the
-   old bash script relied on) is whisper's built-in **Silero VAD**:
-   `wp.vad=true; wp.vad_model_path=<ggml-silero-v5.1.2.bin>`. Enabled by default if
-   the model exists; disable with `WHISPER_VAD=0`, point elsewhere with
-   `WHISPER_VAD_MODEL`. Reproducing offline needs REAL noise (a mic tail or
-   `anoisesrc`), not `anullsrc` zeros.
-
-4. **Clipboard via `NSPasteboard` is UTF-8-native** — Cyrillic round-trips cleanly.
-   Do not "fix" this by shelling out to `pbcopy`: that path mangled Cyrillic to
-   Mac-Roman mojibake under a C / `LANG=ru` locale (the bug that killed the bash
-   version). Stay on NSPasteboard. Auto-paste (`paste_text`) sets the clipboard,
-   synthesizes ⌘V, then restores the prior clipboard after a fixed **0.4 s** (a
-   generation token cancels a stale restore if a newer paste lands first). Two known
-   limits of paste-by-clipboard, both inherited from the old Hammerspoon flow and
-   accepted: a clipboard manager can capture the transcript during that ~0.4 s
-   window, and under heavy load the restore could fire before the paste lands.
-
-5. **`whisper_context` is NOT thread-safe.** Exactly one worker thread touches
-   `g_ctx`, and takes are sequential. The hotkey/timer stop runs `finish()` on a
-   **detached thread** (so the run loop never freezes), which means a new take could
-   otherwise start while the previous take's worker is still decoding → two
-   `whisper_full` on one context. The **`g_finishing`** flag prevents this: set under
-   `g_mu` in `daemon_stop_detach` (atomic with the `g_sess` move-out), checked in
-   `daemon_start`/`daemon_feedfile`, cleared in `stopFinishedWithText`. Only this one
-   worker ever calls `whisper_full` — do not add a second concurrent `whisper_full` on
-   the same context.
-
-6. **The audio tap runs on a realtime thread.** `feed()` must stay cheap (VAD math
-   + enqueue). Heavy work (whisper) belongs on the worker. Blocking the tap drops
-   audio. `feed()`/`processFrame` only does the VAD RMS + segment buffering + an
-   enqueue (a `std::move` of the closed segment under `qmu_`) — no decode, no
-   allocation on the steady-state path. ALL tap-path buffers are pre-`reserve`d:
-   `full_`/`pending_`, AND `cur_`/`preroll_`; on segment close `rotateSegment` swaps
-   in a buffer from a worker-recycled pool (`recycle_`, guarded by `qmu_`) instead of
-   re-growing `cur_`, and the `Recorder` tap reuses one `AVAudioPCMBuffer` (`convOut`)
-   across callbacks — so a closed segment costs no heap allocation on the realtime thread.
-
-7. **Resident model = ~573 MB Metal while the daemon runs — by default.** Intentional
-   (that's the speed win): the memory is not a leak. Opt OUT with **idle-unload**:
-   `DICTATE_IDLE_UNLOAD_SEC=N` frees `g_ctx` (`whisper_free`) after N s with no take, and
-   the next take **reloads on demand** (`ensure_model_loaded`, ~600 ms–1 s, paid once on
-   the calling/main thread). Default OFF (unset / `<=0` → stays resident — the speed
-   trade-off is the user's to make). The free runs on MAIN under `g_mu` and only when
-   `g_sess==null && !g_finishing && !g_editor_open`, so it can never race the lone whisper
-   worker (gotcha #5). Pure gate: `src/dictate_idle.h` (unit-tested — gotcha #19); driver:
-   `DictateController setupIdleTimer`/`idleTick`. Backends (gotcha #1) load once and are
-   never freed; only the model context cycles.
-
-8. **Rebuilding does NOT update a running daemon.** It's resident in memory, and the
-   LaunchAgent runs the **installed copy** (`~/.local/bin/dictate`), not the repo
-   build. After `make`: `cp dictate ~/.local/bin/dictate` then
-   `launchctl kickstart -k gui/$(id -u)/com.user.dictate` (or `dictate quit` if not
-   under launchd; KeepAlive respawns it). See gotcha #13.
-
-9. **Daemon doesn't answer `ping` during model load** (~600 ms): the accept loop
-   starts after the model is loaded (the socket is bound first, so connects queue).
-   `ensure_daemon` already retry-polls; don't treat a brief non-answer as failure.
-
-10. **Streaming only helps with pauses.** Segments close on ~700 ms of silence and
-    are transcribed during recording, so `stop` finalizes just the tail. A short or
-    pauseless clip becomes one segment → effectively single-pass (still fast).
-
-11. **Do NOT shrink `wp.audio_ctx` to the segment length.** It's the obvious "speed
-    up the encoder on short segments" idea (encoder cost scales with audio_ctx, default
-    1500 ≈ 30 s) and it *is* faster — but the large-v3-turbo model is trained on the
-    full 30 s positional range, so a small audio_ctx pushes it off-distribution and it
-    **loops/hallucinates** (measured: a 3 s clip degraded into «Привет! Привет!…»; a
-    19 s clip happened to survive). Segment lengths vary, so this fails intermittently
-    on real speech → unusable. Flash attention (gotcha-free, ~20%) is the safe win.
-
-12. **Open-segment live preview — REMOVED (was the trickiest concurrency in the codebase).**
-    It once decoded the still-open segment in the worker's idle gaps to show words *before*
-    the pause, streaming them into the banner. It was removed when the banner became
-    status-only (the post-take editor is where you read/correct the transcript, so a live
-    tail earned nothing but the WindowServer-throttled jitter and a wasted ~450 ms decode
-    loop). Gone with it: the `InterimCb`/`cb_` callback, the tap's snapshot publish
-    (`previewBuf_`/`pmu_`/`workSnap_`/`inSpeechPub_`), `maybePreview`, the `PREVIEW_*`
-    constants, and the `--interim`/`--realtime` flags. **What stayed** is the real
-    streaming: the worker still decodes each *closed* segment into `parts_` during
-    recording (the latency win — gotcha #5/#6). Lesson if you ever re-add a live tail: it
-    needs a 2nd decode on the one worker — keep the tap to a memcpy-only publish (gotcha #6),
-    decode at **full `audio_ctx`** (gotcha #11), let real segments preempt it, and keep its
-    text display-only (never into `parts_`). Background: the `banner-live-paint-unsolved` memory.
-
-13. **The LaunchAgent binary must NOT live in `~/Documents` (nor `~/Desktop` /
-    `~/Downloads`).** Those are TCC-protected, and a **launchd-spawned** process hangs
-    in dyld (`__open` → `getOnDiskBinarySliceOffset`) just trying to *open* a binary
-    there: it produces no log output and never binds the socket, while
-    `launchctl print` cheerfully reports it `state = running`. The same binary run
-    from a Terminal works (it inherits the shell/Terminal's Documents grant), which
-    makes this look like a launchd-only ghost. Fix: install to `~/.local/bin/dictate`
-    and point the plist there. Related: on **macOS 14+ use `launchctl bootstrap` /
-    `bootout` / `kickstart -k`** — the legacy `load -w` / `unload` are deprecated and on
-    macOS 26 leave wedged/zombie jobs (0 fds, unreapable) that never rebind.
-
-14. **Ad-hoc signing breaks TCC grants on every rebuild.** A plain `make` binary is
-    `adhoc, linker-signed`, so its TCC identity is its **cdhash** — which changes each
-    build. So the Microphone / Accessibility grants you give evaporate on the next
-    `make` (symptom: auto-paste silently stops; `printf 'axcheck\n' | nc -U
-    /tmp/dictate.sock` → `untrusted`; `grep paste: /tmp/dictate.log` shows
-    `ax_trusted=0`). Fix: a **stable self-signed identity** — run
-    `scripts/make-codesign-cert.sh` once; the Makefile then signs `dictate` with
-    `--identifier com.user.dictate --sign dictate-codesign`, making the designated
-    requirement cert-based (`identifier "com.user.dictate" and certificate leaf =
-    H"…"`), stable across rebuilds. Grant Mic + Accessibility ONCE to the signed
-    `~/.local/bin/dictate` and they persist. Switching an already-granted ad-hoc binary
-    to the signed identity changes the DR, so you re-grant once at the switch. (The
-    self-signed cert shows `CSSMERR_TP_NOT_TRUSTED` in `find-identity` — that's fine;
-    trust matters for *verification*, not for *signing* or local execution.)
-
-15. **The editor is a separate process (accessory + non-activating panel — gotcha #20);
-    the daemon hands it ⌘⇧D by UNREGISTERING the global hotkey while it's open.** Four
-    hard-won pieces: (a) a
-    borderless window needs `-canBecomeKeyWindow`→YES *and* its setup in
-    `applicationDidFinishLaunching:` (NOT inline before `[NSApp run]`) or it never
-    becomes key and keyDown is lost; (b) Cmd-chords arrive via `performKeyEquivalent:`,
-    NOT `keyDown:`; (c) if the editor dies without sending `accept`/`editor-cancel`
-    (crash, ⌘Q) the daemon must re-register ⌘⇧D + clear `g_editor_open` via a `waitpid`
-    watcher (which also reaps the child), else it wedges — no more takes; (d) socket
-    `stop` must NOT spawn the editor (only the hotkey/timer path does, via
-    `stopFinishedWithText`/`openEditorWithText:`) — else scripted `dictate stop` pops a
-    GUI *and* its socket reply stalls. See the **Voice editor** section.
-
-16. **The embedded `Info.plist` must live in `src/`, NOT next to the built binary.** The
-    binary carries its own `Info.plist` (so TCC has `NSMicrophoneUsageDescription` and a
-    `CFBundleIdentifier` matching the signing identifier) baked in at link time via
-    `-sectcreate __TEXT __info_plist src/Info.plist` (Makefile). Keep that file under
-    `src/`: if an `Info.plist` sits **adjacent** to `./dictate`, `codesign` decides the
-    directory is a **bundle** — `codesign -dv` reports `Format=bundle` and it writes a
-    `_CodeSignature/CodeResources` sidecar. That sidecar is NOT copied by `cp dictate
-    ~/.local/bin/dictate`, so the installed binary's signature breaks → Mic/Accessibility
-    grants evaporate (a gotcha-#14 failure, but sneakier: the repo build verifies fine).
-    With the plist in `src/`, `codesign -dv` shows `Format=Mach-O thin` and the signature
-    rides inside the Mach-O, so `cp` preserves it. Verify after a build:
-    `codesign -dv dictate 2>&1 | grep Format` must say `Mach-O thin`, and there must be NO
-    `_CodeSignature/` directory in the repo.
-
-17. **The daemon socket is owner-only + peer-authenticated; `feedfile`/`--file` open
-    non-blocking.** `/tmp/dictate.sock` is created under `umask(0077)` + `chmod 0600`, and
-    `serve_client` rejects any peer whose euid ≠ the daemon's (`getpeereid`) **before
-    reading a byte** — the `accept <text>` verb synthesizes a ⌘V paste into the frontmost
-    app, so an unauthenticated peer would be a keystroke-injection sink. Testing
-    consequence: a client running as a *different* user is silently dropped; same-user
-    `nc -U` / `dictate` clients work as before. The single-threaded accept loop sets
-    `SO_RCVTIMEO` (5 s) so a peer that connects and dribbles a partial line can't stall
-    all socket traffic. And `load_wav_pcm16` opens `O_RDONLY|O_NONBLOCK` then requires
-    `S_ISREG`: a FIFO/device path returns `wav read failed` instead of **hanging the
-    daemon in `open()`** (the bare `fopen` did hang — the `fstat` check alone is too late,
-    the open itself blocks on a writer-less FIFO).
-
-18. **One take is hard-capped at `MAX_TAKE_SEC` (120 s) inside `StreamingSession::feed`.**
-    The cap bounds memory on EVERY entry path — mic, socket `start`, editor mini-take —
-    not just the 60 s GUI auto-stop timer (which doesn't cover socket-/editor-started
-    takes, so an abandoned mini-take would otherwise grow the buffer forever). Side effect
-    on the offline paths: a `--file` / `feedfile` clip longer than 120 s is **truncated**
-    at the cap (a `⚠ … truncated` line is printed — not silent). For full-length offline
-    A/B use `--once`: the single-pass path runs `whisper_full` on the whole buffer and is
-    NOT capped. `full_` is `reserve()`d to exactly the cap, so the realtime tap still never
-    reallocates (gotcha #6).
-
-19. **`make test` covers the EXTRACTED pure logic, NOT the `dictate.mm` macOS build.** The
-    unit-testable logic was factored out of `dictate.mm` into `src/dictate_*.h` (header-only,
-    `inline`; `dictate.mm` `#include`s them so there is ONE definition — change a header and
-    both the app and the tests see it). `make test` builds `tests/*.cpp` + those headers with
-    the host `c++` (clang++ on macOS, g++ on Linux) and links NOTHING macOS-specific (no
-    whisper/ggml/AppKit/AVFoundation/Accelerate) — the `test` goal even skips the brew
-    resolution. So `make test` runs anywhere and is the fast inner loop for the parser/VAD/
-    editor/auth logic. **It does NOT compile `dictate.mm`.** A change that only touches a
-    header is validated by `make test`; a change that touches the `.mm` (or a header's
-    signature used by the `.mm`) STILL needs `make` + `make tsan|asan` on a Mac to confirm
-    the Objective-C++ side compiles/links. Consequence when editing off a Mac (e.g. Linux):
-    you can prove the pure logic but NOT the macOS build — say so, don't claim the app builds.
-    What stays e2e-only (needs the model / a live socket / AppKit): the streaming
-    segment *decode* + `finish()`/single-pass fallback, the live socket peer-auth +
-    `SO_RCVTIMEO`, `paste_text`'s actual ⌘V, the banner. Those keep `--file`/`feedfile`/tsan/asan
-    as their coverage (run tsan/asan over `--file` to exercise the tap↔worker concurrency).
-
-20. **The editor window must be an *accessory* app + a *non-activating* `NSPanel`, or it
-    opens on the main Space.** Symptom: trigger ⌘⇧D (or run `dictate editor`) from a
-    non-main Mission-Control Space and the screen yanks to the **main** Space with the
-    editor there. Cause: the editor was a `NSApplicationActivationPolicyRegular` app that
-    called `activateIgnoringOtherApps:` — activating a Regular app switches the user to the
-    process's "home" Space (main). It is **NOT** a window-`collectionBehavior` problem
-    (`MoveToActiveSpace`, then `CanJoinAllSpaces|FullScreenAuxiliary`, both had ZERO effect)
-    and **NOT** launchd-specific (a Terminal-launched `dictate editor` jumped too — so it's
-    the activation, not the daemon spawn). Fix = the Spotlight/Raycast palette trick:
-    `setActivationPolicy:Accessory`, make the window an `NSPanel` with
-    `NSWindowStyleMaskNonactivatingPanel` (becomes KEY + gets keyDown WITHOUT activating),
-    `hidesOnDeactivate=NO` (a panel hides on deactivate by default and we never activate),
-    keep `CanJoinAllSpaces|FullScreenAuxiliary`, and **never call `activate*`**. This is
-    exactly what the (working) banner already does. Don't "restore" the Regular+activate
-    design — it reads cleaner but reintroduces the bug.
-
-21. **`initial_prompt` (user-dictionary lexical bias) must stay SHORT, and its backing
-    storage must outlive every `whisper_full` call.** Two hard-won points: (a) the turbo
-    model is prompt-sensitive (same family as gotcha #11) — a long or sentence-like prompt
-    makes it loop/hallucinate, so the dictionary is assembled as a SHORT, token-budgeted,
-    comma-separated VOCAB LIST (not prose), capped at a conservative estimate of
-    `n_text_ctx/2 = 224` prompt tokens (`dict::DEFAULT_MAX_TOKENS`; tune down with
-    `WHISPER_PROMPT_MAXTOK` if you ever see looping). The token estimate deliberately
-    over-counts: we CANNOT run whisper's BPE tokenizer before the model loads, so the prompt
-    is built in pure code (`src/dictate_dict.h`, unit-tested — gotcha #19) and leans high so
-    the real token count stays under the cap. (b) `whisper_full_params.initial_prompt` is a
-    NON-OWNING `const char*`. It points at the process-lifetime global `g_initial_prompt`
-    (built once at startup in `main`, never reassigned after the worker threads start), so the
-    pointer stays valid across the worker / single-pass decodes — do
-    NOT point it at a temporary. Default ON if `~/.config/whisper/dictionary.txt` exists;
-    `WHISPER_PROMPT=0` disables; `WHISPER_DICT` overrides the path. Measure WER before/after
-    with `scripts/bench-wer.py` (it drives the real binary, so Mac-only — gotcha #19).
+Numbering is preserved one-to-one: **gotcha #N ≡ ADR-00NN** — so the many `gotcha #N`
+cross-references still scattered through this file resolve to ADR-00NN in that database
+(e.g. `gotcha #5` = ADR-0005, whisper_context thread-safety; `gotcha #14` = ADR-0014, signing).
+Read the relevant ADR before changing that area, and record the next hard-won lesson as a
+**new ADR there**, not as a new gotcha here.
 
 ## Native UI (in-process — Hammerspoon dropped)
 
@@ -483,6 +264,9 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
   `WHISPER_LANG` (default `ru`), `WHISPER_VAD_MODEL`, `WHISPER_VAD=0` to disable
   VAD, `DICTATE_GGML_BACKENDS` to override the backend dir, `DICTATE_SOCK` to override
   the socket path (run a test daemon off the live one).
+- `DICTATE_BUILTIN_MIC=0` — stop forcing the built-in MacBook mic and follow the system
+  default input instead (default ON: capture is pinned to the built-in mic so AirPods/a headset
+  connecting mid-session don't silently downgrade audio quality — gotcha #22).
 - `WHISPER_DICT` (default `~/.config/whisper/dictionary.txt`) — user dictionary that biases
   whisper toward your vocabulary (names / tech terms / English-in-Russian) via `initial_prompt`.
   Default ON if the file exists; `WHISPER_PROMPT=0` disables it (like `WHISPER_VAD`/`WHISPER_FLASH`);
