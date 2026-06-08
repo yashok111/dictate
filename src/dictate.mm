@@ -1019,7 +1019,15 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
 }
 - (void)showTranscribing { [_warm invalidate]; _warm=nil;
     [self renderHeader:@"⏳  расшифровка…"]; }
-- (void)hideUI { [_warm invalidate]; _warm=nil; _gen++; [_banner orderOut:nil]; }
+- (void)hideUI { [_warm invalidate]; _warm=nil; _gen++; [_banner orderOut:nil];
+    // TEAR the banner down — don't just hide a cached panel. The daemon lives for days, but a single
+    // long-lived NSPanel loses its CanJoinAllSpaces association over time (accumulating bug): after
+    // hours/days it stops following the active Space and reappears only on the main one. The editor
+    // never hits this because it's a FRESH PROCESS per take. Mirror that here: rebuild a fresh banner
+    // each take (ensureBanner runs on the next show). Cheap — one panel per user-initiated take — and
+    // it resets the Space association every time. (gotcha #20 is about the *config*; this is the
+    // *longevity* of the window object.)
+    _banner = nil; _text = nil; }
 - (void)showError:(NSString *)e { [_warm invalidate]; _warm=nil;
     [self renderHeader:[@"✖ " stringByAppendingString:e]];
     NSUInteger g = _gen;   // only auto-hide if the banner hasn't moved on (e.g. a retake started)
