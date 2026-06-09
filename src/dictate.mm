@@ -1934,6 +1934,7 @@ int main(int argc, char **argv) {
         if (verb=="stop")   return client_cmd("stop",true);
         if (verb=="cancel") return client_cmd("cancel",false);
         if (verb=="ping")   return client_cmd("ping",true);
+        if (verb=="axcheck") return client_cmd("axcheck",true);
         if (verb=="quit")   return client_cmd("quit",true);   // stop the daemon (launchd may respawn it)
 
         // ---- one-shot file mode (no daemon) ----
@@ -1943,9 +1944,9 @@ int main(int argc, char **argv) {
             else if (!strcmp(argv[i],"--lang") && i+1<argc) g_lang=argv[++i];
             else if (!strcmp(argv[i],"--model") && i+1<argc) modelPath=argv[++i];
             else if (!strcmp(argv[i],"--once")) once=true;
-            else { fprintf(stderr,"usage: dictate {daemon|start|stop|cancel|ping|quit} | --file a.wav [--once] [--lang xx] [--model P]\n"); return 2; }
+            else { fprintf(stderr,"usage: dictate {daemon|start|stop|cancel|ping|axcheck|quit} | --file a.wav [--once] [--lang xx] [--model P]\n"); return 2; }
         }
-        if (file.empty()){ fprintf(stderr,"usage: dictate {daemon|start|stop|cancel|ping|quit} | --file a.wav\n"); return 2; }
+        if (file.empty()){ fprintf(stderr,"usage: dictate {daemon|start|stop|cancel|ping|axcheck|quit} | --file a.wav\n"); return 2; }
 
         const char *bd=getenv("DICTATE_GGML_BACKENDS");
         ggml_backend_load_all_from_path(bd?bd:GGML_LIBEXEC);

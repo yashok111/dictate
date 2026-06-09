@@ -40,13 +40,16 @@ PLIST := src/Info.plist
 # Absent → the binary is left ad-hoc (works, but grants won't persist). See gotcha #14.
 SIGN_ID    ?= dictate-codesign
 SIGN_IDENT ?= com.user.dictate
-SIGN_SHA1  ?= $(shell security find-certificate -c "$(SIGN_ID)" -Z +              "$$HOME/Library/Keychains/login.keychain-db" 2>/dev/null +              | awk '/SHA-1 hash:/ {print $$3; exit}')
+SIGN_SHA1  ?= $(shell security find-certificate -c "$(SIGN_ID)" -Z \
+              "$$HOME/Library/Keychains/login.keychain-db" 2>/dev/null \
+              | awk '/SHA-1 hash:/ {print $$3; exit}')
 
 $(BIN): $(SRC) Makefile $(PLIST)
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(BIN) $(LDFLAGS) -sectcreate __TEXT __info_plist $(PLIST)
-	@if [ -n "$(SIGN_SHA1)" ]; then \
-	    codesign --force --identifier "$(SIGN_IDENT)" --sign "$(SIGN_SHA1)" $(BIN) \
-	      && echo "✓ signed $(BIN): $(SIGN_IDENT) / $(SIGN_ID) [$(SIGN_SHA1)] (TCC-stable)"; \
+	@SIGN_KEY="$(SIGN_SHA1)"; \
+	  if [ -z "$$SIGN_KEY" ]; then SIGN_KEY="$(SIGN_ID)"; fi; \
+	  if codesign --force --identifier "$(SIGN_IDENT)" --sign "$$SIGN_KEY" $(BIN); then \
+	    echo "✓ signed $(BIN): $(SIGN_IDENT) / $(SIGN_ID) [$${SIGN_KEY}] (TCC-stable)"; \
 	  else \
 	    echo "⚠ codesigning identity '$(SIGN_ID)' not found — $(BIN) left ad-hoc"; \
 	    echo "  (TCC grants break on each rebuild; run scripts/make-codesign-cert.sh once)"; \
@@ -54,6 +57,9 @@ $(BIN): $(SRC) Makefile $(PLIST)
 
 run: $(BIN)
 	./$(BIN)
+
+post-build-check: $(BIN)
+	scripts/post-build-check.sh ./$(BIN) "$$HOME/.local/bin/$(BIN)"
 
 # Sanitizer builds (skills: sanitizers, concurrency-debugging) — separate binaries so they
 # don't clobber ./dictate. TSan catches data races on the worker/cancel paths; ASan+UBSan
@@ -88,4 +94,4 @@ clean:
 	rm -f $(BIN) $(BIN)-tsan $(BIN)-asan $(TEST_BIN)
 	rm -rf $(BIN).dSYM $(BIN)-tsan.dSYM $(BIN)-asan.dSYM
 
-.PHONY: run clean tsan asan tidy test
+.PHONY: run post-build-check clean tsan asan tidy test
