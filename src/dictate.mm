@@ -82,6 +82,7 @@
 #include "dictate_idle.h"
 #include "dictate_edscroll.h"
 #include "dictate_capture.h"
+#include "dictate_log.h"
 
 // Homebrew ships ggml's CPU/Metal backends as separate plugin .so files loaded at
 // runtime (otherwise the registry is empty → whisper_init aborts, devices=0).
@@ -546,6 +547,177 @@ static void on_capture_lost(void);   // mid-take capture rebuild failed → stop
 static void touch_state(void){ int fd=open(STATE_FILE,O_CREAT|O_WRONLY|O_CLOEXEC|O_NOFOLLOW,0600); if(fd>=0) close(fd); }
 static void clear_state(void){ unlink(STATE_FILE); }
 
+// ── local text logs: owner-only daily NDJSON under ~/.local/share/dictate/logs ──
+struct TakeMeta {
+    std::string id;
+    std::string kind;
+};
+
+struct DetachedTake {
+    std::unique_ptr<StreamingSession> session;
+    TakeMeta meta;
+    explicit operator bool() const { return (bool)session; }
+};
+
+static std::string local_time_string(const char *fmt) {
+    time_t now = time(nullptr);
+    struct tm tm{};
+    localtime_r(&now, &tm);
+    char buf[64];
+    if (!strftime(buf, sizeof(buf), fmt, &tm)) return "";
+    return buf;
+}
+
+static dlog::Date local_date_today(void) {
+    time_t now = time(nullptr);
+    struct tm tm{};
+    localtime_r(&now, &tm);
+    return {tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday};
+}
+
+static std::string log_timestamp(void) {
+    std::string z = local_time_string("%Y-%m-%dT%H:%M:%S%z");
+    if (z.size() == 24) z.insert(z.size() - 2, ":");
+    return z;
+}
+
+static std::string log_day_filename(void) {
+    return local_time_string("%Y-%m-%d.ndjson");
+}
+
+static bool mkdir_owner(const std::string &path) {
+    if (mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    chmod(path.c_str(), 0700);
+    return true;
+}
+
+static std::string log_dir_path(void) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) return "";
+    std::string root(home);
+    std::string local = root + "/.local";
+    std::string share = local + "/share";
+    std::string dictate = share + "/dictate";
+    std::string logs = dictate + "/logs";
+    if (!mkdir_owner(local) || !mkdir_owner(share) || !mkdir_owner(dictate) || !mkdir_owner(logs))
+        return "";
+    return logs;
+}
+
+class TakeLogger {
+public:
+    TakeMeta start(const char *kind) {
+        if (!enabled()) return {};
+        TakeMeta meta{next_id(), kind && *kind ? kind : "main"};
+        event(meta, "start", {});
+        return meta;
+    }
+
+    void event(const TakeMeta &meta, const char *name, std::vector<dlog::Field> fields) {
+        if (!enabled()) return;
+        if (meta.id.empty() || !name || !*name) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        std::string dir = log_dir_path();
+        if (dir.empty()) return;
+        dlog::Event e{log_timestamp(), meta.id, meta.kind, name, std::move(fields)};
+        std::string line = dlog::serialize_event(e);
+        std::string path = dir + "/" + log_day_filename();
+        int fd = open(path.c_str(), O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC|O_NOFOLLOW, 0600);
+        if (fd < 0) return;
+        chmod(path.c_str(), 0600);
+        const char *p = line.data();
+        size_t n = line.size();
+        while (n) {
+            ssize_t w = write(fd, p, n);
+            if (w < 0) { if (errno == EINTR) continue; break; }
+            if (w == 0) break;
+            p += w; n -= (size_t)w;
+        }
+        close(fd);
+    }
+
+    void prune() {
+        if (!enabled()) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        std::string dir = log_dir_path();
+        if (dir.empty()) return;
+        DIR *dp = opendir(dir.c_str());
+        if (!dp) return;
+        dlog::Date today = local_date_today();
+        while (dirent *ent = readdir(dp)) {
+            std::string name = ent->d_name;
+            if (name == "." || name == "..") continue;
+            bool is_regular = ent->d_type == DT_REG;
+            if (ent->d_type == DT_UNKNOWN) {
+                struct stat st{};
+                std::string path = dir + "/" + name;
+                is_regular = lstat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+            }
+            if (dlog::should_prune(name, is_regular, today)) {
+                std::string path = dir + "/" + name;
+                unlink(path.c_str());
+            }
+        }
+        closedir(dp);
+    }
+
+private:
+    bool enabled() const {
+        return dlog::flag_enabled(getenv("DICTATE_LOG"));
+    }
+
+    std::string next_id() {
+        static std::atomic<uint64_t> seq{0};
+        return local_time_string("%Y%m%dT%H%M%S") + "-" + std::to_string(++seq);
+    }
+
+    std::mutex mu_;
+};
+
+static TakeLogger g_take_logger;
+static TakeMeta g_active_take;
+static bool g_has_active_take = false;      // g_mu / main lifecycle
+static std::string g_editor_take_id;        // main thread: parent take currently open in editor
+
+static void log_take_cancel(const TakeMeta &meta, double seconds, const char *reason) {
+    g_take_logger.event(meta, "cancel", {
+        dlog::number_field("duration_sec", seconds),
+        dlog::text_field("reason", reason ? reason : ""),
+    });
+}
+
+static void log_transcript(const TakeMeta &meta, const std::string &rawText,
+                           const std::string &finalText, double seconds, int segments) {
+    g_take_logger.event(meta, "transcript", {
+        dlog::text_field("raw_text", rawText),
+        dlog::text_field("normalized_text", finalText),
+        dlog::number_field("duration_sec", seconds),
+        dlog::integer_field("segment_count", segments),
+    });
+}
+
+static void log_editor_event(const char *event, const std::string &takeId, NSString *text = nil) {
+    if (takeId.empty()) return;
+    TakeMeta meta{takeId, "main"};
+    std::vector<dlog::Field> fields;
+    if (text) fields.push_back(dlog::integer_field("text_chars", (long long)text.length));
+    g_take_logger.event(meta, event, std::move(fields));
+}
+
+static void log_correction_apply(const std::string &mainTakeId, const std::string &correctionId,
+                                 const std::string &rawText, const std::string &appliedText,
+                                 const std::string &mode, const std::string &targetText) {
+    if (mainTakeId.empty()) return;
+    TakeMeta meta{mainTakeId, "main"};
+    g_take_logger.event(meta, "correction_apply", {
+        dlog::text_field("correction_take_id", correctionId),
+        dlog::text_field("mode", mode),
+        dlog::text_field("raw_text", rawText),
+        dlog::text_field("applied_text", appliedText),
+        dlog::text_field("target_text", targetText),
+    });
+}
+
 static void copy_to_clipboard(NSString *text) {
     NSPasteboard *pb=[NSPasteboard generalPasteboard];
     [pb clearContents];
@@ -617,8 +789,8 @@ static bool ensure_model_loaded(void) {
 @interface DictateController : NSObject <NSApplicationDelegate>
 - (std::string)beginTakeError;                              // main; "" ok / err string
 - (void)requestStop;                                       // main; async finish+paste (hotkey/menubar)
-- (std::unique_ptr<StreamingSession>)stopDetachForSocket;  // main; hand the take to the socket thread
-- (void)stopFinishedWithText:(NSString *)ns conf:(NSString *)conf;  // main; open editor + per-word confidence
+- (DetachedTake)stopDetachForSocket;                       // main; hand the take to the socket thread
+- (void)stopFinishedWithText:(NSString *)ns conf:(NSString *)conf takeId:(NSString *)takeId;  // main; open editor + per-word confidence
 - (void)cancel;                                            // main
 - (void)toggle;                                            // main; one entry for hotkey/menubar/socket
 - (void)showHint:(NSString *)h;                                  // main; transient banner hint (paste fallback)
@@ -730,6 +902,8 @@ static std::string daemon_start(const char *kind) {
         g_sess.reset(); g_rec=nil;   // dtor joins the worker — safe (was: delete on a live thread → std::terminate)
         return msg;
     }
+    g_active_take = g_take_logger.start(kind);
+    g_has_active_take = !g_active_take.id.empty();
     // touch STATE_FILE only once real audio flows. The native warm-up poll
     // (DictateController warmTick) reads g_sess->live directly; the file is now just a
     // cheap external "is-recording" flag for scripts/debugging.
@@ -756,29 +930,31 @@ static void stop_live_watch(void) {
 // Detach the current take: stop the engine + live-watch + state file (quick, main-thread
 // safe), and hand the session back so the caller runs the blocking finish() OFF the main
 // thread (finish() joins the worker and must not freeze the Cocoa run loop).
-static std::unique_ptr<StreamingSession> daemon_stop_detach(void) {
-    std::unique_ptr<StreamingSession> s; Recorder *r;
-    { std::lock_guard<std::mutex> lk(g_mu); s=std::move(g_sess); r=g_rec; g_rec=nil;
-      if (s) g_finishing.store(true); }   // set under g_mu, atomic with the g_sess move-out, so a
+static DetachedTake daemon_stop_detach(void) {
+    DetachedTake out; Recorder *r;
+    { std::lock_guard<std::mutex> lk(g_mu); out.session=std::move(g_sess); r=g_rec; g_rec=nil;
+      if (g_has_active_take) { out.meta = g_active_take; g_active_take = {}; g_has_active_take = false; }
+      if (out.session) g_finishing.store(true); }   // set under g_mu, atomic with the g_sess move-out, so a
                                           // concurrent start/feedfile can't slip a 2nd worker onto g_ctx
-    if (!s) return nullptr;
+    if (!out.session) return {};
     [r stop];
     stop_live_watch(); clear_state();
-    return s;
+    return out;
 }
 
 static void daemon_cancel(const char *reason) {
-    (void)reason;
-    std::unique_ptr<StreamingSession> s; Recorder *r;
-    { std::lock_guard<std::mutex> lk(g_mu); s=std::move(g_sess); r=g_rec; g_rec=nil;
-      if (s) g_finishing.store(true); }   // block a new take until the detached cancel frees g_ctx (gotcha #5)
-    if (!s) return;
+    DetachedTake take; Recorder *r;
+    { std::lock_guard<std::mutex> lk(g_mu); take.session=std::move(g_sess); r=g_rec; g_rec=nil;
+      if (g_has_active_take) { take.meta = g_active_take; g_active_take = {}; g_has_active_take = false; }
+      if (take.session) g_finishing.store(true); }   // block a new take until the detached cancel frees g_ctx (gotcha #5)
+    if (!take) return;
     [r stop];
     stop_live_watch(); clear_state();
+    log_take_cancel(take.meta, take.session->seconds(), reason);
     // cancel() joins the whisper worker, which can be mid-whisper_full (~1-2 s). Run it OFF the main
     // thread so Esc-cancel / corr-cancel / editor-cancel don't freeze the run loop (mirrors requestStop's
     // detached finish()). g_finishing (set above) keeps a new take off g_ctx until the worker is joined.
-    StreamingSession *raw = s.release();
+    StreamingSession *raw = take.session.release();
     std::thread([raw]{
         std::unique_ptr<StreamingSession> own(raw);   // joins + frees on scope exit
         try { own->cancel(); } catch (...) {}
@@ -796,6 +972,8 @@ static std::string daemon_feed_audio(const std::vector<float> &audio) {
     if (!ensure_model_loaded()) return "model load failed";  // idle-unload (gotcha #7) freed it → reload on demand
     g_last_active_ms = now_ms();                             // reset the idle-unload clock
     g_sess = std::make_unique<StreamingSession>(g_ctx.get(), g_lang, g_nthreads);
+    g_active_take = g_take_logger.start("main");
+    g_has_active_take = !g_active_take.id.empty();
     size_t step = WHISPER_SAMPLE_RATE/10;                    // 100 ms chunks
     for (size_t i=0;i<audio.size();i+=step)
         g_sess->feed(audio.data()+i, std::min(step, audio.size()-i));
@@ -840,20 +1018,21 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     else if (e != "busy") [self showError:@(e.c_str())];   // "busy" = a finalize is in flight → silent no-op
     return e;
 }
-- (std::unique_ptr<StreamingSession>)stopDetachForSocket {
-    auto s = daemon_stop_detach();         // sets g_finishing under g_mu if a take was live
-    if (!s) return nullptr;
+- (DetachedTake)stopDetachForSocket {
+    DetachedTake take = daemon_stop_detach();         // sets g_finishing under g_mu if a take was live
+    if (!take) return {};
     unregister_esc(); [self stopTimer]; [self showTranscribing];
-    return s;
+    return take;
 }
 - (void)requestStop {
-    auto s = daemon_stop_detach();         // sets g_finishing under g_mu if a take was live
-    if (!s) { [self hideUI]; return; }
+    DetachedTake take = daemon_stop_detach();         // sets g_finishing under g_mu if a take was live
+    if (!take) { [self hideUI]; return; }
     unregister_esc();
     [self stopTimer];
-    if (capture_stop_action(s->live.load(), s->samples())
+    if (capture_stop_action(take.session->live.load(), take.session->samples())
         == CaptureStopAction::reportNoAudio) {
-        StreamingSession *silent = s.release();
+        log_take_cancel(take.meta, take.session->seconds(), "no_audio");
+        StreamingSession *silent = take.session.release();
         std::thread([silent]{
             std::unique_ptr<StreamingSession> own(silent);
             try { own->cancel(); } catch (...) {}
@@ -863,8 +1042,9 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
         return;
     }
     [self showTranscribing];
-    StreamingSession *raw = s.release();   // ownership handed to the background finish thread
-    std::thread([self, raw]{
+    StreamingSession *raw = take.session.release();   // ownership handed to the background finish thread
+    TakeMeta meta = take.meta;
+    std::thread([self, raw, meta]{
         @autoreleasepool {                  // detached thread needs its own pool (ARC BP#5)
             std::string text;
             try { text = raw->finish(); }   // if finish() throws (bad_alloc/join) on this detached thread,
@@ -878,21 +1058,24 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
             std::string confStr;
             try { confStr = conf::serialize(conf::realign(text, raw->confidence(), finalText)); } catch (...) {}
             double seconds = raw->seconds(); int segments = raw->segments();
+            log_transcript(meta, text, finalText, seconds, segments);
             fprintf(stderr, "stop: %.2fs, %d seg → %zu chars\n", seconds, segments, finalText.size());
             delete raw;
             NSString *ns = finalText.empty()? nil : [NSString stringWithUTF8String:finalText.c_str()];
             NSString *confNs = [NSString stringWithUTF8String:confStr.c_str()] ?: @"";
-            dispatch_async(dispatch_get_main_queue(), ^{ @autoreleasepool { [self stopFinishedWithText:ns conf:confNs]; } });
+            NSString *takeId = [NSString stringWithUTF8String:meta.id.c_str()] ?: @"";
+            dispatch_async(dispatch_get_main_queue(), ^{ @autoreleasepool { [self stopFinishedWithText:ns conf:confNs takeId:takeId]; } });
         }
     }).detach();
 }
-- (void)stopFinishedWithText:(NSString *)ns conf:(NSString *)conf {
+- (void)stopFinishedWithText:(NSString *)ns conf:(NSString *)conf takeId:(NSString *)takeId {
     g_finishing.store(false);              // finalize done → a new take may start
     [self hideUI];
+    g_editor_take_id = takeId.UTF8String ?: "";
     [self openEditorWithText:ns conf:conf];
 }
 - (void)openEditorWithText:(NSString *)ns conf:(NSString *)conf {
-    if (!ns.length) return;
+    if (!ns.length) { g_editor_take_id.clear(); return; }
     // Open the foreground editor on the transcript instead of pasting directly. ⌘⇧D is
     // unregistered so it reaches the editor's key window; re-registered on accept/cancel/exit.
     // `conf` carries per-word confidence (serialized) for the uncertain-word highlight.
@@ -908,6 +1091,8 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
 - (void)editorAccept:(NSString *)text {
     g_editor_open.store(false);
     register_toggle();                                           // ⌘⇧D is the daemon's global hotkey again
+    log_editor_event("editor_accept", g_editor_take_id, text);
+    g_editor_take_id.clear();
     NSRunningApplication *app = g_target_app; g_target_app = nil; // release the retained target once used
     if (app) [app activateWithOptions:NSApplicationActivateAllWindows];   // refocus the original app…
     NSString *t = text ?: @"";
@@ -922,6 +1107,8 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
 - (void)editorCancel {
     g_editor_open.store(false);
     register_toggle();
+    log_editor_event("editor_cancel", g_editor_take_id);
+    g_editor_take_id.clear();
     daemon_cancel("editor_orphan");   // cancel any orphaned mini-take: if the editor died mid corr-start/recording, its
                        // mic+session would otherwise stay live forever (no-op if no take is in flight)
     NSRunningApplication *app = g_target_app; g_target_app = nil; // release the retained target once used
@@ -1116,6 +1303,17 @@ static void write_all(int fd, const char *p, size_t n){
     while(n){ ssize_t w=write(fd,p,n); if(w<0){ if(errno==EINTR) continue; break; } if(w==0) break; p+=w; n-=(size_t)w; }
 }
 
+static std::vector<std::string> split_tabs(const std::string &s) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (;;) {
+        size_t tab = s.find('\t', start);
+        if (tab == std::string::npos) { out.push_back(s.substr(start)); return out; }
+        out.push_back(s.substr(start, tab - start));
+        start = tab + 1;
+    }
+}
+
 // Same-user check on a connected AF_UNIX peer. The `accept <text>` verb synthesizes a paste
 // into the frontmost app (borrowing the daemon's Accessibility grant), so an unauthenticated
 // peer is a keystroke-injection sink. The socket is also created 0600 — this is defense in depth.
@@ -1163,21 +1361,23 @@ static void serve_client(int cl) {
             std::string m = e.empty()? "ok\n" : ("err "+e+"\n"); write_all(cl,m.data(),m.size());
         }
         else if (cmd=="stop") {
-            __block std::unique_ptr<StreamingSession> s;
-            dispatch_sync(dispatch_get_main_queue(), ^{ s = [g_ctrl stopDetachForSocket]; });
+            __block DetachedTake take;
+            dispatch_sync(dispatch_get_main_queue(), ^{ take = [g_ctrl stopDetachForSocket]; });
             std::string text;
-            if (s) {
+            if (take) {
                 std::string rawText;
-                if (capture_stop_action(s->live.load(), s->samples())
+                if (capture_stop_action(take.session->live.load(), take.session->samples())
                     == CaptureStopAction::reportNoAudio) {
-                    try { s->cancel(); } catch (...) {}
+                    log_take_cancel(take.meta, take.session->seconds(), "no_audio");
+                    try { take.session->cancel(); } catch (...) {}
                 } else {
-                    try { rawText = s->finish(); }   // off-main: joins the worker without freezing the run loop. A throw
+                    try { rawText = take.session->finish(); }   // off-main: joins the worker without freezing the run loop. A throw
                     catch (...) {}                //   here would std::terminate the socket thread AND skip the finalize
                                                   //   below (g_finishing would wedge) — swallow and finalize regardless.
                     text = rawText;
                     try { text = finalize_transcript(rawText); } catch (...) {}   // post-normalize before clipboard
-                    double seconds=s->seconds(); int segments=s->segments();
+                    double seconds=take.session->seconds(); int segments=take.session->segments();
+                    log_transcript(take.meta, rawText, text, seconds, segments);
                     fprintf(stderr,"stop: %.2fs, %d seg → %zu chars\n", seconds, segments, text.size());
                 }
                 __block NSString *ns = text.empty()? nil : [NSString stringWithUTF8String:text.c_str()];
@@ -1198,22 +1398,42 @@ static void serve_client(int cl) {
             std::string m = e.empty()? "ok\n" : ("err "+e+"\n"); write_all(cl,m.data(),m.size());
         }
         else if (cmd=="corr-stop") {      // stop the mini-take, transcribe, return the text to the editor
-            __block std::unique_ptr<StreamingSession> s;
-            dispatch_sync(dispatch_get_main_queue(), ^{ s = daemon_stop_detach(); });
-            std::string text;
-            if (s) {
+            __block DetachedTake take;
+            dispatch_sync(dispatch_get_main_queue(), ^{ take = daemon_stop_detach(); });
+            std::string text, takeId;
+            if (take) {
                 FinishingGuard fg;
-                if (capture_stop_action(s->live.load(), s->samples())
+                takeId = take.meta.id;
+                if (capture_stop_action(take.session->live.load(), take.session->samples())
                     == CaptureStopAction::reportNoAudio) {
-                    try { s->cancel(); } catch(...) {}
+                    log_take_cancel(take.meta, take.session->seconds(), "no_audio");
+                    try { take.session->cancel(); } catch(...) {}
                 } else {
-                    try { text = s->finish(); } catch(...) {}
+                    try { text = take.session->finish(); } catch(...) {}
+                    log_transcript(take.meta, text, text, take.session->seconds(), take.session->segments());
                 }
             }
-            std::string reply = text + "\n";
+            std::string reply = takeId + "\t" + text + "\n";
             write_all(cl,reply.data(),reply.size());
         }
         else if (cmd=="corr-cancel") { dispatch_sync(dispatch_get_main_queue(), ^{ daemon_cancel("user"); }); write_all(cl,"ok\n",3); }
+        else if (cmd=="correction-apply") {
+            std::vector<std::string> f = split_tabs(arg);
+            std::string rawText, appliedText, targetText;
+            bool ok = f.size() == 5 &&
+                      (f[1] == "replace" || f[1] == "insert") &&
+                      dlog::hex_decode(f[2], &rawText) &&
+                      dlog::hex_decode(f[3], &appliedText) &&
+                      dlog::hex_decode(f[4], &targetText);
+            if (ok) {
+                __block std::string mainTakeId;
+                dispatch_sync(dispatch_get_main_queue(), ^{ mainTakeId = g_editor_take_id; });
+                log_correction_apply(mainTakeId, f[0], rawText, appliedText, f[1], targetText);
+                write_all(cl,"ok\n",3);
+            } else {
+                write_all(cl,"err malformed\n",14);
+            }
+        }
         else if (cmd=="edit") {           // debug: open the editor on the given text (no mic) — mirrors the post-take spawn
             __block NSString *ns = [NSString stringWithUTF8String:arg.c_str()] ?: @"";
             dispatch_async(dispatch_get_main_queue(), ^{ [g_ctrl openEditorWithText:ns conf:@""]; });   // debug path: no confidence
@@ -1228,8 +1448,11 @@ static void serve_client(int cl) {
         else if (cmd=="quit") {
             write_all(cl,"bye\n",4); close(cl);
             dispatch_async(dispatch_get_main_queue(), ^{
-                std::unique_ptr<StreamingSession> s = daemon_stop_detach();   // release the mic if recording
-                if (s) s->cancel();
+                DetachedTake take = daemon_stop_detach();   // release the mic if recording
+                if (take) {
+                    log_take_cancel(take.meta, take.session->seconds(), "quit");
+                    take.session->cancel();
+                }
                 // NB: don't whisper_free(g_ctx) here — an async finish (hotkey/timer stop) may still be
                 // decoding on it; _exit reclaims all memory + GPU state cleanly (and skips dtors, so the
                 // g_finishing flag set by daemon_stop_detach above needs no explicit clear).
@@ -1260,6 +1483,7 @@ static void socket_accept_loop(int srv) {
 static int run_daemon(const std::string &modelPath) {
     signal(SIGPIPE, SIG_IGN);   // a client that disconnects mid-reply must not kill the daemon
     umask(0077);                // daemon-created files (socket, state file, editor log) → owner-only, not world-readable
+    g_take_logger.prune();
     // single instance: if a daemon already answers, bow out.
     { int c=socket(AF_UNIX,SOCK_STREAM,0); sockaddr_un a{}; a.sun_family=AF_UNIX;
       strncpy(a.sun_path,SOCK_PATH,sizeof(a.sun_path)-1);
@@ -1655,17 +1879,21 @@ static std::string editor_request(const std::string &line);  // editor → daemo
         _decoding = YES; [self setNeedsDisplay:YES];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             std::string r = editor_request("corr-stop");
-            NSString *res = [NSString stringWithUTF8String:r.c_str()] ?: @"";
+            size_t tab = r.find('\t');
+            std::string correctionId = tab == std::string::npos ? "" : r.substr(0, tab);
+            std::string correctionText = tab == std::string::npos ? r : r.substr(tab + 1);
+            NSString *res = [NSString stringWithUTF8String:correctionText.c_str()] ?: @"";
+            NSString *cid = [NSString stringWithUTF8String:correctionId.c_str()] ?: @"";
             dispatch_async(dispatch_get_main_queue(), ^{
                 self->_decoding = NO;
-                [self applyResult:res];
+                [self applyResult:res correctionId:cid];
             });
         });
     } else {
-        [self applyResult:[self nextStubResult]];
+        [self applyResult:[self nextStubResult] correctionId:@""];
     }
 }
-- (void)applyResult:(NSString *)res {
+- (void)applyResult:(NSString *)res correctionId:(NSString *)correctionId {
     std::string r = res.UTF8String ?: "";
     if (em_tokenize(r).empty()) { edlog(@"apply → empty result, no change"); [self setNeedsDisplay:YES]; return; }
     EditModel m; m.pos = _pos;                                  // bridge NSArray<NSString*> ↔ the pure model
@@ -1676,6 +1904,23 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     m.applyMiniTake(r);   // voice edit: drop whisper's auto Capital+dot, re-case to context, map spoken punctuation (src/dictate_editmodel.h)
     bool changed = m.snapshot() != before;
     if (changed) _history.recordEdit(before);    // record undo only if the splice actually changed the doc (skip a same-text re-dictation); also forks redo
+    if (changed && self.fromDaemon && correctionId.length) {
+        size_t begin = wasOnWord ? (size_t)wi : (size_t)gi;
+        size_t count = wasOnWord ? m.words.size() - before.words.size() + 1
+                                 : m.words.size() - before.words.size();
+        std::vector<std::string> appliedWords;
+        if (begin <= m.words.size() && count <= m.words.size() - begin)
+            appliedWords.assign(m.words.begin() + (std::ptrdiff_t)begin,
+                                m.words.begin() + (std::ptrdiff_t)(begin + count));
+        std::string applied = em_join(appliedWords);
+        std::string target = wasOnWord && wi >= 0 && (size_t)wi < before.words.size()
+                           ? before.words[(size_t)wi] : "";
+        std::string command = "correction-apply " + std::string(correctionId.UTF8String ?: "") + "\t" +
+                              (wasOnWord ? "replace" : "insert") + "\t" +
+                              dlog::hex_encode(r) + "\t" + dlog::hex_encode(applied) + "\t" +
+                              dlog::hex_encode(target);
+        editor_send(command);
+    }
     [self loadWords:m.words conf:m.conf pos:m.pos];             // model → view (re-measures)
     if (wasOnWord) edlog(@"apply → replace word %d (%lu chars)", wi, (unsigned long)res.length);
     else           edlog(@"apply → insert %lu chars at gap %d", (unsigned long)res.length, gi);
