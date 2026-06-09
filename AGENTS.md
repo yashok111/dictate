@@ -1,4 +1,4 @@
-# CLAUDE.md — `dictate`
+# AGENTS.md — `dictate`
 
 Native macOS push-to-talk dictation. Captures the mic (AVFoundation), transcribes
 locally with whisper.cpp (libwhisper, Metal), shows a banner while you speak, then

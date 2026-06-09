@@ -23,8 +23,7 @@ CXXFLAGS := -std=c++17 -fobjc-arc -O2 -Wall -Wextra \
             -DGGML_LIBEXEC='"$(GGML)/libexec"'
 LDFLAGS  := -L$(WHISPER)/lib -L$(GGML)/lib -lwhisper -lggml -lggml-base \
             -framework Foundation -framework AVFoundation -framework AppKit \
-            -framework Accelerate -framework Carbon -framework ApplicationServices \
-            -framework CoreAudio
+            -framework Accelerate -framework Carbon -framework ApplicationServices
 # Bake the dylib dirs into the binary so it runs without DYLD_LIBRARY_PATH.
 LDFLAGS  += -Wl,-rpath,$(WHISPER)/lib -Wl,-rpath,$(GGML)/lib
 
@@ -41,12 +40,13 @@ PLIST := src/Info.plist
 # Absent → the binary is left ad-hoc (works, but grants won't persist). See gotcha #14.
 SIGN_ID    ?= dictate-codesign
 SIGN_IDENT ?= com.user.dictate
+SIGN_SHA1  ?= $(shell security find-certificate -c "$(SIGN_ID)" -Z +              "$$HOME/Library/Keychains/login.keychain-db" 2>/dev/null +              | awk '/SHA-1 hash:/ {print $$3; exit}')
 
 $(BIN): $(SRC) Makefile $(PLIST)
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(BIN) $(LDFLAGS) -sectcreate __TEXT __info_plist $(PLIST)
-	@if security find-identity -p codesigning 2>/dev/null | grep -q "\"$(SIGN_ID)\""; then \
-	    codesign --force --identifier "$(SIGN_IDENT)" --sign "$(SIGN_ID)" $(BIN) \
-	      && echo "✓ signed $(BIN): $(SIGN_IDENT) / $(SIGN_ID) (TCC-stable)"; \
+	@if [ -n "$(SIGN_SHA1)" ]; then \
+	    codesign --force --identifier "$(SIGN_IDENT)" --sign "$(SIGN_SHA1)" $(BIN) \
+	      && echo "✓ signed $(BIN): $(SIGN_IDENT) / $(SIGN_ID) [$(SIGN_SHA1)] (TCC-stable)"; \
 	  else \
 	    echo "⚠ codesigning identity '$(SIGN_ID)' not found — $(BIN) left ad-hoc"; \
 	    echo "  (TCC grants break on each rebuild; run scripts/make-codesign-cert.sh once)"; \

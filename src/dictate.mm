@@ -25,7 +25,6 @@
 
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
-#import <CoreAudio/CoreAudio.h>   // HAL device enumeration: force the built-in mic (gotcha #22)
 #import <AppKit/AppKit.h>
 #import <Accelerate/Accelerate.h>
 #import <Carbon/Carbon.h>   // global hotkey: RegisterEventHotKey, kVK_*, cmdKey/shiftKey
@@ -63,6 +62,7 @@
 #include <crt_externs.h>     // _NSGetEnviron — environment for posix_spawn
 #include <sys/wait.h>        // waitpid — reap the editor child + recover if it dies
 #include <sys/time.h>        // struct timeval — SO_RCVTIMEO on accepted client sockets
+#include <dirent.h>
 
 #include "whisper.h"
 #include "ggml-backend.h"
@@ -81,6 +81,7 @@
 #include "dictate_dict.h"
 #include "dictate_idle.h"
 #include "dictate_edscroll.h"
+#include "dictate_capture.h"
 
 // Homebrew ships ggml's CPU/Metal backends as separate plugin .so files loaded at
 // runtime (otherwise the registry is empty → whisper_init aborts, devices=0).
@@ -313,6 +314,7 @@ public:
     }
 
     double seconds() const { return (double)full_.size() / WHISPER_SAMPLE_RATE; }
+    size_t samples() const { return full_.size(); }
     int    segments() const { std::lock_guard<std::mutex> lk(tmu_); return (int)parts_.size(); }
     bool   wasCapped() const { return capped_.load(std::memory_order_relaxed); }  // audio hit MAX_TAKE_SEC → truncated
     // Per-word confidence for the final transcript, aligned to em_tokenize of the editor's text.
@@ -425,68 +427,6 @@ private:
 // ── microphone capture → 16 kHz mono → StreamingSession::feed ────────────────
 static void on_capture_lost(void);   // mid-take capture rebuild failed → stop the take + notify (defined after DictateController)
 
-// Find the built-in (MacBook) microphone via the CoreAudio HAL. AVAudioEngine.inputNode
-// otherwise follows the SYSTEM default input, which switches to AirPods/headset the moment
-// they connect — and those mics are markedly worse than the built-in one. We force the
-// built-in device on the input AudioUnit instead (gotcha #22). Returns kAudioObjectUnknown
-// if none is found (→ caller keeps the system default). Disable with DICTATE_BUILTIN_MIC=0.
-static AudioDeviceID find_builtin_input_device(void) {
-    AudioObjectPropertyAddress addr = {
-        kAudioHardwarePropertyDevices,
-        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-    UInt32 sz = 0;
-    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, nullptr, &sz) != noErr || sz == 0)
-        return kAudioObjectUnknown;
-    std::vector<AudioDeviceID> devs(sz / sizeof(AudioDeviceID));
-    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, nullptr, &sz, devs.data()) != noErr)
-        return kAudioObjectUnknown;
-
-    for (AudioDeviceID d : devs) {
-        // Must have at least one input channel (an output-only device has an empty input
-        // stream config) — otherwise a built-in *speaker* could match the transport check.
-        AudioObjectPropertyAddress sa = {
-            kAudioDevicePropertyStreamConfiguration,
-            kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain };
-        UInt32 csz = 0;
-        if (AudioObjectGetPropertyDataSize(d, &sa, 0, nullptr, &csz) != noErr || csz == 0) continue;
-        std::vector<uint8_t> buf(csz);
-        AudioBufferList *bl = (AudioBufferList *)buf.data();
-        if (AudioObjectGetPropertyData(d, &sa, 0, nullptr, &csz, bl) != noErr) continue;
-        UInt32 chans = 0;
-        for (UInt32 i = 0; i < bl->mNumberBuffers; ++i) chans += bl->mBuffers[i].mNumberChannels;
-        if (chans == 0) continue;   // no input → not a microphone
-
-        AudioObjectPropertyAddress ta = {
-            kAudioDevicePropertyTransportType,
-            kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-        UInt32 transport = 0, tsz = sizeof(transport);
-        if (AudioObjectGetPropertyData(d, &ta, 0, nullptr, &tsz, &transport) != noErr) continue;
-        if (transport == kAudioDeviceTransportTypeBuiltIn) return d;
-    }
-    return kAudioObjectUnknown;
-}
-
-// Pin the engine's input node to the built-in mic. Returns YES only if it actually CHANGED
-// the device — so the caller can swallow the single configuration-change notification that
-// setDeviceID posts (we caused it), instead of needlessly rebuilding capture on every take.
-// No-op (returns NO) if disabled / not found / already on the built-in device.
-// Must run BEFORE -inputFormatForBus: is read, since the device determines the input format.
-static BOOL prefer_builtin_input(AVAudioEngine *engine) {
-    static const bool enabled = []{ const char *e = getenv("DICTATE_BUILTIN_MIC"); return !(e && !strcmp(e, "0")); }();
-    if (!enabled) return NO;                              // DICTATE_BUILTIN_MIC=0 → keep system default
-    AudioDeviceID dev = find_builtin_input_device();
-    if (dev == kAudioObjectUnknown) return NO;
-    AUAudioUnit *au = engine.inputNode.AUAudioUnit;
-    if (au.deviceID == dev) return NO;                    // already on the built-in mic → no change, no churn
-    NSError *err = nil;
-    if (![au setDeviceID:dev error:&err]) {
-        fprintf(stderr, "⚠ could not pin built-in mic (id=%u): %s\n",
-                (unsigned)dev, err.localizedDescription.UTF8String ?: "?");
-        return NO;
-    }
-    return YES;
-}
-
 @interface Recorder : NSObject
 - (BOOL)startFeeding:(StreamingSession *)sess error:(NSError **)err;
 - (void)stop;
@@ -498,7 +438,6 @@ static BOOL prefer_builtin_input(AVAudioEngine *engine) {
     AVAudioFormat    *_outFmt;
     StreamingSession *_sess;     // non-owning; valid for the life of the take
     id                _cfgObs;   // AVAudioEngineConfigurationChange observer token
-    BOOL              _pinReconfig;   // swallow the one config-change our own built-in-mic pin triggers (gotcha #22)
     std::shared_ptr<std::atomic<int>> _tapGuard;   // in-flight tap-callback count; -stop waits it to 0
 }
 - (instancetype)init {
@@ -513,12 +452,6 @@ static BOOL prefer_builtin_input(AVAudioEngine *engine) {
 - (BOOL)startFeeding:(StreamingSession *)sess error:(NSError **)err {
     _engine = [[AVAudioEngine alloc] init];
     _sess   = sess;
-    // Pin to the built-in mic before the input format is read (the device determines it).
-    // Keeps capture on the good MacBook mic even when AirPods/a headset are connected. This
-    // setDeviceID posts ONE configuration-change notification (we changed the device) — record
-    // that so -reconfigure swallows it instead of rebuilding capture on every take. The tap is
-    // already built on the pinned device below, so that rebuild would be pure churn (+ a race).
-    _pinReconfig = prefer_builtin_input(_engine);
     // A device/route change (unplug AirPods, switch default input, sample-rate change)
     // STOPS the engine and silences the tap. Without this the take would dribble to a
     // truncated/empty transcript with no signal to the user. Rebuild + restart on change.
@@ -582,10 +515,6 @@ static BOOL prefer_builtin_input(AVAudioEngine *engine) {
 }
 - (void)reconfigure {
     if (!_engine) return;                                 // already stopped
-    if (_pinReconfig) {                                   // this notification is our own built-in-mic pin
-        _pinReconfig = NO;                                // (gotcha #22) — the tap was already built on the
-        return;                                           // pinned device in startFeeding; don't rebuild
-    }
     fprintf(stderr, "audio configuration changed → rebuilding capture\n");
     [_engine.inputNode removeTapOnBus:0];
     [_engine stop];
@@ -787,9 +716,9 @@ static void paste_text(NSString *text) {                 // main thread
 // The banner is status-only (no live transcript) — the take's words surface in the post-take
 // editor. Closed segments still transcribe during recording (the streaming latency win); only
 // the dead open-segment live-preview path is gone.
-static std::string daemon_start() {
+static std::string daemon_start(const char *kind) {
     std::lock_guard<std::mutex> lk(g_mu);
-    if (g_sess) return "";                                   // already recording
+    if (g_sess) return (kind && !strcmp(kind, "correction")) ? "busy" : "";   // main start is idempotent; corr-start must know it failed
     if (g_finishing.load()) return "busy";                  // previous take still finalizing on g_ctx (gotcha #5)
     if (!ensure_model_loaded()) return "model load failed";  // idle-unload (gotcha #7) freed it → reload on demand
     g_last_active_ms = now_ms();                             // reset the idle-unload clock
@@ -838,7 +767,8 @@ static std::unique_ptr<StreamingSession> daemon_stop_detach(void) {
     return s;
 }
 
-static void daemon_cancel(void) {
+static void daemon_cancel(const char *reason) {
+    (void)reason;
     std::unique_ptr<StreamingSession> s; Recorder *r;
     { std::lock_guard<std::mutex> lk(g_mu); s=std::move(g_sess); r=g_rec; g_rec=nil;
       if (s) g_finishing.store(true); }   // block a new take until the detached cancel frees g_ctx (gotcha #5)
@@ -904,7 +834,7 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
 // ── recording lifecycle (all on main) ──
 - (std::string)beginTakeError {
     { std::lock_guard<std::mutex> lk(g_mu); if (g_sess) return ""; }   // already recording → idempotent (don't reset banner/timer)
-    std::string e = daemon_start();
+    std::string e = daemon_start("main");
     if (e.empty()) { g_target_app = [[NSWorkspace sharedWorkspace] frontmostApplication];   // paste target, before the editor steals focus
                      [self showWarmup]; register_esc(); [self startTimer]; }
     else if (e != "busy") [self showError:@(e.c_str())];   // "busy" = a finalize is in flight → silent no-op
@@ -921,6 +851,17 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     if (!s) { [self hideUI]; return; }
     unregister_esc();
     [self stopTimer];
+    if (capture_stop_action(s->live.load(), s->samples())
+        == CaptureStopAction::reportNoAudio) {
+        StreamingSession *silent = s.release();
+        std::thread([silent]{
+            std::unique_ptr<StreamingSession> own(silent);
+            try { own->cancel(); } catch (...) {}
+            g_finishing.store(false);
+        }).detach();
+        [self showError:@"микрофон не передал аудио"];
+        return;
+    }
     [self showTranscribing];
     StreamingSession *raw = s.release();   // ownership handed to the background finish thread
     std::thread([self, raw]{
@@ -936,7 +877,8 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
             // — valid post-finish — BEFORE delete; best-effort, an empty result just disables highlighting.
             std::string confStr;
             try { confStr = conf::serialize(conf::realign(text, raw->confidence(), finalText)); } catch (...) {}
-            fprintf(stderr, "stop: %.2fs, %d seg → %zu chars\n", raw->seconds(), raw->segments(), finalText.size());
+            double seconds = raw->seconds(); int segments = raw->segments();
+            fprintf(stderr, "stop: %.2fs, %d seg → %zu chars\n", seconds, segments, finalText.size());
             delete raw;
             NSString *ns = finalText.empty()? nil : [NSString stringWithUTF8String:finalText.c_str()];
             NSString *confNs = [NSString stringWithUTF8String:confStr.c_str()] ?: @"";
@@ -944,7 +886,7 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
         }
     }).detach();
 }
-- (void)stopFinishedWithText:(NSString *)ns conf:(NSString *)conf {   // hotkey/timer stop → open the editor
+- (void)stopFinishedWithText:(NSString *)ns conf:(NSString *)conf {
     g_finishing.store(false);              // finalize done → a new take may start
     [self hideUI];
     [self openEditorWithText:ns conf:conf];
@@ -980,12 +922,12 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
 - (void)editorCancel {
     g_editor_open.store(false);
     register_toggle();
-    daemon_cancel();   // cancel any orphaned mini-take: if the editor died mid corr-start/recording, its
+    daemon_cancel("editor_orphan");   // cancel any orphaned mini-take: if the editor died mid corr-start/recording, its
                        // mic+session would otherwise stay live forever (no-op if no take is in flight)
     NSRunningApplication *app = g_target_app; g_target_app = nil; // release the retained target once used
     if (app) [app activateWithOptions:NSApplicationActivateAllWindows];
 }
-- (void)cancel { unregister_esc(); [self stopTimer]; daemon_cancel(); [self hideUI]; }
+- (void)cancel { unregister_esc(); [self stopTimer]; daemon_cancel("user"); [self hideUI]; }
 - (void)toggle {
     if (g_editor_open.load()) return;                            // editor owns ⌘⇧D while open (hotkey unregistered)
     bool rec; { std::lock_guard<std::mutex> lk(g_mu); rec = (bool)g_sess; }
@@ -1074,9 +1016,21 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     [self layoutForTextHeight:textH];
     [_banner orderFrontRegardless];
 }
+- (NSString *)currentInputSourceName {
+    AVCaptureDevice *dev = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+    NSString *name = dev.localizedName ?: dev.uniqueID;
+    if (!name.length) return @"";
+    return name;
+}
+- (NSString *)captureHeader:(NSString *)status controls:(NSString *)controls {
+    std::string text = capture_banner_text(status.UTF8String ?: "",
+                                           [self currentInputSourceName].UTF8String ?: "",
+                                           controls.UTF8String ?: "");
+    return [NSString stringWithUTF8String:text.c_str()] ?: status;
+}
 - (void)showWarmup {
     _warmTicks = 0;
-    [self renderHeader:@"⏳  Запуск микрофона…"];
+    [self renderHeader:[self captureHeader:@"⏳  Запуск микрофона…" controls:@""]];
     [_warm invalidate];
     _warm = [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(warmTick:) userInfo:nil repeats:YES];
 }
@@ -1084,12 +1038,13 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     bool live=false; { std::lock_guard<std::mutex> lk(g_mu); live = g_sess && g_sess->live.load(); }
     if (live) { [t invalidate]; if (_warm==t) _warm=nil; [self showLive]; return; }
     if (++_warmTicks > 100) {                          // ~10 s with no audio → show an error instead of a stuck «Запуск…»
-        [t invalidate]; if (_warm==t) _warm=nil;       //   (the 60 s cap still finalizes the silent take)
+        [t invalidate]; if (_warm==t) _warm=nil;
+        unregister_esc(); [self stopTimer]; daemon_cancel("no_audio_timeout");
         [self showError:@"микрофон не запустился"];
     }
 }
 - (void)showLive {
-    [self renderHeader:@"🎙  ЗАПИСЬ — говори\n⌘⇧D — стоп · Esc — отмена"];
+    [self renderHeader:[self captureHeader:@"🎙  ЗАПИСЬ — говори" controls:@"⌘⇧D — стоп · Esc — отмена"]];
 }
 - (void)showTranscribing { [_warm invalidate]; _warm=nil;
     [self renderHeader:@"⏳  расшифровка…"]; }
@@ -1212,11 +1167,19 @@ static void serve_client(int cl) {
             dispatch_sync(dispatch_get_main_queue(), ^{ s = [g_ctrl stopDetachForSocket]; });
             std::string text;
             if (s) {
-                try { text = s->finish(); }   // off-main: joins the worker without freezing the run loop. A throw
-                catch (...) {}                //   here would std::terminate the socket thread AND skip the finalize
-                                              //   below (g_finishing would wedge) — swallow and finalize regardless.
-                try { text = finalize_transcript(text); } catch (...) {}   // post-normalize before clipboard (DICTATE_NORMALIZE); by-value so a throw leaves the raw text intact, never std::terminate on the socket thread
-                fprintf(stderr,"stop: %.2fs, %d seg → %zu chars\n", s->seconds(), s->segments(), text.size());
+                std::string rawText;
+                if (capture_stop_action(s->live.load(), s->samples())
+                    == CaptureStopAction::reportNoAudio) {
+                    try { s->cancel(); } catch (...) {}
+                } else {
+                    try { rawText = s->finish(); }   // off-main: joins the worker without freezing the run loop. A throw
+                    catch (...) {}                //   here would std::terminate the socket thread AND skip the finalize
+                                                  //   below (g_finishing would wedge) — swallow and finalize regardless.
+                    text = rawText;
+                    try { text = finalize_transcript(rawText); } catch (...) {}   // post-normalize before clipboard
+                    double seconds=s->seconds(); int segments=s->segments();
+                    fprintf(stderr,"stop: %.2fs, %d seg → %zu chars\n", seconds, segments, text.size());
+                }
                 __block NSString *ns = text.empty()? nil : [NSString stringWithUTF8String:text.c_str()];
                 dispatch_sync(dispatch_get_main_queue(), ^{ @autoreleasepool { [g_ctrl finalizeSocketStop:ns]; } });
             }
@@ -1231,17 +1194,26 @@ static void serve_client(int cl) {
         else if (cmd=="editor-cancel") { dispatch_async(dispatch_get_main_queue(), ^{ [g_ctrl editorCancel]; }); write_all(cl,"ok\n",3); }
         else if (cmd=="corr-start") {     // editor mini-take: start the mic (no banner — the editor shows the state)
             __block std::string e;
-            dispatch_sync(dispatch_get_main_queue(), ^{ e = daemon_start(); });
+            dispatch_sync(dispatch_get_main_queue(), ^{ e = daemon_start("correction"); });
             std::string m = e.empty()? "ok\n" : ("err "+e+"\n"); write_all(cl,m.data(),m.size());
         }
         else if (cmd=="corr-stop") {      // stop the mini-take, transcribe, return the text to the editor
             __block std::unique_ptr<StreamingSession> s;
             dispatch_sync(dispatch_get_main_queue(), ^{ s = daemon_stop_detach(); });
             std::string text;
-            if (s) { FinishingGuard fg; try { text = s->finish(); } catch(...){} }   // RAII clears g_finishing; catch avoids std::terminate on the socket thread (symmetry with `stop`)
-            text += "\n"; write_all(cl,text.data(),text.size());
+            if (s) {
+                FinishingGuard fg;
+                if (capture_stop_action(s->live.load(), s->samples())
+                    == CaptureStopAction::reportNoAudio) {
+                    try { s->cancel(); } catch(...) {}
+                } else {
+                    try { text = s->finish(); } catch(...) {}
+                }
+            }
+            std::string reply = text + "\n";
+            write_all(cl,reply.data(),reply.size());
         }
-        else if (cmd=="corr-cancel") { dispatch_sync(dispatch_get_main_queue(), ^{ daemon_cancel(); }); write_all(cl,"ok\n",3); }
+        else if (cmd=="corr-cancel") { dispatch_sync(dispatch_get_main_queue(), ^{ daemon_cancel("user"); }); write_all(cl,"ok\n",3); }
         else if (cmd=="edit") {           // debug: open the editor on the given text (no mic) — mirrors the post-take spawn
             __block NSString *ns = [NSString stringWithUTF8String:arg.c_str()] ?: @"";
             dispatch_async(dispatch_get_main_queue(), ^{ [g_ctrl openEditorWithText:ns conf:@""]; });   // debug path: no confidence
@@ -1684,13 +1656,16 @@ static std::string editor_request(const std::string &line);  // editor → daemo
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             std::string r = editor_request("corr-stop");
             NSString *res = [NSString stringWithUTF8String:r.c_str()] ?: @"";
-            dispatch_async(dispatch_get_main_queue(), ^{ self->_decoding = NO; [self applyResult:res]; });
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_decoding = NO;
+                [self applyResult:res];
+            });
         });
     } else {
         [self applyResult:[self nextStubResult]];
     }
 }
-- (void)applyResult:(NSString *)res {   // replace the current word / insert at the gap (src/dictate_editmodel.h)
+- (void)applyResult:(NSString *)res {
     std::string r = res.UTF8String ?: "";
     if (em_tokenize(r).empty()) { edlog(@"apply → empty result, no change"); [self setNeedsDisplay:YES]; return; }
     EditModel m; m.pos = _pos;                                  // bridge NSArray<NSString*> ↔ the pure model
@@ -1699,7 +1674,8 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     EditSnapshot before = m.snapshot();
     BOOL wasOnWord = m.onWord(); int wi = m.wordIndex(), gi = m.gapIndex();
     m.applyMiniTake(r);   // voice edit: drop whisper's auto Capital+dot, re-case to context, map spoken punctuation (src/dictate_editmodel.h)
-    if (m.snapshot() != before) _history.recordEdit(before);    // record undo only if the splice actually changed the doc (skip a same-text re-dictation); also forks redo
+    bool changed = m.snapshot() != before;
+    if (changed) _history.recordEdit(before);    // record undo only if the splice actually changed the doc (skip a same-text re-dictation); also forks redo
     [self loadWords:m.words conf:m.conf pos:m.pos];             // model → view (re-measures)
     if (wasOnWord) edlog(@"apply → replace word %d (%lu chars)", wi, (unsigned long)res.length);
     else           edlog(@"apply → insert %lu chars at gap %d", (unsigned long)res.length, gi);

@@ -1,15 +1,8 @@
 #!/usr/bin/env bash
-# Install curated agent skills for the `dictate` repo into .claude/skills/.
-# Non-interactive: passes -y and targets the `claude-code` agent, so files land
-# in <repo>/.claude/skills/ — exactly where Claude Code auto-discovers them.
+# Install curated agent skills for the `dictate` repo for Claude Code and Codex.
+# Non-interactive: passes -y and targets both local agents, so each can discover
+# the skills while working in this repository.
 # Re-run after a fresh clone to repopulate (lockfile: skills-lock.json).
-#
-# NB — agent target differs from the sibling Telega script on purpose. Telega
-# installs to the `universal` agent (.agents/skills/) as a cross-agent library
-# and symlinks a few into .claude/skills/. Here the whole point is that *this*
-# Claude Code loads the skills while working ON dictate, so we install straight
-# to .claude/skills/ (the only dir Claude Code reads natively). Override with
-# DICTATE_SKILLS_AGENT=universal if you want the Telega-style library location.
 #
 # Stack this curates for: native macOS push-to-talk dictation in Objective-C++
 # (src/dictate.mm) — AVFoundation mic capture, whisper.cpp/libwhisper on Metal,
@@ -34,7 +27,7 @@ REPO_LOWLEVEL="https://github.com/mohitmishra786/low-level-dev-skills"
 REPO_ECC="https://github.com/affaan-m/everything-claude-code"
 REPO_ANTHROPICS="https://github.com/anthropics/skills"
 
-AGENT="${DICTATE_SKILLS_AGENT:-claude-code}"
+AGENTS=(claude-code codex)
 
 # Language-agnostic workflow discipline: plan → TDD → debug to root cause →
 # verify before claiming done → review. Useful on any change to dictate.
@@ -173,16 +166,17 @@ install_set() {
   shift
   local -a skills=("$@")
   echo
-  echo "=== $repo (${#skills[@]} skills) → agent: $AGENT ==="
-  # -y skips prompts; -a <agent> pins where skills land (.claude/skills/ for
-  # claude-code). --skill matches each SKILL.md `name:` field (spaces ok).
+  echo "=== $repo (${#skills[@]} skills) -> agents: ${AGENTS[*]} ==="
+  # -y skips prompts; repeated -a targets both local agents. --skill matches
+  # each SKILL.md `name:` field (spaces ok).
   # SUPPLY CHAIN: `npx -y -p skills` fetches+runs the `skills` package unpinned, and the
   # repos above are third-party. This runs arbitrary code as you — only run it for sources
   # you trust. To harden, pin the package (e.g. `-p skills@X.Y.Z`) and the repos to a commit.
-  run npx -y -p skills skills add "$repo" -y -a "$AGENT" --skill "${skills[@]}"
+  run npx -y -p skills skills add "$repo" -y \
+    -a "${AGENTS[0]}" -a "${AGENTS[1]}" --skill "${skills[@]}"
 }
 
-cd "$(dirname "$0")/.."  # cwd → repo root (skills land in .claude/skills/)
+cd "$(dirname "$0")/.."  # cwd -> repo root (local agent skill directories)
 
 for t in "${TARGETS[@]}"; do
   case "$t" in
@@ -195,4 +189,4 @@ for t in "${TARGETS[@]}"; do
 done
 
 echo
-echo "done. skills in .claude/skills/. lockfile: skills-lock.json"
+echo "done. skills installed locally for Claude Code and Codex. lockfile: skills-lock.json"

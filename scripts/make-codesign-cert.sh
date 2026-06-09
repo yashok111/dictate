@@ -11,7 +11,8 @@
 set -euo pipefail
 ID="${1:-dictate-codesign}"
 
-if security find-identity -p codesigning 2>/dev/null | grep -q "\"$ID\""; then
+if security find-certificate -a -c "$ID" -Z "$HOME/Library/Keychains/login.keychain-db" \
+     2>/dev/null | grep -q "^SHA-1 hash:"; then
   echo "✓ codesigning identity '$ID' already exists — nothing to do."
   exit 0
 fi
