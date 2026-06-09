@@ -11,6 +11,7 @@
 /docs/
 
 # third-party agent skills installed via scripts/install-skills.sh
-# (skills-lock.json IS committed; .claude/skills/ is repopulated from the lockfile).
-# If you hand-write a project skill, carve it out, e.g. !.claude/skills/my-skill/
+# (skills-lock.json IS committed; agent directories are repopulated from it).
+# If you hand-write a project skill, carve it out with a negated rule.
+.agents/skills/
 .claude/skills/
