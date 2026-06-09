@@ -40,7 +40,8 @@ TEST_CASE("parse + first_line compose like serve_client (edit verb w/ utf8 arg)"
 }
 TEST_CASE("all known verbs split correctly") {
     for (const char* v : {"start","stop","cancel","ping","quit","feedfile",
-                          "corr-start","corr-stop","corr-cancel","editor-cancel","axcheck"}) {
+                          "corr-start","corr-stop","corr-cancel","correction-apply",
+                          "editor-cancel","axcheck"}) {
         auto c = parse_command(v);
         CHECK(c.cmd == v);
         CHECK(c.arg == "");

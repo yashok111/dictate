@@ -108,7 +108,7 @@ macOS ties your Mic/Accessibility grants to the exact binary hash — every `mak
 invalidates them and auto-paste silently stops. Run `scripts/make-codesign-cert.sh`
 **once** to create a stable self-signed identity; `make` then signs the binary so the
 grants persist. Diagnose a non-pasting take with
-`printf 'axcheck\n' | nc -U /tmp/dictate.sock` (want `trusted`).
+`dictate axcheck` (want `trusted`).
 
 ## Everyday use
 
@@ -181,6 +181,30 @@ becomes `…`, and a spaced hyphen becomes an em-dash (` — `). It is deliberat
 numbers, and decimals (`3,14`) untouched. Set `DICTATE_NORMALIZE=0` to disable it and get
 the raw whisper text (useful for an A/B). The transform itself is pure logic in
 `src/dictate_text.h` (`normalize_text`) and is covered by `make test`.
+
+## Local text logs
+
+Local text logs are off by default. Start the daemon with `DICTATE_LOG=1` to keep
+text-only usage logs in:
+
+```text
+~/.local/share/dictate/logs/YYYY-MM-DD.ndjson
+```
+
+Each line is one JSON event with a `take_id`, timestamp, take kind (`main` or
+`correction`), and event type. The log includes recording starts, cancellations, raw and
+normalized transcripts, editor accepts/cancels, and applied voice corrections. It does
+**not** store audio, and a recording canceled before recognition is not transcribed just
+for the log; it records only the cancellation metadata and duration.
+
+The log directory is owner-only (`0700`), daily files are owner-only (`0600`), and files
+outside the seven retained local calendar dates (today plus the previous six dates) are
+deleted automatically by the daemon. The logs are local data intended for later dictionary
+analysis; they are never uploaded by `dictate`.
+
+For a LaunchAgent install, add `DICTATE_LOG=1` to the agent's
+`EnvironmentVariables` and restart it with `launchctl kickstart -k
+gui/$(id -u)/com.user.dictate`.
 
 ## Tuning the streaming VAD
 
