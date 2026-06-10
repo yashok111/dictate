@@ -61,6 +61,11 @@ run: $(BIN)
 post-build-check: $(BIN)
 	scripts/post-build-check.sh ./$(BIN) "$$HOME/.local/bin/$(BIN)"
 
+# One-shot deploy: build → unit-test → install to ~/.local/bin → restart the LaunchAgent →
+# post-build checks. Pass flags through, e.g.  make deploy ARGS=--no-test
+deploy:
+	scripts/deploy.sh $(ARGS)
+
 # Sanitizer builds (skills: sanitizers, concurrency-debugging) — separate binaries so they
 # don't clobber ./dictate. TSan catches data races on the worker/cancel paths; ASan+UBSan
 # catch memory errors and UB. Exercise without a mic via:  ./dictate-tsan --file /tmp/t.wav
@@ -94,4 +99,4 @@ clean:
 	rm -f $(BIN) $(BIN)-tsan $(BIN)-asan $(TEST_BIN)
 	rm -rf $(BIN).dSYM $(BIN)-tsan.dSYM $(BIN)-asan.dSYM
 
-.PHONY: run post-build-check clean tsan asan tidy test
+.PHONY: run post-build-check deploy clean tsan asan tidy test
