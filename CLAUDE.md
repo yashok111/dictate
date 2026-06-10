@@ -243,6 +243,12 @@ KeepAlive). It must be a user agent, not a system LaunchDaemon — it needs the 
 mic, clipboard, and GUI session. The plist runs the **installed copy at
 `~/.local/bin/dictate`**, not the repo build (gotcha #13).
 
+**One-shot deploy:** `make deploy` (or `scripts/deploy.sh`) does the whole dance —
+`make test` → `make` → install to `~/.local/bin` → `launchctl kickstart -k` →
+`scripts/post-build-check.sh` (waits for the daemon to come up, then verifies binary/signature/
+LaunchAgent/ping/Accessibility). Flags: `scripts/deploy.sh --no-test` / `--no-check` (or
+`make deploy ARGS=--no-test`). The manual steps below are the underlying commands.
+
 ```sh
 make && cp dictate ~/.local/bin/dictate          # build + install (NOT into ~/Documents — gotcha #13)
 sed "s|/Users/YOUR_USERNAME|$HOME|" com.user.dictate.plist > ~/Library/LaunchAgents/com.user.dictate.plist  # launchd won't expand ~

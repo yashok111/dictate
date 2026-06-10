@@ -1590,6 +1590,10 @@ static int client_cmd(const std::string &cmd, bool printReply) {
 // target app + pastes. A standalone `dictate editor "text"` run (no --from-daemon) uses a
 // local stub for the mini-take and accept just prints/clipboards (for quick iteration).
 static const CGFloat ED_BODY_PT = 30, ED_HDR_TOP = 78, ED_FTR_H = 64, ED_BODY_PAD = 40;
+// Horizontal breathing room reserved around the cursor (hot) word so its rounded highlight box
+// (drawn at NSInsetRect(rect, -ED_HL_PAD, …)) sits in its own gap instead of overlapping the
+// neighbouring words. The layout reflows on every cursor move (`moved`), so reserving it is free.
+static const CGFloat ED_HL_PAD = 6;
 
 // Uncertain-word highlighting (whisper logprob): a (non-cursor, non-punctuation) word whose
 // MIN per-token confidence is below ED_CONF_THRESHOLD is drawn in amber, so the eye lands on
@@ -1716,10 +1720,14 @@ static std::string editor_request(const std::string &line);  // editor → daemo
         NSFont *f = c.isCaret ? [self caretFont] : bf;
         c.rect = NSMakeRect(0, 0, ceil([c.text sizeWithAttributes:@{NSFontAttributeName:f}].width), textH);
     }
+    // Inter-word gap wide enough that the cursor word's rounded highlight box (overhangs ED_HL_PAD on
+    // each side) keeps a visible gap to its neighbours instead of overlapping them. Uniform (not just
+    // around the hot word) so the layout never reflows as the cursor moves — no jitter.
+    CGFloat gapW = MAX(spaceW, 2 * ED_HL_PAD + 5);
     CGFloat x = 0; int line = 0;
     for (EdCell *c in cells) {
         CGFloat w = c.rect.size.width;
-        if (x > 0 && x + spaceW + w > bodyW) { x = 0; line++; } else if (x > 0) { x += spaceW; }
+        if (x > 0 && x + gapW + w > bodyW) { x = 0; line++; } else if (x > 0) { x += gapW; }
         c.line = line; c.rect = NSMakeRect(x, 0, w, textH); x += w;
     }
     _lineCount = line + 1;
@@ -1967,7 +1975,7 @@ static std::string editor_request(const std::string &line);  // editor → daemo
         } else {
             BOOL hot = ([self onWord] && c.wordIndex == [self wordIndex]);
             if (hot) {
-                NSBezierPath *hl = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(c.rect, -6, -3) xRadius:6 yRadius:6];
+                NSBezierPath *hl = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(c.rect, -ED_HL_PAD, -3) xRadius:6 yRadius:6];
                 [(_recording ? [NSColor systemRedColor] : [NSColor systemYellowColor]) setFill]; [hl fill];
             }
             // Low-confidence (non-cursor, non-punctuation) words → amber, leading the eye to likely errors.
