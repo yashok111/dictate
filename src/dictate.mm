@@ -981,11 +981,12 @@ static std::string daemon_feed_audio(const std::vector<float> &audio) {
     return "";
 }
 
-// ── Banner look & layout (Hammerspoon-style: full-width, translucent, bordered; all tunable) ──
-static const double BANNER_RADIUS    = 14;    // corner radius (HS used 14)
-static const double BANNER_BG_ALPHA  = 0.5;   // background = black at this alpha (lower ⇒ more see-through, like HS)
+// ── Banner look & layout (matched to the editor card chrome — see EditorView drawRect; all tunable) ──
+static const double BANNER_RADIUS    = 18;    // corner radius (matches the editor card)
+static const double BANNER_BG_WHITE  = 0.06;  // background = this white level (matches the editor's near-black card)
+static const double BANNER_BG_ALPHA  = 0.96;  // background alpha (matches the editor card)
 static const double BANNER_BORDER_W  = 1;     // hairline border width
-static const double BANNER_BORDER_A  = 0.6;   // border colour = white at this alpha
+static const double BANNER_BORDER_A  = 0.28;  // border colour = white at this alpha (matches the editor card)
 static const double BANNER_HMARGIN   = 12;    // gap to each screen edge; the card otherwise spans the full width
 static const double BANNER_HINSET    = 28;    // text inset L/R inside the card
 static const double BANNER_VINSET    = 22;    // text inset T/B inside the card
@@ -1137,7 +1138,7 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
                                | NSWindowCollectionBehaviorFullScreenAuxiliary;
     NSView *bg = [[NSView alloc] initWithFrame:r];                            // flat translucent fill — HS-style glass
     bg.wantsLayer = YES;
-    bg.layer.backgroundColor = [NSColor colorWithWhite:0 alpha:BANNER_BG_ALPHA].CGColor;   // see-through, no blur
+    bg.layer.backgroundColor = [NSColor colorWithWhite:BANNER_BG_WHITE alpha:BANNER_BG_ALPHA].CGColor;   // matches the editor card
     bg.layer.cornerRadius = BANNER_RADIUS; bg.layer.masksToBounds = YES;
     bg.layer.borderWidth = BANNER_BORDER_W;                                   // HS-style hairline edge
     bg.layer.borderColor = [NSColor colorWithWhite:1 alpha:BANNER_BORDER_A].CGColor;
@@ -1164,7 +1165,7 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
                      NSParagraphStyleAttributeName:ps}]];
     if (subtitle.length) [m appendAttributedString:[[NSAttributedString alloc] initWithString:
         [@"\n" stringByAppendingString:subtitle]
-        attributes:@{NSForegroundColorAttributeName:[NSColor colorWithWhite:1 alpha:0.6],
+        attributes:@{NSForegroundColorAttributeName:[NSColor colorWithWhite:1 alpha:0.45],
                      NSFontAttributeName:[NSFont systemFontOfSize:BANNER_SUB_PT],
                      NSParagraphStyleAttributeName:ps}]];
     return m;
