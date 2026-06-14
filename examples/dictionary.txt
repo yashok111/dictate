@@ -9,10 +9,20 @@
 #   1. ACTION VERBS / workflow words you say all day inside Russian — their English roots
 #      get transliterated wrong ("закоммить", "отрефактори", "задеплой"), so biasing toward
 #      the English form fixes them. This is usually the biggest win.
-#   2. Proper nouns whisper mangles — names of people, YOUR projects, rare libraries/tools.
-#   3. English-in-Russian jargon you use a lot (prompt, endpoint, callback, async…).
-# What NOT to bother with: common framework/tool names you rarely misdictate, and generic
-# words whisper already nails. A name only earns a slot if whisper actually gets it wrong.
+#   2. PERSONAL infra / tooling proper-nouns you dictate constantly — your servers, your
+#      stack, the tools you live in (vps, ssh, backend, your CLI/service names…). These are
+#      high value: whisper has never seen them and mangles them every time. (Generic, widely
+#      known framework names you rarely misdictate are NOT worth a slot — see below.)
+#   3. English-in-Russian jargon you use a lot (prompt, endpoint, label, toast…).
+# What NOT to bother with: common framework/tool names whisper already nails, generic words
+# it gets right, and per-project UI churn (this week's feature nouns). A term only earns a
+# slot if whisper actually gets it wrong AND you say it across projects, not just today.
+#
+# HOW TO BUILD THIS FROM REAL DATA (recommended): mine your own dictation history instead of
+# guessing. If you dictate mostly into Claude Code, your past takes live as Russian user
+# messages in ~/.claude/projects/**/*.jsonl. Extract the Russian-dominant messages, strip
+# code/paths/camelCase, and rank the English tokens that sit *inside* Russian sentences —
+# those are exactly the words whisper transliterates wrong. Frequency = priority.
 #
 # Format:
 #   • one word or short phrase per line; ORDER = PRIORITY (most important first — if the
@@ -21,58 +31,77 @@
 #     term like  C#  or  F#  is kept verbatim.
 #   • blank lines are ignored; exact duplicates are dropped (first one kept).
 #
-# Budget: the prompt is capped at ~224 tokens (a long/prose-like prompt makes the turbo
-# model loop — project gotcha #11/#21), so keep it a SHORT comma-list of words, not prose.
-# The per-entry budget estimate (src/dictate_dict.h) leans HIGH on purpose, so the real
-# whisper token count sits well under 224. If you want more entries, raise the cap via the
-# WHISPER_PROMPT_MAXTOK env (set it in the LaunchAgent plist's EnvironmentVariables) and
-# watch the daemon's logged "~N tok" — keep it near 224, not far above. Toggle the whole
-# feature off with WHISPER_PROMPT=0; override the path with WHISPER_DICT.
+# Budget is ZERO-SUM: the prompt is capped at ~224 tokens (a long/prose-like prompt makes the
+# turbo model loop — project gotcha #11/#21), so keep it a SHORT comma-list of words, not
+# prose. ~50 short words fills it. Adding a term means cutting a weaker one. The per-entry
+# estimate (src/dictate_dict.h) leans HIGH on purpose, so the real whisper token count sits
+# well under 224 — watch the daemon's logged "~N tok" and keep it near 224, not far above.
+# Multi-word phrases ("pull request") are costly; prefer the short form ("PR"). Raise the cap
+# via WHISPER_PROMPT_MAXTOK (in the LaunchAgent plist's EnvironmentVariables) if you must.
+# Toggle the whole feature off with WHISPER_PROMPT=0; override the path with WHISPER_DICT.
 #
 # Below is an ILLUSTRATIVE template — replace with the words YOU actually say.
 
-# ── names: people / projects you say often (replace these placeholders) ──────
+# ── names: people / YOUR projects you say often (replace these placeholders) ──
 #   whisper mangles unfamiliar proper nouns most — put your real ones here, at the top
 Иван
 Петров
 my-project-name
 
+# ── personal infra / tooling you dictate constantly (replace with YOUR stack) ──
+#   your servers, services, CLIs — whisper has never seen them and gets them wrong every time
+VPS
+SSH
+VPN
+backend
+API
+deploy
+domain
+env
+
 # ── action verbs (English roots spoken inside Russian — usually the biggest win) ──
 commit
 merge
 rebase
-revert
 refactor
 debug
-deploy
-rollback
 build
-compile
 lint
 format
 review
 test
 implement
-optimize
+parse
+validate
+mock
+fix
 
 # ── workflow / dev jargon (English-in-Russian) ──────────────────────────────
 prompt
 context
+token
 endpoint
-callback
-async
-await
-component
-props
 function
+component
+hook
+type
+param
 
 # ── git / VCS ─────────────────────────────────────────────────────────────────
 diff
 push
-pull request
 PR
 stash
 checkout
+branch
+
+# ── UI primitives (generic across projects) — keep only if you dictate UI work ──
+label
+title
+toast
+modal
+theme
+placeholder
 
 # ── only-if-you-misdictate-them: languages / libraries / tools ───────────────
 #   keep these ONLY if whisper actually gets them wrong for you — otherwise delete
