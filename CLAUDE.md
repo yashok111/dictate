@@ -301,7 +301,7 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
   `SPEECH_CONFIRM_FR`, `FRAME`. The Silero VAD params live in `make_params`
   (`min_silence_duration_ms`, `speech_pad_ms`).
 
-## whisper.cpp notes (Homebrew 1.8.6)
+## whisper.cpp notes (Homebrew 1.8.7)
 
 API used: `whisper_init_from_file_with_params` (+ `whisper_context_default_params`,
 `use_gpu=true`), `whisper_full_default_params(WHISPER_SAMPLING_GREEDY)`,
