@@ -1,0 +1,23 @@
+# Gitea Actions CI (forge-only: .gitea/workflows/ is invisible to GitHub, so
+# the push-mirror does not double-run this).
+#
+# The APP build is macOS-only (AppKit/AVFoundation frameworks + Homebrew
+# libwhisper) and cannot run here. The doctest suite is deliberately portable
+# (plain `c++ -std=c++17 -pthread`, no frameworks) — verified on linux gcc:14,
+# 186 cases / 718 assertions green — so `make test` alone is the gate.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
