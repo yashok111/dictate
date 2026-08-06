@@ -433,12 +433,29 @@ static void on_capture_lost(void);   // mid-take capture rebuild failed → stop
 - (void)stop;
 @end
 
+// A long-lived daemon's CoreAudio client connection can go STALE — across sleep/wake, a
+// coreaudiod restart, or a wedged virtual device (BlackHole/Teams). Every subsequent
+// -startAndReturnError: then fails with kAudioHardwareNotRunningError ('stop' == 1937010544)
+// even though the mic is perfectly fine for a freshly launched process, so the daemon needs
+// a relaunch to dictate again. AVAudioEngineConfigurationChangeNotification does NOT cover
+// this: it fires on device/route changes, not on a dead HAL client. Recovery is to throw the
+// whole AVAudioEngine away and build a new one — that re-establishes the HAL connection.
+// A stale client can also surface as a 0 Hz input format (our own "нет входного устройства"),
+// so retry on that too; the rebuild costs ~ms, and on a genuinely missing mic / denied
+// permission the second attempt just returns the same error.
+static BOOL capture_err_is_recoverable(NSError *e) {
+    if (!e) return NO;
+    if (e.code == 1937010544) return YES;                                 // 'stop' — HAL not running
+    return [e.domain isEqualToString:@"dictate"] && e.code == 1;          // 0 Hz input format
+}
+
 @implementation Recorder {
     AVAudioEngine    *_engine;
     AVAudioConverter *_conv;
     AVAudioFormat    *_outFmt;
     StreamingSession *_sess;     // non-owning; valid for the life of the take
     id                _cfgObs;   // AVAudioEngineConfigurationChange observer token
+    BOOL              _tapInstalled;   // a tap is live on inputNode bus 0 → -dropEngine must remove it (and must NOT otherwise)
     std::shared_ptr<std::atomic<int>> _tapGuard;   // in-flight tap-callback count; -stop waits it to 0
 }
 - (instancetype)init {
@@ -451,18 +468,61 @@ static void on_capture_lost(void);   // mid-take capture rebuild failed → stop
     return self;
 }
 - (BOOL)startFeeding:(StreamingSession *)sess error:(NSError **)err {
+    _sess = sess;
+    [self buildEngine];
+    return [self startWithHALRecovery:err];
+}
+// Fresh AVAudioEngine + its configuration-change observer.
+- (void)buildEngine {
     _engine = [[AVAudioEngine alloc] init];
-    _sess   = sess;
     // A device/route change (unplug AirPods, switch default input, sample-rate change)
     // STOPS the engine and silences the tap. Without this the take would dribble to a
     // truncated/empty transcript with no signal to the user. Rebuild + restart on change.
     __weak Recorder *weakSelf = self;
+    // -reconfigure tears the engine down, and AVFoundation posts this notification from an
+    // engine-internal context; doing that teardown inside the poster's stack risks a deadlock.
+    // The mainQueue observer alone is *probably* enough (it enqueues an operation), but that is
+    // not contractually async, so hop explicitly. One extra runloop turn on a route change.
     _cfgObs = [[NSNotificationCenter defaultCenter]
                 addObserverForName:AVAudioEngineConfigurationChangeNotification
                             object:_engine
                              queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *note){ (void)note; [weakSelf reconfigure]; }];
-    return [self installTapAndStart:err];
+                        usingBlock:^(NSNotification *note){ (void)note;
+                            dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf reconfigure]; }); }];
+}
+// Tear the engine down WITHOUT touching _sess (unlike -stop, which ends the take). No
+// tapGuard wait: -stop does that after calling this, and the other callers hit it on a start
+// failure (engine never ran), where _sess outlives it and no tap can be in flight.
+// Idempotent — reconfigure's terminal-failure path and -stop can both reach it.
+- (void)dropEngine {
+    if (_cfgObs) { [[NSNotificationCenter defaultCenter] removeObserver:_cfgObs]; _cfgObs=nil; }
+    if (_engine) {
+        // Only when a tap is actually installed: -installTapAndStart: can bail on a 0 Hz input
+        // format BEFORE installing one, and -removeTapOnBus: has no documented no-tap contract.
+        // Touching .inputNode would also re-open the (possibly broken) HAL device for nothing.
+        if (_tapInstalled) { [_engine.inputNode removeTapOnBus:0]; _tapInstalled=NO; }
+        [_engine stop];
+        _engine=nil;
+    }
+    _conv = nil;
+}
+// Start; on a stale-HAL-shaped failure rebuild the whole engine and try ONCE more.
+- (BOOL)startWithHALRecovery:(NSError **)err {
+    NSError *e1=nil;
+    if ([self installTapAndStart:&e1]) return YES;
+    if (!capture_err_is_recoverable(e1)) { if (err) *err=e1; return NO; }
+    fprintf(stderr, "⚠ capture start failed (%s) → rebuilding AVAudioEngine (stale CoreAudio client?)\n",
+            e1.localizedDescription.UTF8String ?: "?");
+    [self dropEngine];
+    [self buildEngine];
+    NSError *e2=nil;
+    if ([self installTapAndStart:&e2]) { fprintf(stderr, "✓ capture recovered after engine rebuild\n"); return YES; }
+    // Terminal: disarm NOW rather than leaving a live observer on a dead engine. Otherwise the
+    // next configuration notification re-enters -reconfigure, which grants itself another
+    // "one-time" retry — an unbounded rebuild loop. With _engine nil, -reconfigure no-ops.
+    [self dropEngine];
+    if (err) *err=e2;
+    return NO;
 }
 // Read the current input format, (re)build the converter, install the tap, start. Called
 // on first start and again on every configuration change (with the new input format).
@@ -511,16 +571,17 @@ static void on_capture_lost(void);   // mid-take capture rebuild failed → stop
         }   // @autoreleasepool
         guard->fetch_sub(1, std::memory_order_release);   // done touching `sess`
     }];
+    _tapInstalled = YES;
     [_engine prepare];
     return [_engine startAndReturnError:err];
 }
 - (void)reconfigure {
-    if (!_engine) return;                                 // already stopped
+    if (!_engine) return;                                 // already stopped, or recovery gave up
     fprintf(stderr, "audio configuration changed → rebuilding capture\n");
-    [_engine.inputNode removeTapOnBus:0];
+    if (_tapInstalled) { [_engine.inputNode removeTapOnBus:0]; _tapInstalled=NO; }
     [_engine stop];
     NSError *err=nil;
-    if (![self installTapAndStart:&err]) {
+    if (![self startWithHALRecovery:&err]) {   // a route change can also leave the HAL client stale
         fprintf(stderr, "⚠ capture rebuild failed: %s\n", err.localizedDescription.UTF8String ?: "?");
         // The mic is dead; don't let the take silently dribble to the 60 s cap. Stop it + notify —
         // DEFERRED so we don't reentrantly [r stop] this very Recorder from inside its own method.
@@ -528,15 +589,14 @@ static void on_capture_lost(void);   // mid-take capture rebuild failed → stop
     }
 }
 - (void)stop {
-    if (!_engine) return;
-    if (_cfgObs) { [[NSNotificationCenter defaultCenter] removeObserver:_cfgObs]; _cfgObs=nil; }
-    [_engine.inputNode removeTapOnBus:0];
-    [_engine stop];
+    [self dropEngine];
     // Wait out any tap callback still touching `_sess`: AVFoundation doesn't document removeTapOnBus
     // as a barrier against an already-running tap block, so without this a late tap could feed() into a
     // session finish()/cancel() is about to read/free (UAF). The tap body is sub-ms → bounded spin.
+    // Unconditional — recovery may already have dropped the engine, and the wait is what makes -stop
+    // a barrier. (Nothing in flight ⇒ the counter is 0 ⇒ no spin at all.)
     while (_tapGuard->load(std::memory_order_acquire) != 0) { struct timespec ts{0, 100000}; nanosleep(&ts, nullptr); }
-    _engine=nil; _conv=nil; _sess=nil;
+    _sess=nil;
 }
 - (void)dealloc {   // safety net: if startFeeding: failed after registering the observer, -stop is never
     if (_cfgObs) [[NSNotificationCenter defaultCenter] removeObserver:_cfgObs];   // called → remove it here
@@ -899,6 +959,11 @@ static std::string daemon_start(const char *kind) {
     NSError *err = nil;
     if (![g_rec startFeeding:g_sess.get() error:&err]) {
         std::string msg = err.localizedDescription.UTF8String ?: "engine start failed";
+        // The engine rebuild inside -startFeeding: already retried, so a surviving 'stop' means
+        // the HAL itself is wedged system-wide (a stuck virtual device, a hung input) — a fresh
+        // process fails too and only a coreaudiod restart clears it. Say so instead of leaving
+        // the user with a bare OSStatus.
+        if (err.code == 1937010544) msg += "\nCoreAudio завис — выполни: sudo killall coreaudiod";
         g_sess.reset(); g_rec=nil;   // dtor joins the worker — safe (was: delete on a live thread → std::terminate)
         return msg;
     }
