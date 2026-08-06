@@ -23,7 +23,9 @@ CXXFLAGS := -std=c++17 -fobjc-arc -O2 -Wall -Wextra \
             -DGGML_LIBEXEC='"$(GGML)/libexec"'
 LDFLAGS  := -L$(WHISPER)/lib -L$(GGML)/lib -lwhisper -lggml -lggml-base \
             -framework Foundation -framework AVFoundation -framework AppKit \
-            -framework Accelerate -framework Carbon -framework ApplicationServices
+            -framework Accelerate -framework Carbon -framework ApplicationServices \
+            -framework CoreAudio
+# CoreAudio: HAL device enumeration, to pin capture to the built-in mic (ADR-0022)
 # Bake the dylib dirs into the binary so it runs without DYLD_LIBRARY_PATH.
 LDFLAGS  += -Wl,-rpath,$(WHISPER)/lib -Wl,-rpath,$(GGML)/lib
 
