@@ -28,6 +28,7 @@
 #import <AppKit/AppKit.h>
 #import <Accelerate/Accelerate.h>
 #import <Carbon/Carbon.h>   // global hotkey: RegisterEventHotKey, kVK_*, cmdKey/shiftKey
+#import <CoreAudio/CoreAudio.h>   // HAL device enumeration: pin capture to the built-in mic
 #import <ApplicationServices/ApplicationServices.h>   // CGEvent (synthetic ⌘V) + AXIsProcessTrusted
 
 #include <cstdint>
@@ -433,6 +434,90 @@ static void on_capture_lost(void);   // mid-take capture rebuild failed → stop
 - (void)stop;
 @end
 
+// ── input-device pinning ─────────────────────────────────────────────────────
+static const double PIN_DISARM_SEC = 2.0;   // failsafe: drop a never-consumed _pinReconfig flag
+
+// AVAudioEngine.inputNode follows the SYSTEM DEFAULT input, and that default routinely sits
+// on something you can't dictate through: a loopback/virtual device (BlackHole, Microsoft
+// Teams Audio) that carries no mic signal at all, or AirPods, whose mic is noticeably worse
+// than the built-in one. Pin the built-in mic explicitly, chosen over the CoreAudio HAL.
+static AudioDeviceID find_builtin_input_device(void) {
+    AudioObjectPropertyAddress addr = { kAudioHardwarePropertyDevices,
+                                        kAudioObjectPropertyScopeGlobal,
+                                        kAudioObjectPropertyElementMain };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &addr, 0, nullptr, &size) != noErr || !size)
+        return kAudioObjectUnknown;
+    std::vector<AudioDeviceID> devs(size / sizeof(AudioDeviceID));
+    // Pass the size of the buffer we actually allocated (not the size-query result — the
+    // truncating division above can only shrink it), then shrink to what the HAL really wrote:
+    // a device unplugged between the two calls leaves the tail value-initialized to 0, and 0 is
+    // a valid-looking AudioObjectID the loop would then query.
+    UInt32 io = (UInt32)(devs.size() * sizeof(AudioDeviceID));
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, nullptr, &io, devs.data()) != noErr)
+        return kAudioObjectUnknown;
+    devs.resize(io / sizeof(AudioDeviceID));
+    for (AudioDeviceID d : devs) {
+        // Needs ≥1 INPUT channel — filtering on transport alone would match an output-only
+        // device, and the built-in *speakers* report the built-in transport too. Two steps do
+        // that: an output-only device returns just the 8-byte AudioBufferList header (no
+        // AudioBuffer), so the size guard rejects it here; the mNumberChannels sum below then
+        // catches the remaining shape, a buffer list that exists but carries no channels.
+        AudioObjectPropertyAddress cfg = { kAudioDevicePropertyStreamConfiguration,
+                                           kAudioDevicePropertyScopeInput,
+                                           kAudioObjectPropertyElementMain };
+        UInt32 csz = 0;
+        if (AudioObjectGetPropertyDataSize(d, &cfg, 0, nullptr, &csz) != noErr || csz < sizeof(AudioBufferList))
+            continue;
+        std::vector<uint8_t> buf(csz);
+        AudioBufferList *bl = (AudioBufferList *)buf.data();
+        if (AudioObjectGetPropertyData(d, &cfg, 0, nullptr, &csz, bl) != noErr) continue;
+        UInt32 chans = 0;
+        for (UInt32 i = 0; i < bl->mNumberBuffers; ++i) chans += bl->mBuffers[i].mNumberChannels;
+        if (!chans) continue;
+        // Transport type is what separates real hardware from the virtual devices: BlackHole
+        // and Teams report kAudioDeviceTransportTypeVirtual, the MacBook mic reports BuiltIn.
+        UInt32 transport = 0, tsz = sizeof(transport);
+        AudioObjectPropertyAddress tr = { kAudioDevicePropertyTransportType,
+                                          kAudioObjectPropertyScopeGlobal,
+                                          kAudioObjectPropertyElementMain };
+        if (AudioObjectGetPropertyData(d, &tr, 0, nullptr, &tsz, &transport) != noErr) continue;
+        if (transport == kAudioDeviceTransportTypeBuiltIn) return d;
+    }
+    return kAudioObjectUnknown;
+}
+// Pin `engine`'s input to the built-in mic. Returns YES only when it actually CHANGED the
+// device — that mutates the engine config and posts exactly ONE configuration-change
+// notification, which -reconfigure must swallow (else every take rebuilds capture for nothing).
+// MUST run before -inputFormatForBus:, since the device determines the format.
+// `cache` carries the device across an engine rebuild within one take: the rebuild path exists
+// precisely for a wedged HAL, and re-running the enumeration there would fire another three
+// synchronous coreaudiod round-trips per device on the main queue with g_mu held.
+static BOOL prefer_builtin_input(AVAudioEngine *engine, AudioDeviceID *cache) {
+    const char *off = getenv("DICTATE_BUILTIN_MIC");
+    if (off && !strcmp(off, "0")) return NO;              // opt out → follow the system default
+    AudioDeviceID dev = (cache && *cache != kAudioObjectUnknown) ? *cache : find_builtin_input_device();
+    if (dev == kAudioObjectUnknown) {
+        // Once per process: on a Mac with no built-in input (mini / Studio / Pro) this is the
+        // permanent state, and a line per take would just be log noise.
+        static bool warned = false;
+        if (!warned) { warned = true;
+            fprintf(stderr, "⚠ no built-in input device found — keeping the system default input\n"); }
+        return NO;
+    }
+    if (cache) *cache = dev;
+    AUAudioUnit *au = engine.inputNode.AUAudioUnit;
+    if (au.deviceID == dev) return NO;                    // already there → no notification
+    NSError *err = nil;
+    if (![au setDeviceID:dev error:&err]) {
+        fprintf(stderr, "⚠ could not pin the built-in mic: %s\n", err.localizedDescription.UTF8String ?: "?");
+        return NO;
+    }
+    fprintf(stderr, "pinned capture to the built-in mic (device %u)\n", (unsigned)dev);
+    return YES;
+}
+
+// ── stale-HAL recovery ───────────────────────────────────────────────────────
 // A long-lived daemon's CoreAudio client connection can go STALE — across sleep/wake, a
 // coreaudiod restart, or a wedged virtual device (BlackHole/Teams). Every subsequent
 // -startAndReturnError: then fails with kAudioHardwareNotRunningError ('stop' == 1937010544)
@@ -456,6 +541,9 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     StreamingSession *_sess;     // non-owning; valid for the life of the take
     id                _cfgObs;   // AVAudioEngineConfigurationChange observer token
     BOOL              _tapInstalled;   // a tap is live on inputNode bus 0 → -dropEngine must remove it (and must NOT otherwise)
+    BOOL              _pinReconfig;    // pinning the built-in mic posts one config-change notification → swallow exactly that one
+    NSUInteger        _engineGen;      // bumped per -buildEngine; blocks captured for engine N must not act on engine N+1
+    AudioDeviceID     _pinnedDev;      // built-in mic found for THIS take; reused on an engine rebuild instead of re-enumerating
     std::shared_ptr<std::atomic<int>> _tapGuard;   // in-flight tap-callback count; -stop waits it to 0
 }
 - (instancetype)init {
@@ -464,6 +552,7 @@ static BOOL capture_err_is_recoverable(NSError *e) {
                                                    sampleRate:WHISPER_SAMPLE_RATE
                                                      channels:1 interleaved:NO];
         _tapGuard = std::make_shared<std::atomic<int>>(0);
+        _pinnedDev = kAudioObjectUnknown;   // one Recorder per take → the enumeration runs once per take
     }
     return self;
 }
@@ -472,9 +561,15 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     [self buildEngine];
     return [self startWithHALRecovery:err];
 }
-// Fresh AVAudioEngine + its configuration-change observer.
+// Fresh AVAudioEngine + its configuration-change observer. Main queue only (the recording
+// lifecycle is main-only; the socket path marshals through dispatch_sync), so the ivars below
+// and -reconfigure never run concurrently.
 - (void)buildEngine {
     _engine = [[AVAudioEngine alloc] init];
+    // Every deferred block below is stamped with the generation of the engine it belongs to.
+    // -dropEngine unregisters the observer, but a block ALREADY dispatched to main survives
+    // that and would otherwise act on the replacement engine (recovery builds a second one).
+    const NSUInteger gen = ++_engineGen;
     // A device/route change (unplug AirPods, switch default input, sample-rate change)
     // STOPS the engine and silences the tap. Without this the take would dribble to a
     // truncated/empty transcript with no signal to the user. Rebuild + restart on change.
@@ -488,8 +583,20 @@ static BOOL capture_err_is_recoverable(NSError *e) {
                             object:_engine
                              queue:[NSOperationQueue mainQueue]
                         usingBlock:^(NSNotification *note){ (void)note;
-                            dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf reconfigure]; }); }];
+                            dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf reconfigureGen:gen]; }); }];
+    // AFTER the observer is registered, so the self-induced notification can't slip past it.
+    _pinReconfig = prefer_builtin_input(_engine, &_pinnedDev);
+    if (_pinReconfig) {
+        // Failsafe: if that notification never arrives, a stuck flag would swallow the next
+        // REAL route change instead. Give it a beat, then disarm — but only if this engine is
+        // still the current one, so take N's timer can't disarm take N+1's freshly armed flag.
+        __weak Recorder *ws = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PIN_DISARM_SEC*NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [ws clearPinReconfigGen:gen]; });
+    }
 }
+- (void)clearPinReconfigGen:(NSUInteger)gen { if (gen == _engineGen) _pinReconfig = NO; }
+- (void)reconfigureGen:(NSUInteger)gen     { if (gen == _engineGen) [self reconfigure]; }
 // Tear the engine down WITHOUT touching _sess (unlike -stop, which ends the take). No
 // tapGuard wait: -stop does that after calling this, and the other callers hit it on a start
 // failure (engine never ran), where _sess outlives it and no tap can be in flight.
@@ -573,10 +680,25 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     }];
     _tapInstalled = YES;
     [_engine prepare];
-    return [_engine startAndReturnError:err];
+    if (![_engine startAndReturnError:err]) return NO;
+    // Log the device the tap is ACTUALLY reading, not the one we asked for. The whole failure
+    // mode this guards against (capture landing on a virtual device) is silent — an empty
+    // transcript, no error — so the confirmation has to come from the started engine.
+    fprintf(stderr, "capture live: device %u, %.0f Hz, %u ch\n",
+            (unsigned)input.AUAudioUnit.deviceID, inFmt.sampleRate, (unsigned)inFmt.channelCount);
+    return YES;
 }
 - (void)reconfigure {
     if (!_engine) return;                                 // already stopped, or recovery gave up
+    // Our own -setDeviceID: from prefer_builtin_input posts one of these. The tap is already
+    // built on the pinned device, so rebuilding would be pure churn (plus a race window that
+    // could hang a take on «расшифровка…»). Swallow it — but the flag alone can't tell our
+    // notification apart from a REAL route change that happens to land in the same window, and
+    // swallowing that one would leave capture stopped for the rest of the take. AVFoundation
+    // STOPS the engine on a genuine configuration change and does not on our pre-start
+    // -setDeviceID:, so -isRunning is the discriminator. Disarm either way: one notification is
+    // all the pin can produce.
+    if (_pinReconfig) { _pinReconfig = NO; if (_engine.isRunning) return; }
     fprintf(stderr, "audio configuration changed → rebuilding capture\n");
     if (_tapInstalled) { [_engine.inputNode removeTapOnBus:0]; _tapInstalled=NO; }
     [_engine stop];

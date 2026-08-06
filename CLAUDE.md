@@ -111,6 +111,16 @@ state file `/tmp/dictate.recording` · logs `/tmp/dictate.log`, `/tmp/dictate-ed
   `AVAudioEngineConfigurationChangeNotification` and **rebuilds the tap + converter** on a
   device/route change (unplugging AirPods, switching input) — otherwise the engine stops
   and the take silently dribbles to an empty transcript.
+  Capture is **pinned to the built-in mic**, not the system default (`prefer_builtin_input` →
+  `find_builtin_input_device`, CoreAudio HAL: `kAudioDeviceTransportTypeBuiltIn` + ≥1 input
+  channel — the channel check matters, the built-in *speakers* also report the built-in
+  transport). Without it the default routinely sits on a virtual device (BlackHole, Teams
+  Audio) that carries no mic signal, or on AirPods. Pinning posts one self-induced
+  configuration-change notification, swallowed via `_pinReconfig` (gotcha #22).
+  On a start failure that looks like a stale CoreAudio client (`kAudioHardwareNotRunningError`,
+  `'stop'` = 1937010544), the whole `AVAudioEngine` is rebuilt and start retried **once**
+  (`-buildEngine`/`-dropEngine`/`-startWithHALRecovery:`); if it still fails, the HAL itself
+  is wedged and only `sudo killall coreaudiod` helps — the error says so (gotcha #23).
 - **whisper's built-in Silero VAD** is enabled in `make_params` on top of all
   that — it trims silence *inside* each segment (see gotcha #3).
 - **Native UI** (`DictateController`, the `NSApp` delegate): owns the global ⌘⇧D
@@ -270,6 +280,13 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
   `WHISPER_LANG` (default `ru`), `WHISPER_VAD_MODEL`, `WHISPER_VAD=0` to disable
   VAD, `DICTATE_GGML_BACKENDS` to override the backend dir, `DICTATE_SOCK` to override
   the socket path (run a test daemon off the live one).
+- `DICTATE_BUILTIN_MIC=0` — stop pinning capture to the built-in mic and follow the system
+  default input instead (default ON; the pin is what keeps takes off BlackHole / Teams Audio
+  / AirPods — gotcha #22). No-ops on a Mac with no built-in input, keeping the default. Note
+  it overrides an external mic you actually chose, and since the daemon is launchd-started,
+  `export`ing it in a shell does nothing — opting out means an `EnvironmentVariables` dict in
+  `~/Library/LaunchAgents/com.user.dictate.plist` + `launchctl bootout`/`bootstrap`. (Same for
+  every other var here when the daemon runs under the LaunchAgent.)
 - `WHISPER_DICT` (default `~/.config/whisper/dictionary.txt`) — user dictionary that biases
   whisper toward your vocabulary (names / tech terms / English-in-Russian) via `initial_prompt`.
   Default ON if the file exists; `WHISPER_PROMPT=0` disables it (like `WHISPER_VAD`/`WHISPER_FLASH`);
