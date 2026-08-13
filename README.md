@@ -115,8 +115,37 @@ grants persist. Diagnose a non-pasting take with
 Press **⌘⇧D** to start, speak, press **⌘⇧D** again to stop. While you talk the banner
 shows **status only** (mic warm-up → recording → transcribing). On stop the **voice
 editor** opens with the transcript for review; **⏎** (or **⌘⇧D**) accepts and pastes it
-into the app you were in, **Esc** cancels. The menubar 🎙 shows the elapsed time; a take
-auto-stops at 60 s. (See [Voice editor](#voice-editor-review--fix-after-each-take) below.)
+into the app you were in, **Esc** cancels. The menubar mic turns red while recording (the
+elapsed time is in its tooltip); a take auto-stops at 60 s. (See [Voice editor](#voice-editor-review--fix-after-each-take) below.)
+
+**Right-click** (or ⌃-click) the menubar icon for a small menu: current state
+(«готов» / «идёт запись» / «расшифровка…» / «открыт редактор»), start/stop, **⟳
+Перезапустить диктовку**, and «Открыть лог». Left-click still just starts/stops a take.
+
+## When it stops responding
+
+If dictation stops reacting — the hotkey does nothing, no banner, a take never finishes —
+restart the daemon. Fastest first:
+
+1. **⌥⌘⇧D** — the restart hotkey. Same physical key as ⌘⇧D plus ⌥, owned by the daemon, so it
+   works even when the menubar icon is nowhere to be seen (a full menu bar makes macOS park it
+   off-screen) and while the editor is open. Releases the mic, relaunches the daemon (~1 s
+   model reload).
+2. **Menubar ▸ ⟳ Перезапустить диктовку** — the same thing, when the icon is visible.
+3. **`dictate restart`** in a terminal — over the socket; if the daemon's main thread is stuck
+   and the graceful path can't finish, it force-restarts a few seconds later. The client gives
+   up after 5 s with «демон не отвечает» rather than hanging.
+4. **Nothing at all responds** — the built-in watchdog handles this on its own: the main
+   thread stamps a heartbeat once a second, and if it goes stale for `DICTATE_WATCHDOG_SEC`
+   (default **30 s**) the daemon relaunches itself. Under the LaunchAgent, launchd's
+   `KeepAlive` brings it back; started by hand, it spawns its own replacement first and only
+   tears down once that succeeded. `DICTATE_WATCHDOG_SEC=0` disables it. It is deliberately
+   hard to trip by accident: the heartbeat keeps ticking while a menu is open, the clock stops
+   while the machine sleeps, a suspended process (SIGSTOP) is detected and skipped, and an
+   on-demand model reload is flagged so it is waited out rather than killed.
+
+If a *fresh* daemon still gets no audio, the CoreAudio HAL itself is wedged — that one needs
+`sudo killall coreaudiod` (the take's error text says so).
 
 The CLI still works for scripting/testing — note that `dictate stop` is the scripting
 path: it prints/copies the transcript and does **not** open the editor:

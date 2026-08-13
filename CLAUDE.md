@@ -25,6 +25,7 @@ daemon** keeps the model in GPU memory (no per-take reload) and enables
   tokenize/cursor/apply + line-nav search), `dictate_authgen.h` (peer-uid + paste-gen checks),
   `dictate_dict.h` (user-dictionary parse + token-budgeted `initial_prompt` build — gotcha #21),
   `dictate_idle.h` (idle-unload gate + poll-cadence arithmetic — gotcha #7),
+  `dictate_watchdog.h` (main-thread watchdog gate: heartbeat staleness + poll cadence),
   `dictate_edscroll.h` (editor vertical-scroll clamp / cursor-follow arithmetic).
 - `tests/` — doctest unit tests (`tests/doctest.h` vendored; `tests/test_*.cpp`). `make test`.
 - `Makefile` — clang++ build; bakes `-DGGML_LIBEXEC` from `brew --prefix ggml`. Also the
@@ -68,7 +69,7 @@ printf 'stop\n'                | nc -U /tmp/dictate.sock   # → streamed transc
 ## CLI / protocol
 
 Normal use is the **⌘⇧D hotkey owned by the daemon itself** — no client needed.
-The client verbs remain for scripting/tests: `start stop cancel ping quit`.
+The client verbs remain for scripting/tests: `start stop cancel ping restart quit`.
 `stop` prints the transcript to stdout (the daemon also copies it to the clipboard
 and auto-pastes). `--file [--once] [--lang xx] [--model P]` is the standalone path:
 `--file` streams (VAD-segmented) like a take, `--once` does a single whole-buffer pass
@@ -76,7 +77,14 @@ and auto-pastes). `--file [--once] [--lang xx] [--model P]` is the standalone pa
 
 Daemon socket commands (newline-terminated, raw replies): `ping`→`pong`,
 `start`→`ok`/`err …`, `stop`→transcript (script/test path: clipboard, **no** editor),
-`cancel`→`ok`, `feedfile <path>`→`ok`, `quit`→`bye`. Editor protocol (daemon ↔ the
+`cancel`→`ok`, `feedfile <path>`→`ok`, `restart`→`ok` (relaunch the daemon process — graceful
+via the main queue, force-restarted from the socket thread after 2 s if main is wedged),
+`wedge <sec>`→`ok` (debug: block the main queue, the only way to exercise the watchdog /
+force-restart e2e — **gated on `DICTATE_DEBUG`**, otherwise `err unknown`), `quit`→`bye`.
+Each connection is served on **its own thread** (`socket_accept_loop`, capped at
+`SOCK_MAX_INFLIGHT`): most verbs `dispatch_sync` to the main queue, so serving inline meant one
+client blocked on a wedged main thread starved the accept loop and `restart` — the verb whose
+job is to break that wedge — was never even read. Editor protocol (daemon ↔ the
 `dictate editor` process): `corr-start`→`ok` (mini-take mic on), `corr-stop`→transcript,
 `corr-cancel`→`ok`, `accept <text>`→`ok` (refocus target + paste), `editor-cancel`→`ok`,
 `edit <text>`→`ok` (debug: open the editor on text, no mic). Standalone:
@@ -220,7 +228,10 @@ all UI on the **main thread**:
 - **Hotkey**: `RegisterEventHotKey(kVK_ANSI_D=2, ⌘⇧)` toggles a take — keycode 2 is
   the physical D key, so it survives a Cyrillic layout (and needs no Accessibility).
   A second hotkey for **Esc** is registered only for the duration of a take (so Esc
-  stays normal everywhere else) and cancels it.
+  stays normal everywhere else) and cancels it. A **third**, ⌥⌘⇧D (id 3), restarts the daemon
+  and — unlike ⌘⇧D — is **never unregistered**, not even while the editor is open: it is the
+  escape hatch for a stuck daemon, and the menubar ⟳ item it duplicates is unreachable whenever
+  macOS parks the status item off-screen (see Menubar below). All three die with the process.
 - **Banner**: a borderless floating `NSPanel` whose content view is a **flat
   translucent fill** (layer-backed `NSView`, black α`BANNER_BG_ALPHA` — Hammerspoon-
   style glass, no blur) + a hairline border, holding one centred `NSTextField`. Spans
@@ -237,8 +248,60 @@ all UI on the **main thread**:
   take's banner. All look/layout knobs are the `BANNER_*` constants atop `src/dictate.mm`.
 - **Auto-paste**: `paste_text` — clipboard + synthetic ⌘V (`CGEventPost`), restore
   after 0.4 s; degrades to clipboard-only if not Accessibility-trusted (gotchas #2/#4).
-- **Menubar**: `NSStatusItem` (⏳ idle / 🎙 m:ss recording, click toggles) + a 1 Hz
-  `NSTimer` that enforces the 60 s cap.
+- **Menubar**: `NSStatusItem` — an **SF Symbol template image** (`setStatusGlyphRecording:`:
+  `mic` idle / `mic.fill` tinted red while recording; text fallback only if the symbol is nil),
+  **left**-click toggles + a 1 Hz `NSTimer` that enforces the 60 s cap and writes the elapsed
+  m:ss into the **tooltip**. The glyph is deliberately narrow and fixed-width: macOS packs menu
+  bar extras right-to-left and silently parks whatever no longer fits (measured on this Mac: the
+  item sat at x≈650-740 pt while the first *drawn* icon was at ≈800 pt), so the old
+  «⏳» / «🎙 m:ss» title — 41 pt idle, ~70 pt recording — was invisible on a full menu bar. Both
+  the 60 s-cap timer and the warm-up poll are registered in `NSRunLoopCommonModes` (menu tracking
+  leaves the default mode; a default-mode-only cap timer would let the mic run past 60 s while
+  the user holds the menu open). **Right/⌃-click opens a menu** (`sendActionOn:` both
+  mouse-ups; `statusClicked:` routes on `NSApp.currentEvent`): a disabled state line
+  (`stateSummary` — `try_lock` on `g_mu`, never `lock`, so a stuck path can't freeze the menu),
+  start/stop, **⟳ перезапустить**, open log. The restart is the user's own way out of a wedged
+  daemon — it used to need an agent.
+- **Restart / watchdog** (`restart_process_now` + `DictateController.setupWatchdog`): the daemon
+  owns state that can't be reset in place (Metal ctx, CoreAudio HAL client, hotkey, windows), so
+  recovery = a fresh process (~1 s model load). `restart_process_now` takes **no locks and never
+  hops to the main queue** — callable from the watchdog/socket thread while main is wedged.
+  **Order matters**: it lines the successor up FIRST (`posix_spawn` of `daemon --replace`, never
+  `fork` — Metal + threads; `--replace` makes the child wait for our socket to vanish instead of
+  bowing out as a duplicate) and only then tears down. So a failed spawn aborts the restart with
+  nothing dropped (a wedged daemon beats no daemon), and under launchd nothing is spawned at all
+  (`XPC_SERVICE_NAME` → `KeepAlive` is the successor). Teardown — unlink socket + state file —
+  runs exactly once (`g_torn_down`), so a forced second caller can't unlink the successor's fresh
+  socket, and the editor child is `SIGTERM`ed (`g_editor_pid`): a fresh daemon has no
+  `g_target_app` and re-registers ⌘⇧D, so an orphan would paste into the wrong app. `g_restarting`
+  keeps the graceful main-queue path and the `restart` verb's force path to one restart; the force
+  waits `RESTART_DEADLINE_SEC+1` so it doesn't beat the graceful path on a healthy daemon. The
+  watchdog itself: the main queue stamps `g_wd_beat_ms` at 1 Hz, a background thread restarts the
+  process when the stamp is `DICTATE_WATCHDOG_SEC` stale. Four false-positive traps it avoids —
+  the heartbeat timer is in **`NSRunLoopCommonModes`** (menu tracking would starve a default-mode
+  timer), the clock is **`CLOCK_UPTIME_RAW`** (stops during system sleep; `CLOCK_MONOTONIC` does
+  not — a closed lid would look like an 8-hour stall), `wd_checker_starved` skips a round when the
+  watchdog thread's OWN sleep overran (SIGSTOP/suspension starves both threads; `lastCheck` is
+  stamped before the first sleep so round 1 is guarded too), and `g_longop_until_ms` marks an
+  on-demand model reload so a slow one is waited out instead of killing the take — a **deadline**
+  (`LONGOP_GRACE_SEC`), not a flag, because a load that never returns (model on a stalled volume)
+  would otherwise disarm the watchdog forever in the worst wedge of all; and its RAII guard stamps
+  the heartbeat on the way out, since main is still mid-block (mic warm-up) when the exemption
+  lifts. Restart bookkeeping: `g_replacement_spawned` is only the spawn CLAIM — a second caller
+  tears down only once `g_replacement_ready` confirms a successor exists (or launchd is one), and
+  `g_restart_gen` stands the armed deadline/force threads down when a restart aborts, so the
+  daemon can't restart itself moments after telling the user the restart failed.
+  Three more deliberate details, each verified e2e with the `wedge` verb: (a) the heartbeat is armed
+  by the FIRST timer tick, never up-front — a daemon whose run loop never starts is left alone
+  instead of restart-looping; (b) `wd_checker_starved` suppresses a round when the watchdog thread's
+  OWN sleep overran (SIGSTOP / suspension starves both threads — tested with `kill -STOP`); (c) the
+  graceful `restartNow:` arms an off-main `RESTART_DEADLINE_SEC` thread BEFORE stopping the recorder
+  and joining the worker, since those are exactly the calls that can hang. Restart logging is
+  `raw_log` (`write(2)`), not `fprintf` — a thread wedged while holding stderr's stdio lock would
+  deadlock a printf. **Known narrow race** (pre-existing, shared with `quit`): between our exit and
+  the replacement binding, a concurrent `dictate start` can spawn a second daemon; whichever binds
+  first wins and the loser bows out via the single-instance guard — but if the loser is the launchd
+  job, `KeepAlive` re-runs it every ~10 s until the other daemon exits. Not worth a lock file today.
 
 The Unix socket + client verbs stay (scripts/tests). `/tmp/dictate.recording` is
 still touched while capture is live — a cheap external flag; nothing reads it now
@@ -312,6 +375,10 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
   resident-speed win for memory when idle (gotcha #7). The idle gate (`src/dictate_idle.h`,
   unit-tested — gotcha #19) is polled by an `NSTimer` at `idle_poll_interval_sec(N)`
   (timeout/3, clamped to 1–10 s).
+- `DICTATE_WATCHDOG_SEC=N` (default `30`, `0` = off, values < 10 clamp up to 10) — restart the
+  daemon if the main run loop stops stamping its 1 Hz heartbeat for N seconds. The pure gate is
+  `src/dictate_watchdog.h` (unit-tested); see the Native-UI section for the two false-positive
+  traps (common run-loop modes, sleep-excluding clock).
 - VAD/segmentation constants in `src/dictate_vad.h` (with the pure `Segmenter`):
   `SILENCE_CLOSE_FR` (~700 ms pause closes a segment), `SPEECH_FACTOR`/`ABS_FLOOR`
   (sensitivity), `MAX_SEG_FR` (~20 s hard cap), `PREROLL_FR` (~300 ms kept before onset),
@@ -348,6 +415,9 @@ confidence → amber below `ED_CONF_THRESHOLD`; `src/dictate_conf.h` incl. `real
 `normalize_text`, unit-tested — see the Voice-editor section)** ·
 **idle-unload: free the resident model after `DICTATE_IDLE_UNLOAD_SEC` idle, reload on
 demand — opt-in, off by default; `src/dictate_idle.h` + `idleTick` under `g_mu`, gotcha #7** ·
+**self-recovery: menubar right-click menu (state + ⟳ перезапустить + лог), `restart` socket
+verb / CLI, and a main-thread watchdog that relaunches the daemon after
+`DICTATE_WATCHDOG_SEC` (30 s) of a stalled run loop — `src/dictate_watchdog.h`** ·
 **status-only banner: no live transcript in the banner (it jumped/grew as words streamed) —
 the take's words appear in the post-take editor. The open-segment live-preview machinery
 (callback, tap snapshot, `maybePreview`, `PREVIEW_*`, `--interim`/`--realtime`) was removed
