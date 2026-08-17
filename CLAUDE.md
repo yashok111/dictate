@@ -309,7 +309,7 @@ all UI on the **main thread**:
   and joining the worker, since those are exactly the calls that can hang. Restart logging is
   `raw_log` (`write(2)`), not `fprintf` — a thread wedged while holding stderr's stdio lock would
   deadlock a printf.
-- **Take-start deadline** (`g_takestart_until_ms`, `DICTATE_TAKESTART_SEC`, default 8 s): a second,
+- **Take-start deadline** (`g_takestart_until_ms`, `DICTATE_TAKESTART_SEC`, default 8 s — gotcha #24): a second,
   much tighter watcher armed only around the mic-start critical section in `daemon_start` — the
   `AVAudioEngine` build, the built-in-mic pin and the engine start, all synchronous CoreAudio on the
   main queue **with `g_mu` held**. That is where the wedge actually lands in practice (2026-08-17:
@@ -327,7 +327,7 @@ all UI on the **main thread**:
   the heartbeat is stale for the same reason and fires a few seconds later; so a pending prompt
   takes the **long-op exemption** instead (the one the model reload uses, bounded by
   `LONGOP_GRACE_SEC` so an unanswered prompt still cannot disarm the watchdog forever).
-- **Wedge forensics** (`wedge_sample_init` / `wedge_sample_loop` / `request_wedge_sample`): the
+- **Wedge forensics** (`wedge_sample_init` / `wedge_sample_loop` / `request_wedge_sample`, gotcha #24): the
   restart is also the moment the evidence dies — after it, all that is left of a wedge is *absent*
   log lines. So an involuntary restart (`wd_reason_is_wedge`: `watchdog` / `socket-force` /
   `take-start`, never a user-initiated ⟳) `sample`s the process for `WEDGE_SAMPLE_SEC` first,
@@ -349,7 +349,7 @@ all UI on the **main thread**:
   watchers would fire again on their very next round: a hot loop of failing spawns, one `sample`
   each. The abort stamps `RESTART_BACKOFF_SEC`, which only the automatic triggers honour — a user
   asking for a restart is never made to wait.
-- **Stamped log lines** (`slog`/`raw_log`, `ts_prefix`): every line the daemon writes itself starts
+- **Stamped log lines** (`slog`/`raw_log`, `ts_prefix`, gotcha #24): every line the daemon writes itself starts
   with `HH:MM:SS.mmm`; whisper's own chatter stays unstamped, which conveniently makes ours the
   greppable ones. `/tmp/dictate.log` used to have no time at all — nothing in it could be lined up
   against `log show`, the take log or `ps`, which is most of what made the 2026-08-17 post-mortem
@@ -440,7 +440,7 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
   heartbeat for N seconds. The pure gate is `src/dictate_watchdog.h` (unit-tested); see the
   Native-UI section for the false-positive traps (common run-loop modes, sleep-excluding clock,
   checker starvation, long-op exemption).
-- `DICTATE_TAKESTART_SEC=N` (default `8`, `0` = off, values < 3 clamp up to 3) — restart the daemon
+- `DICTATE_TAKESTART_SEC=N` (default `8`, `0` = off, values < 3 clamp up to 3 — gotcha #24) — restart the daemon
   if the mic-start section (`AVAudioEngine` build + built-in-mic pin + engine start, main queue,
   `g_mu` held) does not return within N seconds. Tighter than the heartbeat on purpose — see the
   Native-UI section. Off when the watchdog is off.
