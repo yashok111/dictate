@@ -73,3 +73,45 @@ TEST_CASE("wd_beat_interval_sec is well inside the smallest allowed timeout") {
     // Several heartbeats must fit in the timeout window, else one slow tick = a false restart.
     CHECK(wd_beat_interval_sec() * 5.0 <= (double)wd_min_timeout_sec());
 }
+
+TEST_CASE("wd_takestart_timeout_sec: <=0 disables, small values clamp up to the floor") {
+    CHECK(wd_takestart_timeout_sec(0)  == 0);
+    CHECK(wd_takestart_timeout_sec(-3) == 0);
+    CHECK(wd_takestart_timeout_sec(1)  == wd_takestart_min_sec());   // 1 s would fire on a healthy warm-up
+    CHECK(wd_takestart_timeout_sec(wd_takestart_min_sec()) == wd_takestart_min_sec());
+    CHECK(wd_takestart_timeout_sec(8)  == 8);
+}
+
+TEST_CASE("wd_deadline_expired: unarmed (0) never expires; armed fires at the stamp") {
+    CHECK_FALSE(wd_deadline_expired(1e9, 0.0));     // nothing armed → no take in flight
+    CHECK_FALSE(wd_deadline_expired(1e9, -1.0));
+    CHECK_FALSE(wd_deadline_expired(4999.0, 5000.0));
+    CHECK(wd_deadline_expired(5000.0, 5000.0));     // exactly at the deadline (>=)
+    CHECK(wd_deadline_expired(9000.0, 5000.0));
+}
+
+TEST_CASE("take-start deadline is tighter than the smallest allowed heartbeat timeout") {
+    // The whole point of the deadline is to beat the generic watchdog to the wedge. If the floor
+    // ever crept above the heartbeat floor it would be dead code.
+    CHECK(wd_takestart_min_sec() < wd_min_timeout_sec());
+    CHECK(wd_takestart_poll_sec() <= (double)wd_takestart_min_sec());   // at least one poll fits
+}
+
+TEST_CASE("wd_in_backoff: holds automatic restarts off after an aborted one") {
+    CHECK_FALSE(wd_in_backoff(1000.0, 0.0));       // nothing pending → never held off
+    CHECK_FALSE(wd_in_backoff(1000.0, -1.0));
+    CHECK(wd_in_backoff(1000.0, 31000.0));         // inside the window
+    CHECK_FALSE(wd_in_backoff(31000.0, 31000.0));  // exactly at the stamp → free again
+    CHECK_FALSE(wd_in_backoff(99000.0, 31000.0));
+}
+
+TEST_CASE("wd_reason_is_wedge: only the involuntary restarts are worth a snapshot") {
+    CHECK(wd_reason_is_wedge("watchdog"));
+    CHECK(wd_reason_is_wedge("socket-force"));
+    CHECK(wd_reason_is_wedge("take-start"));
+    CHECK_FALSE(wd_reason_is_wedge("menu"));      // user pressed ⟳ / ⌥⌘⇧D — nothing to explain
+    CHECK_FALSE(wd_reason_is_wedge("socket"));    // plain `dictate restart`
+    CHECK_FALSE(wd_reason_is_wedge("socket-forced"));   // no prefix matching
+    CHECK_FALSE(wd_reason_is_wedge(""));
+    CHECK_FALSE(wd_reason_is_wedge(nullptr));
+}
