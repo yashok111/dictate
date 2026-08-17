@@ -19,12 +19,20 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <!-- Free the resident ~573 MB Metal model after this many seconds idle (gotcha #7).
-         0/unset = stay resident. First take after an unload pays a ~600 ms-1 s reload. -->
+    <!-- DICTATE_IDLE_UNLOAD_SEC: free the resident ~573 MB Metal model after this many seconds
+         idle (gotcha #7). 0/unset = stay resident. The first take after an unload pays a
+         ~600 ms-1 s reload.
+         DICTATE_WATCHDOG_SEC: restart the daemon after this long with a stalled main run loop.
+         Lowered from the built-in default of 30 s after the 2026-08-17 wedge, where the UI
+         (hotkey, banner, menubar ⟳ — all main-thread) was dead for the full timeout before the
+         watchdog fired. The mic-start section, which is where that wedge landed, has its own and
+         much tighter deadline (DICTATE_TAKESTART_SEC, default 8 s). -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>DICTATE_IDLE_UNLOAD_SEC</key>
         <string>300</string>
+        <key>DICTATE_WATCHDOG_SEC</key>
+        <string>15</string>
     </dict>
     <key>StandardOutPath</key>
     <string>/tmp/dictate.log</string>

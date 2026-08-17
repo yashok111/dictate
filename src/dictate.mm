@@ -63,6 +63,7 @@
 #include <crt_externs.h>     // _NSGetEnviron — environment for posix_spawn
 #include <sys/wait.h>        // waitpid — reap the editor child + recover if it dies
 #include <sys/time.h>        // struct timeval — SO_RCVTIMEO on accepted client sockets
+#include <sys/uio.h>         // writev — stamp + message in ONE write, so log lines can't interleave
 #include <dirent.h>
 
 #include "whisper.h"
@@ -116,6 +117,53 @@ static double now_ms(void) { return (double)clock_gettime_nsec_np(CLOCK_MONOTONI
 // stall on wake and the watchdog would restart the daemon every morning. CLOCK_UPTIME_RAW stops.
 static double now_uptime_ms(void) { return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1.0e6; }
 
+// ── daemon log lines: stamped, single-write ──────────────────────────────────────────────
+// Every line the daemon writes itself carries "HH:MM:SS.mmm ". /tmp/dictate.log used to carry
+// no time at all, which is exactly what made the 2026-08-17 wedge post-mortem painful: nothing
+// in it could be lined up against `log show`, the take log, or `ps`. whisper's own chatter stays
+// unstamped — a convenient side effect, since the stamp then marks OUR lines for grepping.
+//
+// Implemented over write(2), not fprintf, for the same reason raw_log always was: these are the
+// lines that must survive a restart taken while another thread sits wedged, possibly holding
+// stderr's stdio lock. Two more consequences of that constraint:
+//   · the stamp is arithmetic over a UTC offset cached at startup, NOT localtime_r — that takes
+//     an internal timezone lock. A DST flip mid-run therefore skews the wall-clock by an hour;
+//     ordering, which is what a post-mortem needs, is unaffected.
+//   · stamp and message go out in ONE writev, so two threads logging at once cannot interleave
+//     into a line with someone else's timestamp on it.
+static long g_tz_off_sec = 0;                      // seconds east of UTC, captured once
+static void log_init_tz(void) {
+    time_t t = time(nullptr); struct tm lt{};
+    if (localtime_r(&t, &lt)) g_tz_off_sec = lt.tm_gmtoff;
+}
+static size_t ts_prefix(char *buf, size_t cap) {   // → bytes written ("HH:MM:SS.mmm ")
+    struct timespec ts{}; clock_gettime(CLOCK_REALTIME, &ts);
+    long long secs = (long long)ts.tv_sec + (long long)g_tz_off_sec;
+    long long sod  = ((secs % 86400) + 86400) % 86400;                 // second of the local day
+    int n = snprintf(buf, cap, "%02d:%02d:%02d.%03d ", (int)(sod/3600), (int)((sod/60)%60),
+                     (int)(sod%60), (int)(ts.tv_nsec/1000000));
+    return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+// Stamp + emit a ready-made string. Async-safe enough for the restart path: no malloc, no stdio.
+static void raw_log(const char *s) {
+    char ts[24]; size_t n = ts_prefix(ts, sizeof ts);
+    struct iovec iov[2] = { { ts, n }, { (void *)s, strlen(s) } };
+    ssize_t w = writev(STDERR_FILENO, iov, 2); (void)w;
+}
+// Stamp + format. Everything the daemon logs goes through here (the client/`--file` paths keep
+// plain fprintf — a timestamp on interactive CLI output is just noise).
+__attribute__((format(printf, 1, 2)))
+static void slog(const char *fmt, ...) {
+    char line[2048];
+    size_t n = ts_prefix(line, sizeof line);
+    va_list ap; va_start(ap, fmt);
+    int m = vsnprintf(line + n, sizeof line - n, fmt, ap);
+    va_end(ap);
+    if (m < 0) return;
+    size_t body = (size_t)m < sizeof line - n ? (size_t)m : sizeof line - n - 1;   // vsnprintf truncates
+    ssize_t w = write(STDERR_FILENO, line, n + body); (void)w;
+}
+
 // Watchdog state (see src/dictate_watchdog.h): the main queue stamps g_wd_beat_ms once a second,
 // a background thread restarts the process if the stamp goes stale. 0 = disabled.
 static const int WATCHDOG_DEFAULT_SEC = 30;
@@ -125,6 +173,12 @@ static std::atomic<double> g_wd_beat_ms{0};
 // stamp; 0 = none. Bounded on purpose — see ensure_model_loaded.
 static std::atomic<double> g_longop_until_ms{0};
 static const int           LONGOP_GRACE_SEC = 120;
+// Take-start deadline (src/dictate_watchdog.h): the mic-start critical section must finish by this
+// uptime-ms stamp; 0 = no take starting. The generic heartbeat covers this too, just far later —
+// see wd_takestart_timeout_sec for why the section gets its own, tighter watcher.
+static const int           TAKESTART_DEFAULT_SEC = 8;
+static int                 g_takestart_sec = 0;    // effective timeout; 0 = disabled
+static std::atomic<double> g_takestart_until_ms{0};
 
 // Default whisper CPU-thread count. This workload is GPU(Metal)-bound, so the thread
 // count barely moves transcription time (measured on M1 Pro: 2…8 threads all ≈ equal).
@@ -517,7 +571,7 @@ static BOOL prefer_builtin_input(AVAudioEngine *engine, AudioDeviceID *cache) {
         // permanent state, and a line per take would just be log noise.
         static bool warned = false;
         if (!warned) { warned = true;
-            fprintf(stderr, "⚠ no built-in input device found — keeping the system default input\n"); }
+            slog("⚠ no built-in input device found — keeping the system default input\n"); }
         return NO;
     }
     if (cache) *cache = dev;
@@ -525,10 +579,10 @@ static BOOL prefer_builtin_input(AVAudioEngine *engine, AudioDeviceID *cache) {
     if (au.deviceID == dev) return NO;                    // already there → no notification
     NSError *err = nil;
     if (![au setDeviceID:dev error:&err]) {
-        fprintf(stderr, "⚠ could not pin the built-in mic: %s\n", err.localizedDescription.UTF8String ?: "?");
+        slog("⚠ could not pin the built-in mic: %s\n", err.localizedDescription.UTF8String ?: "?");
         return NO;
     }
-    fprintf(stderr, "pinned capture to the built-in mic (device %u)\n", (unsigned)dev);
+    slog("pinned capture to the built-in mic (device %u)\n", (unsigned)dev);
     return YES;
 }
 
@@ -633,12 +687,12 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     NSError *e1=nil;
     if ([self installTapAndStart:&e1]) return YES;
     if (!capture_err_is_recoverable(e1)) { if (err) *err=e1; return NO; }
-    fprintf(stderr, "⚠ capture start failed (%s) → rebuilding AVAudioEngine (stale CoreAudio client?)\n",
-            e1.localizedDescription.UTF8String ?: "?");
+    slog("⚠ capture start failed (%s) → rebuilding AVAudioEngine (stale CoreAudio client?)\n",
+         e1.localizedDescription.UTF8String ?: "?");
     [self dropEngine];
     [self buildEngine];
     NSError *e2=nil;
-    if ([self installTapAndStart:&e2]) { fprintf(stderr, "✓ capture recovered after engine rebuild\n"); return YES; }
+    if ([self installTapAndStart:&e2]) { slog("✓ capture recovered after engine rebuild\n"); return YES; }
     // Terminal: disarm NOW rather than leaving a live observer on a dead engine. Otherwise the
     // next configuration notification re-enters -reconfigure, which grants itself another
     // "one-time" retry — an unbounded rebuild loop. With _engine nil, -reconfigure no-ops.
@@ -699,8 +753,8 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     // Log the device the tap is ACTUALLY reading, not the one we asked for. The whole failure
     // mode this guards against (capture landing on a virtual device) is silent — an empty
     // transcript, no error — so the confirmation has to come from the started engine.
-    fprintf(stderr, "capture live: device %u, %.0f Hz, %u ch\n",
-            (unsigned)input.AUAudioUnit.deviceID, inFmt.sampleRate, (unsigned)inFmt.channelCount);
+    slog("capture live: device %u, %.0f Hz, %u ch\n",
+         (unsigned)input.AUAudioUnit.deviceID, inFmt.sampleRate, (unsigned)inFmt.channelCount);
     return YES;
 }
 - (void)reconfigure {
@@ -714,12 +768,12 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     // -setDeviceID:, so -isRunning is the discriminator. Disarm either way: one notification is
     // all the pin can produce.
     if (_pinReconfig) { _pinReconfig = NO; if (_engine.isRunning) return; }
-    fprintf(stderr, "audio configuration changed → rebuilding capture\n");
+    slog("audio configuration changed → rebuilding capture\n");
     if (_tapInstalled) { [_engine.inputNode removeTapOnBus:0]; _tapInstalled=NO; }
     [_engine stop];
     NSError *err=nil;
     if (![self startWithHALRecovery:&err]) {   // a route change can also leave the HAL client stale
-        fprintf(stderr, "⚠ capture rebuild failed: %s\n", err.localizedDescription.UTF8String ?: "?");
+        slog("⚠ capture rebuild failed: %s\n", err.localizedDescription.UTF8String ?: "?");
         // The mic is dead; don't let the take silently dribble to the 60 s cap. Stop it + notify —
         // DEFERRED so we don't reentrantly [r stop] this very Recorder from inside its own method.
         dispatch_async(dispatch_get_main_queue(), ^{ on_capture_lost(); });
@@ -990,8 +1044,8 @@ static bool ensure_model_loaded(void) {
     struct LongOpGuard { ~LongOpGuard(){ g_wd_beat_ms.store(now_uptime_ms()); g_longop_until_ms.store(0); } } guard;
     double t0 = now_ms();
     load_backends_and_model(g_model_path);
-    if (g_ctx) fprintf(stderr, "✓ model reloaded on demand (%.0f ms)\n", now_ms()-t0);
-    else       fprintf(stderr, "✖ model reload failed: %s\n", g_model_path.c_str());
+    if (g_ctx) slog("✓ model reloaded on demand (%.0f ms)\n", now_ms()-t0);
+    else       slog("✖ model reload failed: %s\n", g_model_path.c_str());
     return (bool)g_ctx;
 }
 
@@ -1049,16 +1103,16 @@ static void install_hotkeys(void) {
     InstallApplicationEventHandler(&hotkey_handler, 1, &t, nullptr, &g_hkHandler);
     EventHotKeyID idD = { 'dict', 1 };
     OSStatus s = RegisterEventHotKey(kVK_ANSI_D, cmdKey|shiftKey, idD, GetApplicationEventTarget(), 0, &g_hkToggle);
-    if (s != noErr) fprintf(stderr, "⚠ hotkey ⌘⇧D registration failed (%d)\n", (int)s);
-    else            fprintf(stderr, "✓ hotkey ⌘⇧D registered\n");
+    if (s != noErr) slog("⚠ hotkey ⌘⇧D registration failed (%d)\n", (int)s);
+    else            slog("✓ hotkey ⌘⇧D registered\n");
     // ⌥⌘⇧D — restart the daemon. Same physical D key, one extra modifier: the menubar ⟳ item is not
     // reachable when macOS parks the status item under the notch (a full menu bar), so the escape
     // hatch must not live only in the menu. NOT unregistered while the editor is open — the point
     // is that it works when everything else is stuck.
     EventHotKeyID idR = { 'dict', 3 };
     s = RegisterEventHotKey(kVK_ANSI_D, cmdKey|shiftKey|optionKey, idR, GetApplicationEventTarget(), 0, &g_hkRestart);
-    fprintf(stderr, s==noErr ? "✓ hotkey ⌥⌘⇧D (перезапуск) registered\n"
-                             : "⚠ hotkey ⌥⌘⇧D registration failed\n");
+    slog("%s", s==noErr ? "✓ hotkey ⌥⌘⇧D (перезапуск) registered\n"
+                        : "⚠ hotkey ⌥⌘⇧D registration failed\n");
 }
 static void register_esc(void) {   // Esc cancels ONLY while a take is live (so Esc is normal elsewhere)
     if (g_hkEsc) return;
@@ -1091,8 +1145,8 @@ static void paste_text(NSString *text) {                 // main thread
     NSString *orig = [pb stringForType:NSPasteboardTypeString] ?: @"";   // non-string content → restored as empty
     copy_to_clipboard(text);                             // text on the clipboard either way
     bool trusted = ax_trusted(false);
-    fprintf(stderr, "paste: %lu chars, ax_trusted=%d → %s\n",
-            (unsigned long)text.length, trusted, trusted ? "synth ⌘V" : "clipboard-only (grant Accessibility)");
+    slog("paste: %lu chars, ax_trusted=%d → %s\n",
+         (unsigned long)text.length, trusted, trusted ? "synth ⌘V" : "clipboard-only (grant Accessibility)");
     if (!trusted) { [g_ctrl showHint:@"готово — вставь ⌘V"]; return; }   // degrade, no synthetic key
     CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
     CGEventRef down = CGEventCreateKeyboardEvent(src, (CGKeyCode)kVK_ANSI_V, true);
@@ -1121,6 +1175,45 @@ static std::string daemon_start(const char *kind) {
     g_last_active_ms = now_ms();                             // reset the idle-unload clock
     g_sess = std::make_unique<StreamingSession>(g_ctx.get(), g_lang, g_nthreads);
     g_rec  = [[Recorder alloc] init];
+    // Arm the take-start deadline (src/dictate_watchdog.h) around the mic start: everything from
+    // here to the end of -startFeeding: is synchronous CoreAudio on the main queue with g_mu held,
+    // and when THAT wedges the hotkey, the banner and the menubar (⟳ included) go down with it —
+    // the 2026-08-17 incident, 35 s of dead UI. Disarmed the moment -startFeeding: returns, NOT at
+    // the end of this function: what follows it (the take-log line, the live-watch thread) is
+    // local-disk and bookkeeping work with a completely different failure mode, and leaving it
+    // inside an 8 s budget sized for CoreAudio would turn a stalled disk into a restart LOOP —
+    // a restart does not fix a stalled disk. The RAII guard stays as the net for the early returns.
+    //
+    // Armed only when the mic permission is already granted: on a first run macOS puts up the TCC
+    // dialog and blocks here until the user answers. That is not a wedge, and restarting the
+    // daemon out from under the prompt would take the prompt down with it and make the permission
+    // ungrantable — a restart loop the user cannot escape. Suppressing only THIS deadline is not
+    // enough, though: the heartbeat is stale for the same reason and would fire a few seconds
+    // later. So a pending prompt takes the long-op exemption instead — the same one the model
+    // reload uses, bounded by LONGOP_GRACE_SEC, so a prompt nobody ever answers still cannot
+    // disarm the watchdog forever.
+    struct TakeStartGuard {
+        bool longop;
+        void disarm() {
+            g_takestart_until_ms.store(0);
+            if (longop) { g_longop_until_ms.store(0); longop = false; }
+            g_wd_beat_ms.store(now_uptime_ms());   // main was legitimately busy right up to here;
+        }                                          // don't hand the watchdog a stale stamp (as LongOpGuard)
+        ~TakeStartGuard(){ disarm(); }
+    };
+    const bool micAuthorized = [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]
+                               == AVAuthorizationStatusAuthorized;
+    TakeStartGuard tsGuard{ !micAuthorized };
+    if (!micAuthorized)                g_longop_until_ms.store(now_uptime_ms() + LONGOP_GRACE_SEC * 1000.0);
+    else if (g_takestart_sec > 0)      g_takestart_until_ms.store(now_uptime_ms() + g_takestart_sec * 1000.0);
+    // Debug-only: stall right here, inside the armed window, on the main queue, under g_mu — an
+    // exact stand-in for the real wedge, and the only way to exercise the deadline end to end
+    // (same role the `wedge` verb plays for the heartbeat, same DICTATE_DEBUG gate).
+    if (const char *st = getenv("DICTATE_DEBUG_TAKESTART_STALL"); st && getenv("DICTATE_DEBUG")) {
+        int sec = atoi(st);
+        if (sec > 0) { slog("take-start: debug stall %d s\n", sec);
+                       struct timespec ts{sec, 0}; nanosleep(&ts, nullptr); }
+    }
     NSError *err = nil;
     if (![g_rec startFeeding:g_sess.get() error:&err]) {
         std::string msg = err.localizedDescription.UTF8String ?: "engine start failed";
@@ -1132,6 +1225,7 @@ static std::string daemon_start(const char *kind) {
         g_sess.reset(); g_rec=nil;   // dtor joins the worker — safe (was: delete on a live thread → std::terminate)
         return msg;
     }
+    tsGuard.disarm();   // CoreAudio returned — everything below is out of scope for both watchers
     g_active_take = g_take_logger.start(kind);
     g_has_active_take = !g_active_take.id.empty();
     // touch STATE_FILE only once real audio flows. The native warm-up poll
@@ -1200,11 +1294,121 @@ static void daemon_cancel(const char *reason) {
 // socket verb (works even when the main queue is wedged), and the automatic watchdog.
 static std::string self_path(void);   // defined with the client helpers, below
 
-// Logging for the restart path: a bare write(2), NOT fprintf. The whole point of the hard path is
-// that it runs while some other thread is wedged — and that thread may be wedged *while holding
-// stderr's stdio lock*, which would deadlock a printf. snprintf into a stack buffer is fine (it
-// touches no FILE). stderr is unbuffered, so nothing is lost by skipping fflush.
-static void raw_log(const char *s) { ssize_t n = write(STDERR_FILENO, s, strlen(s)); (void)n; }
+// Logging on this path is raw_log/slog (write(2), defined at the top of the file), NEVER fprintf:
+// the whole point of the hard path is that it runs while some other thread is wedged — and that
+// thread may be wedged *while holding stderr's stdio lock*, which would deadlock a printf.
+// snprintf into a stack buffer is fine (it touches no FILE).
+
+// ── wedge forensics ──────────────────────────────────────────────────────────────────────
+// The restart is also the moment the evidence disappears: once the process is gone, all that is
+// left of a wedge is the absence of log lines (that is literally all the 2026-08-17 post-mortem
+// had — `log show` gave the last CoreAudio call, nothing gave the stuck stack). So snapshot the
+// process with `sample` BEFORE tearing it down, but only for the involuntary reasons
+// (wd_reason_is_wedge): a user-initiated ⟳ has nothing to explain and the user is waiting.
+//
+// Everything expensive is prepared UP FRONT, while the daemon is healthy — the report directory,
+// the argv strings, and a helper thread parked on a semaphore since startup. The restart path
+// itself must stay allocation-free, and that is not pedantry: it runs while another thread is
+// wedged, and a thread wedged inside CoreAudio/AVFoundation (exactly our case) may hold the
+// allocator lock. A posix_spawn taken from the restart path could then block forever and defeat
+// the very restart it was documenting — and under launchd that would be a NEW way to lose the
+// daemon outright, since the managed path otherwise spawns nothing at all. So the restart path
+// only signals a semaphore, waits on an atomic with a deadline, and goes regardless; all the
+// allocating work happens on the helper, where blocking costs nothing but the report.
+//
+// The report lands under ~/.local/share/dictate/wedge/ (0700, ours) rather than in /tmp: /tmp is
+// world-writable, and a predictable name there lets any local user pre-plant a symlink and have
+// `sample -file` truncate whatever we can write.
+//
+// Ordering (see restart_process_now): this runs BEFORE the successor is lined up. A hand-started
+// daemon's `--replace` successor gives us 5 s to drop the socket before it takes over, and our
+// teardown would then unlink ITS fresh socket — sampling first keeps that clock from starting,
+// and the wait is kept under 5 s anyway so the invariant survives a reorder.
+// DICTATE_WEDGE_SAMPLE=0 turns the whole thing off.
+static const int WEDGE_SAMPLE_SEC      = 1;   // how long `sample` watches the process — a wedged
+                                              // stack does not move, 1 s of it is the whole story
+static const int WEDGE_SAMPLE_WAIT_SEC = 4;   // hard cap on how long WE wait for it to finish
+                                              // (a 1 s sample lands in ~1.5 s), < the 5 s takeover
+static dispatch_semaphore_t g_sample_req = nullptr;    // restart path → helper (signal only)
+// Handshake is GENERATION-counted, not a boolean: a restart can abort (no replacement could be
+// spawned) and a later one can follow, and a boolean would let the late completion of the first,
+// timed-out snapshot satisfy the second one's wait — which would then proceed and kill its own
+// `sample` mid-run. Requests and completions are 1:1 and in order (one semaphore token per loop
+// iteration), so "my request is done" is simply done_gen >= my request number.
+static std::atomic<unsigned long long> g_sample_req_gen{0};
+static std::atomic<unsigned long long> g_sample_done_gen{0};
+static char                 g_sample_dir[400];         // prepared at startup; "" = forensics off
+static char                 g_sample_pid[16];          // argv strings, likewise pre-rendered
+static char                 g_sample_sec[8];
+
+// Helper-thread body. Parked on the semaphore until a wedge restart signals it; blocking is fine
+// here, and only here.
+static void wedge_sample_loop(void) {
+    for (;;) {
+        dispatch_semaphore_wait(g_sample_req, DISPATCH_TIME_FOREVER);
+        char path[480];
+        snprintf(path, sizeof path, "%s/wedge-%lld.txt", g_sample_dir, (long long)time(nullptr));
+        char msg[560];
+        posix_spawn_file_actions_t fa;
+        if (posix_spawn_file_actions_init(&fa) != 0) {   // ENOMEM: `fa` is unusable, do NOT use it
+            raw_log("wedge-sample: file actions init failed — no snapshot\n");
+            g_sample_done_gen.fetch_add(1); continue;
+        }
+        posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);   // sample's own progress
+        posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);   // chatter goes nowhere;
+        posix_spawn_file_actions_adddup2(&fa, 1, 2);                          // the report is -file
+        char *argv[] = { (char*)"sample", g_sample_pid, g_sample_sec, (char*)"-file", path, nullptr };
+        pid_t pid = 0;
+        int rc = posix_spawn(&pid, "/usr/bin/sample", &fa, nullptr, argv, *_NSGetEnviron());
+        posix_spawn_file_actions_destroy(&fa);
+        if (rc != 0) {
+            snprintf(msg, sizeof msg, "wedge-sample: spawn failed (%s)\n", strerror(rc));
+            raw_log(msg); g_sample_done_gen.fetch_add(1); continue;
+        }
+        snprintf(msg, sizeof msg, "wedge-sample: %s ← sampling %s s\n", path, g_sample_sec);
+        raw_log(msg);
+        // Blocking wait, EINTR-safe: we own this child, so it is reaped even if the restart gave
+        // up on us and even if the restart is later aborted (a zombie would otherwise outlive it).
+        int st = 0;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        g_sample_done_gen.fetch_add(1);
+    }
+}
+
+// Prepare the forensics machinery while the daemon is healthy. Called once from run_daemon.
+static void wedge_sample_init(void) {
+    if (const char *e = getenv("DICTATE_WEDGE_SAMPLE"); e && !strcmp(e, "0")) {
+        slog("wedge-sample: disabled\n"); return;
+    }
+    const char *home = getenv("HOME");
+    if (!home || !*home) { slog("wedge-sample: no $HOME — disabled\n"); return; }
+    char dir[400];
+    snprintf(dir, sizeof dir, "%s/.local/share/dictate", home);
+    mkdir(dir, 0700);                                    // parents may already exist (take logs)
+    snprintf(dir, sizeof dir, "%s/.local/share/dictate/wedge", home);
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        slog("wedge-sample: cannot create %s (%s) — disabled\n", dir, strerror(errno)); return;
+    }
+    g_sample_req = dispatch_semaphore_create(0);
+    if (!g_sample_req) { slog("wedge-sample: no semaphore — disabled\n"); return; }
+    snprintf(g_sample_dir, sizeof g_sample_dir, "%s", dir);
+    snprintf(g_sample_pid, sizeof g_sample_pid, "%d", (int)getpid());
+    snprintf(g_sample_sec, sizeof g_sample_sec, "%d", WEDGE_SAMPLE_SEC);
+    std::thread(wedge_sample_loop).detach();
+    slog("wedge-sample: armed — stuck stacks go to %s before an involuntary restart\n", dir);
+}
+
+// Called from restart_process_now. Allocation-free by construction (see above).
+static void request_wedge_sample(const char *reason) {
+    if (!g_sample_dir[0] || !wd_reason_is_wedge(reason)) return;
+    const unsigned long long mine = g_sample_req_gen.fetch_add(1) + 1;
+    dispatch_semaphore_signal(g_sample_req);
+    for (int i = 0; i < WEDGE_SAMPLE_WAIT_SEC * 20 && g_sample_done_gen.load() < mine; i++) {
+        struct timespec ts{0, 50*1000*1000}; nanosleep(&ts, nullptr);
+    }
+    if (g_sample_done_gen.load() < mine)
+        raw_log("wedge-sample: not finished at the deadline — restarting anyway (report may be partial)\n");
+}
 
 // launchd sets XPC_SERVICE_NAME to the job label for its jobs ("0" for anything it didn't launch;
 // verified on this install: the LaunchAgent gets `com.user.dictate`, a shell gets `0`). Under
@@ -1251,6 +1455,11 @@ static std::atomic<unsigned long long> g_restart_gen{0}; // bumped when a restar
                                                          // armed deadline/force threads stand down
 static std::atomic<bool> g_torn_down{false};       // socket + state file already dropped by whoever got here first
 static std::atomic<pid_t> g_editor_pid{0};         // live `dictate editor` child, so a restart doesn't orphan it
+// Aborted restarts hold the AUTOMATIC triggers off for a bit (src/dictate_watchdog.h,
+// wd_in_backoff): main is still wedged when a restart aborts, so without this both watchers
+// would retry on their next round — a spawn-failure hot loop, one `sample` per round.
+static std::atomic<double> g_restart_backoff_until_ms{0};
+static const int RESTART_BACKOFF_SEC  = 30;  // how long an aborted restart holds the watchers off
 static const int RESTART_GRACE_SEC    = 5;   // how long a second caller waits on an in-flight restart
 static const int RESTART_DEADLINE_SEC = 3;   // how long the graceful (main-queue) restart gets before it is forced
 
@@ -1269,6 +1478,9 @@ static void restart_process_now(const char *reason) {
     }
     char msg[128]; snprintf(msg, sizeof msg, "restart (%s): relaunching the daemon\n", reason);
     raw_log(msg);
+    // 0) If this restart is breaking a WEDGE, snapshot the stuck stacks before anything is torn
+    //    down — this is the only moment the evidence still exists. No-op for a voluntary restart.
+    request_wedge_sample(reason);
     // 1) Line the successor up FIRST. Under launchd, KeepAlive is the successor and there is nothing
     //    to do. Otherwise spawn one — and if that fails, abort the restart with NOTHING torn down:
     //    a wedged daemon still owns the hotkey and can be retried, no daemon at all cannot.
@@ -1282,6 +1494,7 @@ static void restart_process_now(const char *reason) {
                 raw_log("restart: no replacement could be spawned — aborting the restart, staying "
                         "alive (retry with `dictate restart`)\n");
                 g_replacement_spawned.store(false);           // nothing was spawned — let a retry try again
+                g_restart_backoff_until_ms.store(now_uptime_ms() + RESTART_BACKOFF_SEC*1000.0);
                 g_restart_gen.fetch_add(1);                   // stand down any deadline/force thread
                 g_restarting.store(false);
                 return;
@@ -1296,7 +1509,11 @@ static void restart_process_now(const char *reason) {
             }
             if (!g_replacement_ready.load()) {
                 raw_log("restart: no confirmed replacement — not tearing down\n");
-                g_restarting.store(false);
+                g_restart_backoff_until_ms.store(now_uptime_ms() + RESTART_BACKOFF_SEC*1000.0);
+                g_restart_gen.fetch_add(1);                   // stand down the armed deadline/force
+                g_restarting.store(false);                    // threads too — same as the spawn-failure
+                                                              // abort; otherwise they retry at once and
+                                                              // walk straight past the backoff
                 return;
             }
         }
@@ -1409,7 +1626,7 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
             try { confStr = conf::serialize(conf::realign(text, raw->confidence(), finalText)); } catch (...) {}
             double seconds = raw->seconds(); int segments = raw->segments();
             log_transcript(meta, text, finalText, seconds, segments);
-            fprintf(stderr, "stop: %.2fs, %d seg → %zu chars\n", seconds, segments, finalText.size());
+            slog("stop: %.2fs, %d seg → %zu chars\n", seconds, segments, finalText.size());
             delete raw;
             NSString *ns = finalText.empty()? nil : [NSString stringWithUTF8String:finalText.c_str()];
             NSString *confNs = [NSString stringWithUTF8String:confStr.c_str()] ?: @"";
@@ -1741,14 +1958,14 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     g_last_active_ms = now_ms();
     double iv = idle_poll_interval_sec(g_idle_unload_sec);
     _idle = [NSTimer scheduledTimerWithTimeInterval:iv target:self selector:@selector(idleTick:) userInfo:nil repeats:YES];
-    fprintf(stderr, "idle-unload: armed — model will free after %d s idle (poll %.0fs)\n", g_idle_unload_sec, iv);
+    slog("idle-unload: armed — model will free after %d s idle (poll %.0fs)\n", g_idle_unload_sec, iv);
 }
 - (void)idleTick:(NSTimer *)t { (void)t;
     std::lock_guard<std::mutex> lk(g_mu);   // serialize the free against take-start + the worker (gotcha #5)
     bool sess = (bool)g_sess, fin = g_finishing.load(), ed = g_editor_open.load(), loaded = (bool)g_ctx;
     if (idle_is_active(sess, fin, ed, loaded)) { g_last_active_ms = now_ms(); return; }   // active → reset clock
     if (idle_should_unload(now_ms(), g_last_active_ms, g_idle_unload_sec, sess, fin, ed, loaded)) {
-        fprintf(stderr, "idle-unload: freeing model after %.0f s idle\n", (now_ms()-g_last_active_ms)/1000.0);
+        slog("idle-unload: freeing model after %.0f s idle\n", (now_ms()-g_last_active_ms)/1000.0);
         g_ctx.reset();                       // whisper_free → ~573 MB Metal released (gotcha #7)
     }
 }
@@ -1765,7 +1982,7 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     int req = WATCHDOG_DEFAULT_SEC;
     if (const char *e = getenv("DICTATE_WATCHDOG_SEC")) req = atoi(e);
     g_watchdog_sec = wd_effective_timeout_sec(req);
-    if (g_watchdog_sec <= 0) { fprintf(stderr, "watchdog: disabled\n"); return; }
+    if (g_watchdog_sec <= 0) { slog("watchdog: disabled\n"); return; }
     // NOTE: the heartbeat is armed by the FIRST timer tick, not here. wd_should_restart treats an
     // unarmed stamp as healthy, so a daemon whose run loop never starts at all is never restarted —
     // that failure would restart-loop forever (each loop paying a ~10 s model load) instead of
@@ -1791,13 +2008,42 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
             if (starved) { raw_log("watchdog: checker starved — skipping this round\n"); continue; }
             double longopUntil = g_longop_until_ms.load();
             if (!wd_should_restart(now, beat, to, /*long_op_in_flight=*/now < longopUntil)) continue;
+            if (wd_in_backoff(now, g_restart_backoff_until_ms.load())) continue;   // last restart aborted
             char msg[128];
             snprintf(msg, sizeof msg, "watchdog: main thread unresponsive for %.0f s — restarting\n", (now-beat)/1000.0);
             raw_log(msg);
             restart_process_now("watchdog");   // never returns
         }
     }).detach();
-    fprintf(stderr, "watchdog: armed — restart if main stalls > %d s (poll %.0fs)\n", to, poll);
+    slog("watchdog: armed — restart if main stalls > %d s (poll %.0fs)\n", to, poll);
+
+    // The take-start deadline rides alongside the heartbeat: same restart, much tighter window,
+    // its own reason string. It gets its OWN thread rather than a second check inside the loop
+    // above, because it is only worth having at a ~1 s poll while the heartbeat polls a fraction
+    // of a far larger timeout. Deliberately gated on the watchdog being enabled — both are "the
+    // daemon may restart itself", so DICTATE_WATCHDOG_SEC=0 turns off both.
+    int treq = TAKESTART_DEFAULT_SEC;
+    if (const char *e = getenv("DICTATE_TAKESTART_SEC")) treq = atoi(e);
+    g_takestart_sec = wd_takestart_timeout_sec(treq);
+    if (g_takestart_sec <= 0) { slog("take-start deadline: disabled\n"); return; }
+    double tpoll = wd_takestart_poll_sec();
+    std::thread([tpoll]{
+        struct timespec ts{(time_t)tpoll, (long)((tpoll - (double)(time_t)tpoll) * 1e9)};
+        double lastCheck = now_uptime_ms();   // same reasoning as the heartbeat checker above
+        for (;;) {
+            nanosleep(&ts, nullptr);
+            double now = now_uptime_ms();
+            bool starved = wd_checker_starved(now, lastCheck, tpoll);   // OUR sleep overran → the
+            lastCheck = now;                                            // process was suspended
+            if (starved) continue;
+            if (!wd_deadline_expired(now, g_takestart_until_ms.load())) continue;
+            if (wd_in_backoff(now, g_restart_backoff_until_ms.load())) continue;   // last restart aborted
+            raw_log("take-start: the mic start did not return in time — restarting\n");
+            restart_process_now("take-start");   // never returns
+        }
+    }).detach();
+    slog("take-start deadline: armed — restart if starting the mic takes > %d s (poll %.0fs)\n",
+         g_takestart_sec, tpoll);
 }
 - (void)beatTick:(NSTimer *)t { (void)t; g_wd_beat_ms.store(now_uptime_ms()); }
 @end
@@ -1885,7 +2131,7 @@ static void serve_client(int cl, bool degraded) {
                     try { text = finalize_transcript(rawText); } catch (...) {}   // post-normalize before clipboard
                     double seconds=take.session->seconds(); int segments=take.session->segments();
                     log_transcript(take.meta, rawText, text, seconds, segments);
-                    fprintf(stderr,"stop: %.2fs, %d seg → %zu chars\n", seconds, segments, text.size());
+                    slog("stop: %.2fs, %d seg → %zu chars\n", seconds, segments, text.size());
                 }
                 __block NSString *ns = text.empty()? nil : [NSString stringWithUTF8String:text.c_str()];
                 dispatch_sync(dispatch_get_main_queue(), ^{ @autoreleasepool { [g_ctrl finalizeSocketStop:ns]; } });
@@ -1958,7 +2204,7 @@ static void serve_client(int cl, bool degraded) {
         else if (cmd=="wedge" && getenv("DICTATE_DEBUG")) {
             int sec = atoi(arg.c_str());
             if (sec < 1) sec = 1; if (sec > 120) sec = 120;
-            fprintf(stderr, "wedge: blocking the main queue for %d s (debug)\n", sec);
+            slog("wedge: blocking the main queue for %d s (debug)\n", sec);
             dispatch_async(dispatch_get_main_queue(), ^{ struct timespec ts{sec,0}; nanosleep(&ts,nullptr); });
             write_all(cl,"ok\n",3);
         }
@@ -2052,17 +2298,17 @@ static int run_daemon(const std::string &modelPath, bool replacing) {
             if (answered) write_all(c,"ping\n",5);
             if (c>=0) close(c);
             if (!answered) break;                                   // nobody home → we bind below
-            if (!replacing) { fprintf(stderr,"daemon already running\n"); return 0; }
-            if (waited_ms >= 5000) { fprintf(stderr,"replace: predecessor still listening after %d ms — taking over\n", waited_ms); break; }
+            if (!replacing) { slog("daemon already running\n"); return 0; }
+            if (waited_ms >= 5000) { slog("replace: predecessor still listening after %d ms — taking over\n", waited_ms); break; }
             struct timespec ts{0, 50*1000*1000}; nanosleep(&ts,nullptr); waited_ms += 50;
         }
-        if (replacing) fprintf(stderr,"replace: predecessor gone after %d ms\n", waited_ms);
+        if (replacing) slog("replace: predecessor gone after %d ms\n", waited_ms);
     }
     // Only remove the path if it is actually a socket — defense-in-depth so a redirected
     // $DICTATE_SOCK can't make the daemon unlink an arbitrary user file (lstat, so a symlink is
     // seen AS a symlink and never followed). A stale socket from a dead daemon is the normal case.
     { struct stat st; if (lstat(SOCK_PATH,&st)==0 && !S_ISSOCK(st.st_mode)) {
-          fprintf(stderr,"refusing to unlink non-socket %s\n", SOCK_PATH); return 1; } }
+          slog("refusing to unlink non-socket %s\n", SOCK_PATH); return 1; } }
     unlink(SOCK_PATH);
 
     int srv=socket(AF_UNIX,SOCK_STREAM,0);
@@ -2074,11 +2320,11 @@ static int run_daemon(const std::string &modelPath, bool replacing) {
     if (listen(srv,8)<0){ perror("listen"); return 1; }
 
     g_model_path = modelPath;   // remembered so idle-unload can reload (gotcha #7)
-    fprintf(stderr,"⏳ loading model: %s\n", modelPath.c_str());
+    slog("⏳ loading model: %s\n", modelPath.c_str());
     double t0=now_ms();
     load_backends_and_model(modelPath);
-    if (!g_ctx){ fprintf(stderr,"✖ model load failed\n"); return 1; }
-    fprintf(stderr,"✓ model resident (%.0f ms). listening on %s\n", now_ms()-t0, SOCK_PATH);
+    if (!g_ctx){ slog("✖ model load failed\n"); return 1; }
+    slog("✓ model resident (%.0f ms). listening on %s\n", now_ms()-t0, SOCK_PATH);
 
     // Become a Cocoa accessory agent: the main thread runs the AppKit run loop (needed
     // for the global hotkey + banner + status item, added in later tasks); the socket
@@ -2094,6 +2340,7 @@ static int run_daemon(const std::string &modelPath, bool replacing) {
         [g_ctrl setupStatusItem];
         [g_ctrl setupIdleTimer];   // arm idle-unload if DICTATE_IDLE_UNLOAD_SEC is set (gotcha #7)
         [g_ctrl setupWatchdog];    // arm the main-thread watchdog (DICTATE_WATCHDOG_SEC=0 disables)
+        wedge_sample_init();       // park the forensics helper NOW, while allocating is still safe
         std::thread([srv]{ socket_accept_loop(srv); }).detach();
         [NSApp run];
     }
@@ -2631,7 +2878,7 @@ static void spawn_editor(NSString *transcript, NSString *conf) {
     pid_t pid;
     int rc = posix_spawn(&pid, self.c_str(), &fa, nullptr, argv, *_NSGetEnviron());
     posix_spawn_file_actions_destroy(&fa);
-    fprintf(stderr, "spawn_editor rc=%d pid=%d\n", rc, (int)pid);
+    slog("spawn_editor rc=%d pid=%d\n", rc, (int)pid);
     if (rc == 0) {
         g_editor_pid.store(pid);   // so a restart can take the editor with it instead of orphaning it
         // Reap the child AND recover if it dies WITHOUT sending accept/editor-cancel (crash, ⌘Q):
@@ -2645,7 +2892,7 @@ static void spawn_editor(NSString *transcript, NSString *conf) {
             // would have to be a same-uid process that reused the pid within microseconds; the
             // airtight version is a DISPATCH_SOURCE_TYPE_PROC/PROC_EXIT source instead of waitpid.
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (g_editor_open.load()) { fprintf(stderr, "editor exited without accept/cancel → recover\n"); [g_ctrl editorCancel]; }
+                if (g_editor_open.load()) { slog("editor exited without accept/cancel → recover\n"); [g_ctrl editorCancel]; }
             });
         }).detach();
     }
@@ -2725,6 +2972,7 @@ static int run_editor(NSString *transcript, bool fromDaemon, NSString *conf) {
 int main(int argc, char **argv) {
     @autoreleasepool {
         signal(SIGPIPE, SIG_IGN);   // never die on a broken pipe (socket peer or stdout consumer gone)
+        log_init_tz();              // cache the UTC offset before anything can log (see slog)
         const char *home=getenv("HOME");
         std::string modelPath = getenv("WHISPER_MODEL") ? getenv("WHISPER_MODEL")
             : std::string(home?home:".")+"/.config/whisper/ggml-large-v3-turbo-q5_0.bin";
@@ -2756,8 +3004,8 @@ int main(int argc, char **argv) {
                 if (const char *m = getenv("WHISPER_PROMPT_MAXTOK")) { int n=atoi(m); if (n>0) maxtok=(std::size_t)n; }
                 g_initial_prompt = dict::build_initial_prompt(ss.str(), maxtok);
                 if (!g_initial_prompt.empty())
-                    fprintf(stderr,"✓ lexical-bias prompt: ~%zu tok from %s\n",
-                            dict::estimate_tokens(g_initial_prompt), dictPath.c_str());
+                    slog("✓ lexical-bias prompt: ~%zu tok from %s\n",
+                         dict::estimate_tokens(g_initial_prompt), dictPath.c_str());
             }
         }
 

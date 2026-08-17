@@ -25,7 +25,8 @@ daemon** keeps the model in GPU memory (no per-take reload) and enables
   tokenize/cursor/apply + line-nav search), `dictate_authgen.h` (peer-uid + paste-gen checks),
   `dictate_dict.h` (user-dictionary parse + token-budgeted `initial_prompt` build — gotcha #21),
   `dictate_idle.h` (idle-unload gate + poll-cadence arithmetic — gotcha #7),
-  `dictate_watchdog.h` (main-thread watchdog gate: heartbeat staleness + poll cadence),
+  `dictate_watchdog.h` (main-thread watchdog gate: heartbeat staleness + poll cadence, the
+  take-start deadline arithmetic, and which restart reasons are worth a `sample` snapshot),
   `dictate_edscroll.h` (editor vertical-scroll clamp / cursor-follow arithmetic).
 - `tests/` — doctest unit tests (`tests/doctest.h` vendored; `tests/test_*.cpp`). `make test`.
 - `Makefile` — clang++ build; bakes `-DGGML_LIBEXEC` from `brew --prefix ggml`. Also the
@@ -81,6 +82,10 @@ Daemon socket commands (newline-terminated, raw replies): `ping`→`pong`,
 via the main queue, force-restarted from the socket thread after 2 s if main is wedged),
 `wedge <sec>`→`ok` (debug: block the main queue, the only way to exercise the watchdog /
 force-restart e2e — **gated on `DICTATE_DEBUG`**, otherwise `err unknown`), `quit`→`bye`.
+The take-start deadline has its own e2e hook for the same reason (nothing else hangs the mic
+start on demand): `DICTATE_DEBUG_TAKESTART_STALL=<sec>` (with `DICTATE_DEBUG`) stalls inside the
+armed window, on the main queue, under `g_mu` — start a take and the daemon restarts with reason
+`take-start` and leaves a `/tmp/dictate-wedge-*.txt` naming `daemon_start`.
 Each connection is served on **its own thread** (`socket_accept_loop`, capped at
 `SOCK_MAX_INFLIGHT`): most verbs `dispatch_sync` to the main queue, so serving inline meant one
 client blocked on a wedged main thread starved the accept loop and `restart` — the verb whose
@@ -229,9 +234,14 @@ all UI on the **main thread**:
   the physical D key, so it survives a Cyrillic layout (and needs no Accessibility).
   A second hotkey for **Esc** is registered only for the duration of a take (so Esc
   stays normal everywhere else) and cancels it. A **third**, ⌥⌘⇧D (id 3), restarts the daemon
-  and — unlike ⌘⇧D — is **never unregistered**, not even while the editor is open: it is the
-  escape hatch for a stuck daemon, and the menubar ⟳ item it duplicates is unreachable whenever
-  macOS parks the status item off-screen (see Menubar below). All three die with the process.
+  and — unlike ⌘⇧D — is **never unregistered**, not even while the editor is open: it covers a
+  daemon that is stuck but still pumping its run loop, and the menubar ⟳ item it duplicates is
+  unreachable whenever macOS parks the status item off-screen (see Menubar below). All three die
+  with the process. **It is NOT an escape hatch from a wedged main thread**: Carbon delivers
+  hotkeys to the main run loop, so when main is blocked ⌥⌘⇧D is as dead as the ⟳ menu item (this
+  is exactly what the user hits — the 2026-08-17 incident). The only two things that still work
+  there are the socket (`dictate restart`, served on its own thread with a force path) and the
+  automatic watchdog / take-start deadline.
 - **Banner**: a borderless floating `NSPanel` whose content view is a **flat
   translucent fill** (layer-backed `NSView`, black α`BANNER_BG_ALPHA` — Hammerspoon-
   style glass, no blur) + a hairline border, holding one centred `NSTextField`. Spans
@@ -298,7 +308,57 @@ all UI on the **main thread**:
   graceful `restartNow:` arms an off-main `RESTART_DEADLINE_SEC` thread BEFORE stopping the recorder
   and joining the worker, since those are exactly the calls that can hang. Restart logging is
   `raw_log` (`write(2)`), not `fprintf` — a thread wedged while holding stderr's stdio lock would
-  deadlock a printf. **Known narrow race** (pre-existing, shared with `quit`): between our exit and
+  deadlock a printf.
+- **Take-start deadline** (`g_takestart_until_ms`, `DICTATE_TAKESTART_SEC`, default 8 s): a second,
+  much tighter watcher armed only around the mic-start critical section in `daemon_start` — the
+  `AVAudioEngine` build, the built-in-mic pin and the engine start, all synchronous CoreAudio on the
+  main queue **with `g_mu` held**. That is where the wedge actually lands in practice (2026-08-17:
+  `setDeviceID:` → `kAudioHardwareIllegalOperationError` → AVFoundation never returned → 35 s of
+  dead UI), and the heartbeat timeout cannot be lowered to match because it also has to cover the
+  model reload, the editor spawn and every AppKit callback. Own thread, 1 s poll, same
+  `restart_process_now` with reason `take-start`; same `wd_checker_starved` suspension guard.
+  Disarmed the instant `-startFeeding:` returns, not at the end of `daemon_start`: the take-log
+  write and the live-watch thread that follow are disk/bookkeeping work, and leaving them inside a
+  budget sized for CoreAudio would turn a stalled disk into a restart *loop*. Disabled together
+  with the watchdog (`DICTATE_WATCHDOG_SEC=0`).
+  **Mic permission not yet granted** (first run): the TCC dialog owns this exact section until the
+  user answers, and a restart would take the prompt down with the process — an unescapable loop
+  where the permission can never be granted. Suppressing just this deadline is not enough, since
+  the heartbeat is stale for the same reason and fires a few seconds later; so a pending prompt
+  takes the **long-op exemption** instead (the one the model reload uses, bounded by
+  `LONGOP_GRACE_SEC` so an unanswered prompt still cannot disarm the watchdog forever).
+- **Wedge forensics** (`wedge_sample_init` / `wedge_sample_loop` / `request_wedge_sample`): the
+  restart is also the moment the evidence dies — after it, all that is left of a wedge is *absent*
+  log lines. So an involuntary restart (`wd_reason_is_wedge`: `watchdog` / `socket-force` /
+  `take-start`, never a user-initiated ⟳) `sample`s the process for `WEDGE_SAMPLE_SEC` first,
+  leaving `~/.local/share/dictate/wedge/wedge-<epoch>.txt` with every thread's stack — including
+  the stuck one, the single thing the log cannot give. Two structural rules, both learned the hard
+  way in review: (a) **the restart path allocates nothing** — the report dir, the argv strings and
+  a helper thread parked on a `dispatch_semaphore` are all set up at startup, and the restart only
+  signals the semaphore and polls an atomic with a `WEDGE_SAMPLE_WAIT_SEC` deadline. A wedge inside
+  CoreAudio/AVFoundation can hold the allocator lock, so a `posix_spawn` issued from the restart
+  path could block forever and defeat the restart it was documenting — and under launchd that
+  would be a *new* way to lose the daemon, since the managed path otherwise spawns nothing. The
+  helper blocks instead, where blocking costs only the report (and its blocking `waitpid` is also
+  what keeps a timed-out `sample` from becoming a zombie if the restart later aborts). (b) the
+  report goes under `~/.local/share/dictate/wedge/` (0700), **not** `/tmp`: a predictable name in a
+  world-writable directory lets any local user pre-plant a symlink and have `sample -file` truncate
+  whatever the daemon can write. `DICTATE_WEDGE_SAMPLE=0` turns it off.
+- **Restart backoff** (`g_restart_backoff_until_ms`, `wd_in_backoff`): a restart that ABORTS (no
+  replacement could be spawned — a wedged daemon beats no daemon) leaves main still wedged, so both
+  watchers would fire again on their very next round: a hot loop of failing spawns, one `sample`
+  each. The abort stamps `RESTART_BACKOFF_SEC`, which only the automatic triggers honour — a user
+  asking for a restart is never made to wait.
+- **Stamped log lines** (`slog`/`raw_log`, `ts_prefix`): every line the daemon writes itself starts
+  with `HH:MM:SS.mmm`; whisper's own chatter stays unstamped, which conveniently makes ours the
+  greppable ones. `/tmp/dictate.log` used to have no time at all — nothing in it could be lined up
+  against `log show`, the take log or `ps`, which is most of what made the 2026-08-17 post-mortem
+  slow. Both go through `write(2)` (never stdio, see above), stamp+message in one `writev` so two
+  threads can't interleave, and the UTC offset is cached at startup rather than calling
+  `localtime_r` (it takes a timezone lock) — a DST flip mid-run skews wall-clock by an hour but
+  never the ordering. The `--file`/client paths keep plain `fprintf`: a timestamp on interactive
+  CLI output is noise.
+- **Known narrow race** (pre-existing, shared with `quit`): between our exit and
   the replacement binding, a concurrent `dictate start` can spawn a second daemon; whichever binds
   first wins and the loser bows out via the single-instance guard — but if the loser is the launchd
   job, `KeepAlive` re-runs it every ~10 s until the other daemon exits. Not worth a lock file today.
@@ -375,10 +435,18 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
   resident-speed win for memory when idle (gotcha #7). The idle gate (`src/dictate_idle.h`,
   unit-tested — gotcha #19) is polled by an `NSTimer` at `idle_poll_interval_sec(N)`
   (timeout/3, clamped to 1–10 s).
-- `DICTATE_WATCHDOG_SEC=N` (default `30`, `0` = off, values < 10 clamp up to 10) — restart the
-  daemon if the main run loop stops stamping its 1 Hz heartbeat for N seconds. The pure gate is
-  `src/dictate_watchdog.h` (unit-tested); see the Native-UI section for the two false-positive
-  traps (common run-loop modes, sleep-excluding clock).
+- `DICTATE_WATCHDOG_SEC=N` (built-in default `30`, **`15` in the installed plist**, `0` = off,
+  values < 10 clamp up to 10) — restart the daemon if the main run loop stops stamping its 1 Hz
+  heartbeat for N seconds. The pure gate is `src/dictate_watchdog.h` (unit-tested); see the
+  Native-UI section for the false-positive traps (common run-loop modes, sleep-excluding clock,
+  checker starvation, long-op exemption).
+- `DICTATE_TAKESTART_SEC=N` (default `8`, `0` = off, values < 3 clamp up to 3) — restart the daemon
+  if the mic-start section (`AVAudioEngine` build + built-in-mic pin + engine start, main queue,
+  `g_mu` held) does not return within N seconds. Tighter than the heartbeat on purpose — see the
+  Native-UI section. Off when the watchdog is off.
+- `DICTATE_WEDGE_SAMPLE=0` — skip the `/usr/bin/sample` snapshot taken before an involuntary
+  restart (default ON, writes `~/.local/share/dictate/wedge/wedge-<epoch>.txt`). The snapshot costs
+  ~1.5 s of an already-broken daemon's restart and is the only source of the stuck stack.
 - VAD/segmentation constants in `src/dictate_vad.h` (with the pure `Segmenter`):
   `SILENCE_CLOSE_FR` (~700 ms pause closes a segment), `SPEECH_FACTOR`/`ABS_FLOOR`
   (sensitivity), `MAX_SEG_FR` (~20 s hard cap), `PREROLL_FR` (~300 ms kept before onset),
@@ -417,7 +485,13 @@ confidence → amber below `ED_CONF_THRESHOLD`; `src/dictate_conf.h` incl. `real
 demand — opt-in, off by default; `src/dictate_idle.h` + `idleTick` under `g_mu`, gotcha #7** ·
 **self-recovery: menubar right-click menu (state + ⟳ перезапустить + лог), `restart` socket
 verb / CLI, and a main-thread watchdog that relaunches the daemon after
-`DICTATE_WATCHDOG_SEC` (30 s) of a stalled run loop — `src/dictate_watchdog.h`** ·
+`DICTATE_WATCHDOG_SEC` (15 s in the installed plist) of a stalled run loop —
+`src/dictate_watchdog.h`** ·
+**wedge diagnostics + faster recovery (after the 2026-08-17 mic-start wedge): a `DICTATE_TAKESTART_SEC`
+(8 s) deadline around the mic-start critical section, a `/usr/bin/sample` snapshot of the stuck
+stacks (`~/.local/share/dictate/wedge/`, taken by a helper parked since startup so the restart path
+still allocates nothing) before any involuntary restart, a backoff after an aborted restart, and
+`HH:MM:SS.mmm` stamps on every daemon log line** ·
 **status-only banner: no live transcript in the banner (it jumped/grew as words streamed) —
 the take's words appear in the post-take editor. The open-segment live-preview machinery
 (callback, tap snapshot, `maybePreview`, `PREVIEW_*`, `--interim`/`--realtime`) was removed

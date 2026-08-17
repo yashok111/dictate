@@ -134,15 +134,26 @@ restart the daemon. Fastest first:
 2. **Menubar ▸ ⟳ Перезапустить диктовку** — the same thing, when the icon is visible.
 3. **`dictate restart`** in a terminal — over the socket; if the daemon's main thread is stuck
    and the graceful path can't finish, it force-restarts a few seconds later. The client gives
-   up after 5 s with «демон не отвечает» rather than hanging.
-4. **Nothing at all responds** — the built-in watchdog handles this on its own: the main
-   thread stamps a heartbeat once a second, and if it goes stale for `DICTATE_WATCHDOG_SEC`
-   (default **30 s**) the daemon relaunches itself. Under the LaunchAgent, launchd's
-   `KeepAlive` brings it back; started by hand, it spawns its own replacement first and only
-   tears down once that succeeded. `DICTATE_WATCHDOG_SEC=0` disables it. It is deliberately
-   hard to trip by accident: the heartbeat keeps ticking while a menu is open, the clock stops
-   while the machine sleeps, a suspended process (SIGSTOP) is detected and skipped, and an
-   on-demand model reload is flagged so it is waited out rather than killed.
+   up after 5 s with «демон не отвечает» rather than hanging. This is the one that still works
+   when the daemon's main thread is **fully** wedged: both the hotkey and the menu are delivered
+   on that thread, so neither of the first two options can reach a daemon in that state.
+4. **Nothing at all responds** — the daemon handles this on its own; you should get it back
+   within ~10-15 s without touching anything.
+   - The main thread stamps a heartbeat once a second, and if it goes stale for
+     `DICTATE_WATCHDOG_SEC` (**15 s** as installed) the daemon relaunches itself.
+   - Starting the mic — where this has actually gone wrong in practice, deep inside CoreAudio —
+     gets a tighter deadline of its own, `DICTATE_TAKESTART_SEC` (**8 s**).
+   - Under the LaunchAgent, launchd's `KeepAlive` brings it back; started by hand, it spawns its
+     own replacement first and only tears down once that succeeded. `DICTATE_WATCHDOG_SEC=0`
+     disables both.
+   - It is deliberately hard to trip by accident: the heartbeat keeps ticking while a menu is
+     open, the clock stops while the machine sleeps, a suspended process (SIGSTOP) is detected
+     and skipped, an on-demand model reload is flagged so it is waited out rather than killed,
+     and the mic deadline is not armed at all until the microphone permission has been granted.
+   - Before such a restart the daemon snapshots its own stuck stacks to
+     `~/.local/share/dictate/wedge/wedge-<epoch>.txt` (`sample`, ~1.5 s). If it keeps happening,
+     that file plus the timestamped `/tmp/dictate.log` is what to look at — between them they say
+     which thread was stuck and where. `DICTATE_WEDGE_SAMPLE=0` opts out.
 
 If a *fresh* daemon still gets no audio, the CoreAudio HAL itself is wedged — that one needs
 `sudo killall coreaudiod` (the take's error text says so).
