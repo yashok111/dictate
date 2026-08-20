@@ -81,11 +81,17 @@ Daemon socket commands (newline-terminated, raw replies): `ping`→`pong`,
 `cancel`→`ok`, `feedfile <path>`→`ok`, `restart`→`ok` (relaunch the daemon process — graceful
 via the main queue, force-restarted from the socket thread after 2 s if main is wedged),
 `wedge <sec>`→`ok` (debug: block the main queue, the only way to exercise the watchdog /
-force-restart e2e — **gated on `DICTATE_DEBUG`**, otherwise `err unknown`), `quit`→`bye`.
+force-restart e2e — **gated on `DICTATE_DEBUG`**, otherwise `err unknown`),
+`reconfig`→`ok` (debug, same gate: run the route-change path — `Recorder -reconfigure`, which drops
+and rebuilds the engine — without physically unplugging anything; works both idle and mid-take),
+`quit`→`bye`.
 The take-start deadline has its own e2e hook for the same reason (nothing else hangs the mic
 start on demand): `DICTATE_DEBUG_TAKESTART_STALL=<sec>` (with `DICTATE_DEBUG`) stalls inside the
 armed window, on the main queue, under `g_mu` — start a take and the daemon restarts with reason
 `take-start` and leaves a `/tmp/dictate-wedge-*.txt` naming `daemon_start`.
+`DICTATE_DEBUG_POISON=1` (with `DICTATE_DEBUG`) is the same kind of hook for the deferred
+`audio-poisoned` restart: every successful mic start reports a fake `kAudioHardwareIllegalOperationError`,
+so a take + cancel is enough to watch the daemon wait out the take and then restart while idle.
 Each connection is served on **its own thread** (`socket_accept_loop`, capped at
 `SOCK_MAX_INFLIGHT`): most verbs `dispatch_sync` to the main queue, so serving inline meant one
 client blocked on a wedged main thread starved the accept loop and `restart` — the verb whose
@@ -120,20 +126,54 @@ state file `/tmp/dictate.recording` · logs `/tmp/dictate.log`, `/tmp/dictate-ed
   live. (The old open-segment live-preview path was removed — see gotcha #12.)
 - **Recorder** (`AVAudioEngine`): tap converts the hardware format → 16 kHz mono
   via `AVAudioConverter` (drained in a loop — a sample-rate conversion may not consume all
-  input in one `convertToBuffer:`), sets `sess->live`, and calls `sess->feed`. It observes
-  `AVAudioEngineConfigurationChangeNotification` and **rebuilds the tap + converter** on a
-  device/route change (unplugging AirPods, switching input) — otherwise the engine stops
-  and the take silently dribbles to an empty transcript.
+  input in one `convertToBuffer:`), sets `sess->live`, and calls `sess->feed`.
+  **One Recorder and one `AVAudioEngine` per daemon**, not per take (gotcha #25): building the
+  engine is what touches `-[AVAudioEngine inputNode]`, and that call constructs the AUHAL, publishes
+  AVFoundation's process-private `CADefaultDeviceAggregate-<pid>-0` and — when that aggregate has
+  gone bad — disappears into `AVAEHalUtil::GetSubDevices` for **10–35 s**, on the main queue, under
+  `g_mu`, i.e. exactly inside the take-start deadline. Reusing the engine leaves one construction
+  per process instead of one per ⌘⇧D (measured: ~470 ms for the first take, ~110 ms for every take
+  after it). The hardware input format is cached alongside it (`_inFmt`) — `-inputFormatForBus:` IS
+  `GetHWFormat`, the same wedge site — and can only go stale behind a configuration-change
+  notification, which drops the whole engine. So `g_rec` no longer means “a take is running”;
+  `g_sess` does, and `-stop` now ends the take (tap off, engine stopped) without destroying the
+  engine. A failed `-startFeeding:` drops the engine and clears `_sess` — the cleanup the old
+  throw-the-Recorder-away code got for free. And because a persistent engine turns a one-take
+  annoyance into a permanent one, every start checks afterwards that the engine really landed on
+  `_pinnedDev`; if it did not (a failed `setDeviceID:`, a device that drifted) the engine is marked
+  `_engineSuspect` and rebuilt before the next take — otherwise a single failed pin would leave
+  every later take recording from BlackHole/Teams, i.e. silent, with no error anywhere. It observes
+  `AVAudioEngineConfigurationChangeNotification` and on a device/route change (unplugging AirPods,
+  switching input) **drops the engine entirely**, re-enumerating and re-pinning on the rebuild —
+  that notification means the format and possibly the device id are wrong, and the old per-take
+  rebuild used to refresh both for free. Without any of it the engine stops and the take silently
+  dribbles to an empty transcript.
   Capture is **pinned to the built-in mic**, not the system default (`prefer_builtin_input` →
   `find_builtin_input_device`, CoreAudio HAL: `kAudioDeviceTransportTypeBuiltIn` + ≥1 input
   channel — the channel check matters, the built-in *speakers* also report the built-in
-  transport). Without it the default routinely sits on a virtual device (BlackHole, Teams
-  Audio) that carries no mic signal, or on AirPods. Pinning posts one self-induced
+  transport; aggregates are rejected by `kAudioObjectPropertyClass`, since the one device we can
+  never want to pin to is precisely the `CADefaultDeviceAggregate` above). Without it the default
+  routinely sits on a virtual device (BlackHole, Teams Audio) that carries no mic signal, or on
+  AirPods. Pinning posts one self-induced
   configuration-change notification, swallowed via `_pinReconfig` (gotcha #22).
   On a start failure that looks like a stale CoreAudio client (`kAudioHardwareNotRunningError`,
   `'stop'` = 1937010544), the whole `AVAudioEngine` is rebuilt and start retried **once**
   (`-buildEngine`/`-dropEngine`/`-startWithHALRecovery:`); if it still fails, the HAL itself
   is wedged and only `sudo killall coreaudiod` helps — the error says so (gotcha #23).
+  A **different** refusal — `kAudioHardwareIllegalOperationError` (`'nope'` = 1852797029) from
+  `setDeviceID:` or from `-startAndReturnError:` on a device the HAL otherwise describes happily —
+  is not a stale client but rot in this process's own audio state, and only a fresh process clears
+  it. It is also the documented precursor to the `GetHWFormat` wedge (in the 2026-08-19 incident it
+  was logged **five minutes** before the daemon hung mid-take). So it sets `g_audio_poisoned` and
+  arms a 2 s poll (`-armPoisonRestart` / `-poisonTick:`) that restarts the daemon at the next moment
+  with no take, no pending finish and no editor — same ~1 s cure the watchdog applies, except
+  nobody is mid-sentence. Guards: it is ignored until this process has captured at least once
+  (`g_capture_ok_since_launch`), or a Mac where the pin can never work would restart after every
+  take forever; it honours the aborted-restart backoff; and “audio-poisoned” is deliberately not a
+  `wd_reason_is_wedge` reason, so it takes no `sample` snapshot (nothing is stuck). Every successful
+  mic start logs its own timings — `capture live: … (engine N ms, fmt N ms, start N ms)`, plus a
+  warning past `MIC_START_SLOW_MS` — so a mic start creeping toward `DICTATE_TAKESTART_SEC` is
+  visible in `/tmp/dictate.log` before it costs a restart.
 - **whisper's built-in Silero VAD** is enabled in `make_params` on top of all
   that — it trims silence *inside* each segment (see gotcha #3).
 - **Native UI** (`DictateController`, the `NSApp` delegate): owns the global ⌘⇧D
@@ -444,6 +484,8 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
   if the mic-start section (`AVAudioEngine` build + built-in-mic pin + engine start, main queue,
   `g_mu` held) does not return within N seconds. Tighter than the heartbeat on purpose — see the
   Native-UI section. Off when the watchdog is off.
+- `DICTATE_DEBUG_POISON=1` (debug, needs `DICTATE_DEBUG`) — fake a `kAudioHardwareIllegalOperationError`
+  on every successful mic start, to exercise the deferred `audio-poisoned` restart (gotcha #25).
 - `DICTATE_WEDGE_SAMPLE=0` — skip the `/usr/bin/sample` snapshot taken before an involuntary
   restart (default ON, writes `~/.local/share/dictate/wedge/wedge-<epoch>.txt`). The snapshot costs
   ~1.5 s of an already-broken daemon's restart and is the only source of the stuck stack.
@@ -492,6 +534,12 @@ verb / CLI, and a main-thread watchdog that relaunches the daemon after
 stacks (`~/.local/share/dictate/wedge/`, taken by a helper parked since startup so the restart path
 still allocates nothing) before any involuntary restart, a backoff after an aborted restart, and
 `HH:MM:SS.mmm` stamps on every daemon log line** ·
+**per-process `AVAudioEngine` + deferred `audio-poisoned` restart (after the 2026-08-19 repeat of the
+mic-start wedge): the engine and the hardware format are built once per daemon instead of once per
+take (the `inputNode`/`GetHWFormat` wedge site now runs once, and a warm take starts in ~110 ms
+instead of ~190 ms), a `kAudioHardwareIllegalOperationError` books a restart for the next idle
+moment rather than waiting to be wedged mid-take, and every mic start logs its per-step timings —
+gotcha #25** ·
 **status-only banner: no live transcript in the banner (it jumped/grew as words streamed) —
 the take's words appear in the post-take editor. The open-segment live-preview machinery
 (callback, tap snapshot, `maybePreview`, `PREVIEW_*`, `--interim`/`--realtime`) was removed

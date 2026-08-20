@@ -180,6 +180,21 @@ static const int           TAKESTART_DEFAULT_SEC = 8;
 static int                 g_takestart_sec = 0;    // effective timeout; 0 = disabled
 static std::atomic<double> g_takestart_until_ms{0};
 
+// ── degraded in-process CoreAudio state (ADR-0024) ───────────────────────────────────────
+// AVFoundation keeps ONE process-private aggregate device (`CADefaultDeviceAggregate-<pid>-0`)
+// for the whole life of the process. When it rots, CoreAudio starts answering
+// kAudioHardwareIllegalOperationError and -inputFormatForBus: can disappear for tens of seconds —
+// at which point the take-start deadline restarts the daemon out from under a take the user is
+// already speaking into. Nothing resets that state in place, so the first HARMLESS symptom books
+// a restart for the next idle moment instead: same cure, ~1 s, and nobody is mid-sentence.
+static std::atomic<bool> g_audio_poisoned{false};
+// …but only once this process has proved it CAN capture. Otherwise a Mac where the pin simply
+// never works (no built-in mic, an exotic device) would restart after every take forever, and the
+// restart would fix nothing — the successor fails exactly the same way on its first take.
+static std::atomic<bool> g_capture_ok_since_launch{false};
+static const double POISON_CHECK_SEC  = 2.0;    // how often the armed poison watch looks for an idle moment
+static const double MIC_START_SLOW_MS = 1500.0; // above this a successful mic start is still worth a warning
+
 // Default whisper CPU-thread count. This workload is GPU(Metal)-bound, so the thread
 // count barely moves transcription time (measured on M1 Pro: 2…8 threads all ≈ equal).
 // We still default to the performance-core count (perflevel0) instead of every logical
@@ -497,10 +512,15 @@ private:
 
 // ── microphone capture → 16 kHz mono → StreamingSession::feed ────────────────
 static void on_capture_lost(void);   // mid-take capture rebuild failed → stop the take + notify (defined after DictateController)
+static void on_audio_poisoned(const char *what);   // CoreAudio told us the process audio state is degraded (defined after DictateController)
 
+// ONE Recorder for the life of the daemon, and one AVAudioEngine inside it (rebuilt only on a
+// route change or HAL recovery) — see -startFeeding:. A take is «active» iff g_sess is set;
+// the Recorder being non-nil says nothing about that.
 @interface Recorder : NSObject
 - (BOOL)startFeeding:(StreamingSession *)sess error:(NSError **)err;
 - (void)stop;
+- (void)debugReconfigure;   // debug: run the route-change path on demand (see the `reconfig` verb)
 @end
 
 // ── input-device pinning ─────────────────────────────────────────────────────
@@ -527,6 +547,21 @@ static AudioDeviceID find_builtin_input_device(void) {
         return kAudioObjectUnknown;
     devs.resize(io / sizeof(AudioDeviceID));
     for (AudioDeviceID d : devs) {
+        // NEVER an aggregate. AVAudioEngine publishes a process-PRIVATE aggregate of its own —
+        // `CADefaultDeviceAggregate-<pid>-0`, visible only inside this process, created on the
+        // first -inputNode and kept for the whole process lifetime — and that device is exactly
+        // the one that goes bad: once it does, AVFoundation's -inputFormatForBus: disappears into
+        // AVAEHalUtil::GetSubDevices for tens of seconds (measured 10-35 s, ADR-0024). Today it
+        // reports transport 'grup' so the check below already skips it, but that is an
+        // implementation detail of one macOS version — an aggregate built over the built-in mic
+        // could as easily report 'bltn'. Pinning to a class we can never want costs one property
+        // read per candidate, so refuse by class as well.
+        AudioClassID cls = 0; UInt32 clsz = sizeof(cls);
+        AudioObjectPropertyAddress cl = { kAudioObjectPropertyClass,
+                                          kAudioObjectPropertyScopeGlobal,
+                                          kAudioObjectPropertyElementMain };
+        if (AudioObjectGetPropertyData(d, &cl, 0, nullptr, &clsz, &cls) == noErr &&
+            cls == kAudioAggregateDeviceClassID) continue;
         // Needs ≥1 INPUT channel — filtering on transport alone would match an output-only
         // device, and the built-in *speakers* report the built-in transport too. Two steps do
         // that: an output-only device returns just the 8-byte AudioBufferList header (no
@@ -580,6 +615,13 @@ static BOOL prefer_builtin_input(AVAudioEngine *engine, AudioDeviceID *cache) {
     NSError *err = nil;
     if (![au setDeviceID:dev error:&err]) {
         slog("⚠ could not pin the built-in mic: %s\n", err.localizedDescription.UTF8String ?: "?");
+        // kAudioHardwareIllegalOperationError on a device the HAL is perfectly happy to describe
+        // means the AUHAL/aggregate state INSIDE this process has rotted, not that the mic is
+        // gone — and it is the documented precursor to the multi-second -inputFormatForBus:
+        // wedge (ADR-0024: the 2026-08-19 daemon logged exactly this five minutes before it hung
+        // for 10 s and had to be restarted mid-take). Nothing short of a fresh process clears it,
+        // so book a restart for the next idle moment rather than waiting to be wedged.
+        if (err.code == kAudioHardwareIllegalOperationError) on_audio_poisoned("pinning the built-in mic");
         return NO;
     }
     slog("pinned capture to the built-in mic (device %u)\n", (unsigned)dev);
@@ -612,7 +654,10 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     BOOL              _tapInstalled;   // a tap is live on inputNode bus 0 → -dropEngine must remove it (and must NOT otherwise)
     BOOL              _pinReconfig;    // pinning the built-in mic posts one config-change notification → swallow exactly that one
     NSUInteger        _engineGen;      // bumped per -buildEngine; blocks captured for engine N must not act on engine N+1
-    AudioDeviceID     _pinnedDev;      // built-in mic found for THIS take; reused on an engine rebuild instead of re-enumerating
+    AudioDeviceID     _pinnedDev;      // built-in mic found for THIS engine; reused on a rebuild instead of re-enumerating
+    BOOL              _engineSuspect;  // this engine did NOT end up on _pinnedDev → don't keep it past the take
+    AVAudioFormat    *_inFmt;          // hardware input format, cached per engine (see -installTapAndStart:)
+    double            _tBuild, _tFmt, _tStart;   // per-step mic-start timings, ms (logged on success)
     std::shared_ptr<std::atomic<int>> _tapGuard;   // in-flight tap-callback count; -stop waits it to 0
 }
 - (instancetype)init {
@@ -621,20 +666,44 @@ static BOOL capture_err_is_recoverable(NSError *e) {
                                                    sampleRate:WHISPER_SAMPLE_RATE
                                                      channels:1 interleaved:NO];
         _tapGuard = std::make_shared<std::atomic<int>>(0);
-        _pinnedDev = kAudioObjectUnknown;   // one Recorder per take → the enumeration runs once per take
+        _pinnedDev = kAudioObjectUnknown;
     }
     return self;
 }
+// The engine is built ONCE and then reused take after take. It used to be rebuilt per take, and
+// that put the two calls that actually wedge — -[AVAudioEngine inputNode] (which constructs the
+// AUHAL and publishes the process-private CADefaultDeviceAggregate) and -setDeviceID: — on the
+// path of every single ⌘⇧D, on the main queue, under g_mu. Measured: ~190 ms per take rebuilding
+// vs ~97 ms reusing, and every one of those rebuilds was another roll of the dice on the 10-35 s
+// AVAEHalUtil::GetSubDevices hang (ADR-0024). Reuse leaves exactly one construction per process.
+// Built lazily rather than at startup on purpose: on a first run the construction is what raises
+// the mic TCC prompt, and that belongs on the user's first ⌘⇧D, not on their login.
+// -dropEngine (route change, HAL recovery, terminal start failure) nils it → the next take builds
+// a fresh one, so the recovery story is unchanged.
 - (BOOL)startFeeding:(StreamingSession *)sess error:(NSError **)err {
     _sess = sess;
-    [self buildEngine];
-    return [self startWithHALRecovery:err];
+    _tBuild = _tFmt = _tStart = 0;
+    if (!_engine) [self buildEngine];
+    else if (_engineSuspect) {   // last take could not reach the built-in mic — retry from scratch
+        slog("capture: last engine was not on the built-in mic → rebuilding before this take\n");
+        [self dropEngine]; _pinnedDev = kAudioObjectUnknown; [self buildEngine];
+    }
+    if ([self startWithHALRecovery:err]) return YES;
+    // The Recorder outlives the take now, so a failed start has to clean up after itself — the
+    // old code got that for free by throwing the whole object away. Both matter: `_sess` is about
+    // to be destroyed by the caller, and a start that failed AFTER -installTapOnBus: would
+    // otherwise leave a stale tap on bus 0 for the next take to install a second one over.
+    [self dropEngine];
+    _sess = nil;
+    return NO;
 }
 // Fresh AVAudioEngine + its configuration-change observer. Main queue only (the recording
 // lifecycle is main-only; the socket path marshals through dispatch_sync), so the ivars below
 // and -reconfigure never run concurrently.
 - (void)buildEngine {
+    const double t0 = now_ms();
     _engine = [[AVAudioEngine alloc] init];
+    _inFmt  = nil;                      // belongs to the old engine's device
     // Every deferred block below is stamped with the generation of the engine it belongs to.
     // -dropEngine unregisters the observer, but a block ALREADY dispatched to main survives
     // that and would otherwise act on the replacement engine (recovery builds a second one).
@@ -654,7 +723,12 @@ static BOOL capture_err_is_recoverable(NSError *e) {
                         usingBlock:^(NSNotification *note){ (void)note;
                             dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf reconfigureGen:gen]; }); }];
     // AFTER the observer is registered, so the self-induced notification can't slip past it.
+    // The first touch of .inputNode happens in here, which makes this whole call the wedge site —
+    // hence the timing (ADR-0024: `log show` could say where CoreAudio stopped, /tmp/dictate.log
+    // could not even say that the mic start had been slow).
     _pinReconfig = prefer_builtin_input(_engine, &_pinnedDev);
+    _tBuild += now_ms() - t0;   // += : a HAL-recovery retry builds a SECOND engine, and the point of
+                                // the number is the total the user waited, not just the last attempt
     if (_pinReconfig) {
         // Failsafe: if that notification never arrives, a stuck flag would swallow the next
         // REAL route change instead. Give it a beat, then disarm — but only if this engine is
@@ -680,13 +754,18 @@ static BOOL capture_err_is_recoverable(NSError *e) {
         [_engine stop];
         _engine=nil;
     }
-    _conv = nil;
+    _conv  = nil;
+    _inFmt = nil;   // the cached hardware format described the engine we just dropped
+    _engineSuspect = NO;
 }
 // Start; on a stale-HAL-shaped failure rebuild the whole engine and try ONCE more.
 - (BOOL)startWithHALRecovery:(NSError **)err {
     NSError *e1=nil;
     if ([self installTapAndStart:&e1]) return YES;
-    if (!capture_err_is_recoverable(e1)) { if (err) *err=e1; return NO; }
+    // Not a stale-HAL shape → no retry. Still drop the engine: it now outlives the take, and
+    // -installTapAndStart: can fail AFTER the tap is on (the start itself), which would leave a
+    // stale tap and a half-started engine for the next take to build on.
+    if (!capture_err_is_recoverable(e1)) { [self dropEngine]; if (err) *err=e1; return NO; }
     slog("⚠ capture start failed (%s) → rebuilding AVAudioEngine (stale CoreAudio client?)\n",
          e1.localizedDescription.UTF8String ?: "?");
     [self dropEngine];
@@ -704,8 +783,16 @@ static BOOL capture_err_is_recoverable(NSError *e) {
 // on first start and again on every configuration change (with the new input format).
 - (BOOL)installTapAndStart:(NSError **)err {
     AVAudioInputNode *input = _engine.inputNode;
-    AVAudioFormat *inFmt = [input inputFormatForBus:0];
+    // Cached per engine. -inputFormatForBus: is AVAudioIOUnit::GetHWFormat — the exact call that
+    // spent 10-35 s walking the aggregate's subdevices in both recorded wedges (ADR-0024) — and
+    // the format cannot change under us without an AVAudioEngineConfigurationChangeNotification,
+    // which -reconfigure answers by dropping the whole engine (and with it this cache).
+    const double t0 = now_ms();
+    if (!_inFmt) _inFmt = [input inputFormatForBus:0];
+    _tFmt += now_ms() - t0;     // += for the same reason as _tBuild (reset per take/reconfigure)
+    AVAudioFormat *inFmt = _inFmt;
     if (inFmt.sampleRate <= 0) {
+        _inFmt = nil;   // don't cache a broken format — the retry re-reads it
         if (err) *err = [NSError errorWithDomain:@"dictate" code:1
                           userInfo:@{NSLocalizedDescriptionKey:@"нет входного устройства / доступа к микрофону"}];
         return NO;
@@ -748,13 +835,45 @@ static BOOL capture_err_is_recoverable(NSError *e) {
         guard->fetch_sub(1, std::memory_order_release);   // done touching `sess`
     }];
     _tapInstalled = YES;
+    const double t1 = now_ms();
     [_engine prepare];
-    if (![_engine startAndReturnError:err]) return NO;
+    BOOL started = [_engine startAndReturnError:err];
+    _tStart += now_ms() - t1;
+    if (!started) {
+        // Same reading as in prefer_builtin_input: 'nope' from a device the HAL happily describes
+        // is degraded in-process audio state, and only a fresh process clears it.
+        if (err && *err && (*err).code == kAudioHardwareIllegalOperationError)
+            on_audio_poisoned("starting the engine");
+        return NO;
+    }
+    g_capture_ok_since_launch.store(true);
+    // Did the pin actually take? A persistent engine turns a ONE-TAKE annoyance into a permanent
+    // one: if -setDeviceID: failed (or the device drifted), every later take would keep recording
+    // from whatever the system default is — BlackHole or Teams Audio carry no mic signal at all,
+    // so the user would get silent take after silent take with no error anywhere. Mark the engine
+    // and rebuild before the next take instead. Skipped when there is nothing to pin to
+    // (DICTATE_BUILTIN_MIC=0, or a Mac with no built-in input): _pinnedDev stays unknown there.
+    _engineSuspect = (_pinnedDev != kAudioObjectUnknown && input.AUAudioUnit.deviceID != _pinnedDev);
+    if (_engineSuspect)
+        slog("⚠ capture is NOT on the built-in mic (want %u, got %u) — rebuilding before the next take\n",
+             (unsigned)_pinnedDev, (unsigned)input.AUAudioUnit.deviceID);
     // Log the device the tap is ACTUALLY reading, not the one we asked for. The whole failure
     // mode this guards against (capture landing on a virtual device) is silent — an empty
     // transcript, no error — so the confirmation has to come from the started engine.
-    slog("capture live: device %u, %.0f Hz, %u ch\n",
-         (unsigned)input.AUAudioUnit.deviceID, inFmt.sampleRate, (unsigned)inFmt.channelCount);
+    // The timings ride along: they are the only per-take record of how long CoreAudio took, and
+    // a mic start creeping from ~100 ms toward the DICTATE_TAKESTART_SEC budget is the warning
+    // that used to be invisible until the daemon was already being restarted mid-take.
+    slog("capture live: device %u, %.0f Hz, %u ch (engine %.0f ms, fmt %.0f ms, start %.0f ms)\n",
+         (unsigned)input.AUAudioUnit.deviceID, inFmt.sampleRate, (unsigned)inFmt.channelCount,
+         _tBuild, _tFmt, _tStart);
+    if (_tBuild + _tFmt + _tStart > MIC_START_SLOW_MS)
+        slog("⚠ mic start took %.1f s — CoreAudio is degrading (ADR-0024); the take-start deadline "
+             "is %d s\n", (_tBuild + _tFmt + _tStart)/1000.0, g_takestart_sec);
+    // Debug-only: pretend CoreAudio just refused an operation. Nothing else can produce
+    // kAudioHardwareIllegalOperationError on demand, and the deferred-restart path is otherwise
+    // only exercised by the very failure it exists to get ahead of. Same DICTATE_DEBUG gate as
+    // the `wedge` verb and DICTATE_DEBUG_TAKESTART_STALL.
+    if (getenv("DICTATE_DEBUG_POISON") && getenv("DICTATE_DEBUG")) on_audio_poisoned("a debug hook");
     return YES;
 }
 - (void)reconfigure {
@@ -769,8 +888,16 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     // all the pin can produce.
     if (_pinReconfig) { _pinReconfig = NO; if (_engine.isRunning) return; }
     slog("audio configuration changed → rebuilding capture\n");
-    if (_tapInstalled) { [_engine.inputNode removeTapOnBus:0]; _tapInstalled=NO; }
-    [_engine stop];
+    _tBuild = _tFmt = _tStart = 0;   // this is a fresh mic start; don't fold the original take's numbers in
+    // Drop the ENGINE, not just the tap. The engine now outlives the take, so this is the one
+    // moment its cached state is known to be wrong: the hardware format has changed (that is what
+    // the notification means) and the pinned device id may not even exist any more. Rebuilding
+    // re-reads the format and re-runs the enumeration — the same guarantee the old
+    // engine-per-take code got for free.
+    [self dropEngine];
+    _pinnedDev = kAudioObjectUnknown;   // the device list moved under us → don't reuse the id
+    if (!_sess) return;                 // no take in flight: the next -startFeeding: builds a fresh engine
+    [self buildEngine];
     NSError *err=nil;
     if (![self startWithHALRecovery:&err]) {   // a route change can also leave the HAL client stale
         slog("⚠ capture rebuild failed: %s\n", err.localizedDescription.UTF8String ?: "?");
@@ -779,8 +906,14 @@ static BOOL capture_err_is_recoverable(NSError *e) {
         dispatch_async(dispatch_get_main_queue(), ^{ on_capture_lost(); });
     }
 }
+// End the TAKE, keep the engine. Stopping capture no longer throws the AVAudioEngine away —
+// rebuilding it per take is what put -inputNode on every ⌘⇧D (see -startFeeding:). The tap must
+// still come off: it holds `_sess`, which dies with the take.
 - (void)stop {
-    [self dropEngine];
+    if (_engine) {
+        if (_tapInstalled) { [_engine.inputNode removeTapOnBus:0]; _tapInstalled=NO; }
+        [_engine stop];
+    }
     // Wait out any tap callback still touching `_sess`: AVFoundation doesn't document removeTapOnBus
     // as a barrier against an already-running tap block, so without this a late tap could feed() into a
     // session finish()/cancel() is about to read/free (UAF). The tap body is sub-ms → bounded spin.
@@ -789,6 +922,10 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     while (_tapGuard->load(std::memory_order_acquire) != 0) { struct timespec ts{0, 100000}; nanosleep(&ts, nullptr); }
     _sess=nil;
 }
+// Debug-only: drive -reconfigure without an actual device change. That path drops and rebuilds
+// the engine, and it is the one branch of the persistent-engine design that no test and no
+// `--file` run can reach — a real route change means physically unplugging something.
+- (void)debugReconfigure { [self reconfigure]; }
 - (void)dealloc {   // safety net: if startFeeding: failed after registering the observer, -stop is never
     if (_cfgObs) [[NSNotificationCenter defaultCenter] removeObserver:_cfgObs];   // called → remove it here
 }
@@ -1067,6 +1204,7 @@ static bool ensure_model_loaded(void) {
 - (void)finalizeSocketStop:(NSString *)ns;                      // main; socket `stop` finalize (clipboard, NO editor)
 - (void)restartNow:(const char *)reason;                        // main; release the mic, then relaunch the process
 - (void)menuRestart:(id)sender;                                 // main; menubar ⟳ item / ⌥⌘⇧D hotkey
+- (void)armPoisonRestart;                                       // main; restart at the next idle moment (g_audio_poisoned)
 @end
 
 static DictateController *g_ctrl = nil;
@@ -1079,6 +1217,23 @@ static void spawn_editor(NSString *transcript, NSString *conf);    // defined in
 static void on_capture_lost(void) {
     [g_ctrl cancel];
     [g_ctrl showHint:@"⚠ устройство ввода изменилось — запись прервана"];
+}
+
+// CoreAudio has started refusing operations it used to allow (kAudioHardwareIllegalOperationError).
+// See g_audio_poisoned: this is the cheap early warning for a wedge that otherwise announces itself
+// by hanging the main thread mid-take. Book a restart; do NOT take one now — the caller is inside
+// the mic-start critical section of a take the user is speaking into. Main thread (every caller is
+// on the recording lifecycle, which is main-only).
+static void on_audio_poisoned(const char *what) {
+    if (!g_capture_ok_since_launch.load()) {          // never captured → this is not degradation
+        slog("⚠ CoreAudio refused %s (kAudioHardwareIllegalOperationError) on a daemon that has "
+             "not captured yet — not restarting (a fresh process would fail the same way)\n", what);
+        return;
+    }
+    if (g_audio_poisoned.exchange(true)) return;      // already booked
+    slog("⚠ CoreAudio refused %s (kAudioHardwareIllegalOperationError) — the process audio state is "
+         "degraded; restarting the daemon at the next idle moment (ADR-0024)\n", what);
+    [g_ctrl armPoisonRestart];
 }
 
 // ── Hotkeys (Carbon RegisterEventHotKey — virtual keycodes are keyboard-position
@@ -1174,7 +1329,7 @@ static std::string daemon_start(const char *kind) {
     if (!ensure_model_loaded()) return "model load failed";  // idle-unload (gotcha #7) freed it → reload on demand
     g_last_active_ms = now_ms();                             // reset the idle-unload clock
     g_sess = std::make_unique<StreamingSession>(g_ctx.get(), g_lang, g_nthreads);
-    g_rec  = [[Recorder alloc] init];
+    if (!g_rec) g_rec = [[Recorder alloc] init];   // one per daemon, not one per take — see -startFeeding:
     // Arm the take-start deadline (src/dictate_watchdog.h) around the mic start: everything from
     // here to the end of -startFeeding: is synchronous CoreAudio on the main queue with g_mu held,
     // and when THAT wedges the hotkey, the banner and the menubar (⟳ included) go down with it —
@@ -1222,8 +1377,9 @@ static std::string daemon_start(const char *kind) {
         // process fails too and only a coreaudiod restart clears it. Say so instead of leaving
         // the user with a bare OSStatus.
         if (err.code == 1937010544) msg += "\nCoreAudio завис — выполни: sudo killall coreaudiod";
-        g_sess.reset(); g_rec=nil;   // dtor joins the worker — safe (was: delete on a live thread → std::terminate)
-        return msg;
+        g_sess.reset();   // dtor joins the worker — safe (was: delete on a live thread → std::terminate).
+        return msg;       // g_rec STAYS: it is the daemon's, not the take's, and -startFeeding:
+                          // already cleared its session pointer and dropped the engine on the way out.
     }
     tsGuard.disarm();   // CoreAudio returned — everything below is out of scope for both watchers
     g_active_take = g_take_logger.start(kind);
@@ -1256,7 +1412,8 @@ static void stop_live_watch(void) {
 // thread (finish() joins the worker and must not freeze the Cocoa run loop).
 static DetachedTake daemon_stop_detach(void) {
     DetachedTake out; Recorder *r;
-    { std::lock_guard<std::mutex> lk(g_mu); out.session=std::move(g_sess); r=g_rec; g_rec=nil;
+    { std::lock_guard<std::mutex> lk(g_mu); out.session=std::move(g_sess); r=g_rec;   // g_rec is the daemon's,
+                                          // not the take's — the moved-out g_sess is what ends the take
       if (g_has_active_take) { out.meta = g_active_take; g_active_take = {}; g_has_active_take = false; }
       if (out.session) g_finishing.store(true); }   // set under g_mu, atomic with the g_sess move-out, so a
                                           // concurrent start/feedfile can't slip a 2nd worker onto g_ctx
@@ -1268,7 +1425,7 @@ static DetachedTake daemon_stop_detach(void) {
 
 static void daemon_cancel(const char *reason) {
     DetachedTake take; Recorder *r;
-    { std::lock_guard<std::mutex> lk(g_mu); take.session=std::move(g_sess); r=g_rec; g_rec=nil;
+    { std::lock_guard<std::mutex> lk(g_mu); take.session=std::move(g_sess); r=g_rec;   // ditto: persistent recorder
       if (g_has_active_take) { take.meta = g_active_take; g_active_take = {}; g_has_active_take = false; }
       if (take.session) g_finishing.store(true); }   // block a new take until the detached cancel frees g_ctx (gotcha #5)
     if (!take) return;
@@ -1574,6 +1731,7 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     int          _secs;
     NSTimer     *_idle;        // idle-unload poll: frees the resident model after DICTATE_IDLE_UNLOAD_SEC (gotcha #7)
     NSTimer     *_beat;        // 1 Hz main-thread heartbeat for the watchdog (src/dictate_watchdog.h)
+    NSTimer     *_poison;      // armed only once CoreAudio has gone bad: waits for an idle moment to restart
 }
 
 // ── recording lifecycle (all on main) ──
@@ -1901,6 +2059,36 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     [self showHint:@"⟳ перезапуск…"];                                    // the banner is the only ACK the user gets
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.4*NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ [self restartNow:"menu"]; }); }
+// ── deferred restart on degraded CoreAudio (g_audio_poisoned, ADR-0024) ──────────────────
+// The watchdog and the take-start deadline both restart the daemon while the user is WAITING —
+// that is the ~10 s the 2026-08-19 incident cost. This one restarts it while nobody is looking:
+// arm on the first refusal, then poll for a moment with no take, no pending finish and no editor,
+// and take the ~1 s hit there. Idempotent; a second arm is a no-op.
+- (void)armPoisonRestart {
+    if (_poison) return;
+    _poison = [NSTimer scheduledTimerWithTimeInterval:POISON_CHECK_SEC target:self
+                                             selector:@selector(poisonTick:) userInfo:nil repeats:YES];
+    // COMMON modes, for the same reason as the heartbeat: menu tracking leaves the default mode,
+    // and a restart that only happens when no menu is open is a restart that can be starved.
+    [[NSRunLoop currentRunLoop] addTimer:_poison forMode:NSRunLoopCommonModes];
+}
+- (void)poisonTick:(NSTimer *)t { (void)t;
+    if (g_editor_open.load() || g_finishing.load()) return;      // a take is still being turned into text
+    {   // try_lock, never lock: this runs on main, and blocking here on whatever holds g_mu is
+        // precisely the wedge we are trying to get ahead of. Busy → look again in POISON_CHECK_SEC.
+        std::unique_lock<std::mutex> lk(g_mu, std::try_to_lock);
+        if (!lk.owns_lock() || g_sess) return;
+    }
+    // An aborted restart (no successor could be spawned) leaves us alive and still poisoned;
+    // honour the backoff so this doesn't become a spawn-failure loop on a 2 s cadence.
+    if (wd_in_backoff(now_uptime_ms(), g_restart_backoff_until_ms.load())) return;
+    // The timer is deliberately NOT invalidated here: a successful restart_process_now never
+    // returns, and the only way to get back is an ABORTED restart (no successor could be spawned)
+    // — which leaves the daemon alive and still poisoned, i.e. still needing this. The backoff
+    // above is what keeps that retry from becoming a hot loop.
+    slog("audio-poisoned: idle → restarting for a clean CoreAudio client\n");
+    [self restartNow:"audio-poisoned"];   // not a wedge reason → no `sample` snapshot is taken
+}
 // Graceful restart from the main queue: release the mic and log the abandoned take first, then
 // hand over to the lock-free restart_process_now. The forceful path (wedged main thread) skips
 // straight to restart_process_now from the watchdog / socket thread.
@@ -2206,6 +2394,10 @@ static void serve_client(int cl, bool degraded) {
             if (sec < 1) sec = 1; if (sec > 120) sec = 120;
             slog("wedge: blocking the main queue for %d s (debug)\n", sec);
             dispatch_async(dispatch_get_main_queue(), ^{ struct timespec ts{sec,0}; nanosleep(&ts,nullptr); });
+            write_all(cl,"ok\n",3);
+        }
+        else if (cmd=="reconfig" && getenv("DICTATE_DEBUG")) {
+            dispatch_sync(dispatch_get_main_queue(), ^{ [g_rec debugReconfigure]; });
             write_all(cl,"ok\n",3);
         }
         else if (cmd=="restart") {
