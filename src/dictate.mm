@@ -3171,10 +3171,18 @@ int main(int argc, char **argv) {
         g_lang = getenv("WHISPER_LANG") ? getenv("WHISPER_LANG") : "ru";
         g_nthreads = default_threads();
 
-        // Silero VAD model (kills the silence hallucination). Default to the same
-        // file the old script used; disable with WHISPER_VAD=0; skip if absent.
-        std::string vadPath = getenv("WHISPER_VAD_MODEL") ? getenv("WHISPER_VAD_MODEL")
-            : std::string(home?home:".")+"/.config/whisper/ggml-silero-v5.1.2.bin";
+        // Silero VAD model (kills the silence hallucination). Default to v6.2.0 — the
+        // version upstream whisper.cpp tests against since 1.9.x — falling back to the
+        // older v5.1.2 file if only that one is on disk (older installs / a rollback via
+        // WHISPER_VAD_MODEL). Disable with WHISPER_VAD=0; skip if absent.
+        std::string vadPath;
+        if (getenv("WHISPER_VAD_MODEL")) vadPath = getenv("WHISPER_VAD_MODEL");
+        else {
+            std::string dir = std::string(home?home:".")+"/.config/whisper/";
+            struct stat vs0;
+            vadPath = dir+"ggml-silero-v6.2.0.bin";
+            if (stat(vadPath.c_str(),&vs0)!=0) vadPath = dir+"ggml-silero-v5.1.2.bin";
+        }
         const char *vadOff = getenv("WHISPER_VAD");
         struct stat vst;
         if (vadOff && !strcmp(vadOff,"0")) vadPath.clear();

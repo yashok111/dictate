@@ -440,7 +440,9 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
 ## Config (env) & tuning
 
 - `WHISPER_MODEL` (default `~/.config/whisper/ggml-large-v3-turbo-q5_0.bin`),
-  `WHISPER_LANG` (default `ru`), `WHISPER_VAD_MODEL`, `WHISPER_VAD=0` to disable
+  `WHISPER_LANG` (default `ru`), `WHISPER_VAD_MODEL` (default
+  `~/.config/whisper/ggml-silero-v6.2.0.bin`, falling back to `ggml-silero-v5.1.2.bin` when
+  only that one is on disk — set the var to roll back), `WHISPER_VAD=0` to disable
   VAD, `DICTATE_GGML_BACKENDS` to override the backend dir, `DICTATE_SOCK` to override
   the socket path (run a test daemon off the live one).
 - `DICTATE_BUILTIN_MIC=0` — stop pinning capture to the built-in mic and follow the system
@@ -495,7 +497,7 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
   `SPEECH_CONFIRM_FR`, `FRAME`. The Silero VAD params live in `make_params`
   (`min_silence_duration_ms`, `speech_pad_ms`).
 
-## whisper.cpp notes (Homebrew 1.8.7)
+## whisper.cpp notes (Homebrew 1.9.2)
 
 API used: `whisper_init_from_file_with_params` (+ `whisper_context_default_params`,
 `use_gpu=true`), `whisper_full_default_params(WHISPER_SAMPLING_GREEDY)`,
