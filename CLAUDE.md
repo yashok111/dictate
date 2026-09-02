@@ -13,6 +13,21 @@ The whole reason this exists in C++ instead of the shell pipeline: a **resident
 daemon** keeps the model in GPU memory (no per-take reload) and enables
 **streaming** (transcribe while you speak).
 
+## Deep dives (read on demand, not auto-loaded)
+
+Long-form rationale lives in `docs/` so this file stays lean. **Read the file for an area
+before changing it** — each one is the hard-won part:
+
+- `docs/audio-capture.md` — `StreamingSession` (VAD segmentation, worker, alloc-free tap),
+  `Recorder` (one `AVAudioEngine` per daemon, built-in-mic pin, HAL recovery, `audio-poisoned`).
+- `docs/voice-editor.md` — `EditorView`/`EditModel`, mini-takes, confidence highlight, undo,
+  accept→paste, ⌘⇧D routing.
+- `docs/native-ui.md` — hotkeys (why keycode 2, why ⌥⌘⇧D is never unregistered), banner,
+  auto-paste, menubar (why an SF Symbol, why common run-loop modes).
+- `docs/self-recovery.md` — restart, watchdog, take-start deadline, wedge `sample`, backoff,
+  stamped logs, the known restart race.
+- `docs/status.md` — what is done, in order.
+
 ## Layout
 
 - `src/dictate.mm` — the entire program (Objective-C++). One file on purpose.
@@ -118,141 +133,37 @@ logs `/tmp/dictate.log`, `/tmp/dictate-editor.log`.
 - **Client** (`client_cmd` / `ensure_daemon`): `start` auto-spawns the daemon
   (fork+setsid+exec, logging to `/tmp/dictate.log`) if none answers, then polls
   ~6 s for it to come up (covers the model-load window).
-- **StreamingSession**: energy-VAD segments the 16 kHz mono stream at pauses; a
-  **single worker thread** runs `whisper_full` per closed segment and appends text
-  in order — that's the streaming win: most of the audio is already transcribed by the
-  time you stop, so `finish()` only has the open tail left (it flushes that segment,
-  drains the worker, joins parts). If the energy VAD heard nothing it falls back to one
-  pass over the full buffer. **No live interim text**: the worker just builds `parts_`;
-  the banner is status-only and the take's words surface in the post-take editor, not
-  live. (The old open-segment live-preview path was removed — see gotcha #12.)
-- **Recorder** (`AVAudioEngine`): tap converts the hardware format → 16 kHz mono
-  via `AVAudioConverter` (drained in a loop — a sample-rate conversion may not consume all
-  input in one `convertToBuffer:`), sets `sess->live`, and calls `sess->feed`.
-  **One Recorder and one `AVAudioEngine` per daemon**, not per take (gotcha #25): building the
-  engine is what touches `-[AVAudioEngine inputNode]`, and that call constructs the AUHAL, publishes
-  AVFoundation's process-private `CADefaultDeviceAggregate-<pid>-0` and — when that aggregate has
-  gone bad — disappears into `AVAEHalUtil::GetSubDevices` for **10–35 s**, on the main queue, under
-  `g_mu`, i.e. exactly inside the take-start deadline. Reusing the engine leaves one construction
-  per process instead of one per ⌘⇧D (measured: ~470 ms for the first take, ~110 ms for every take
-  after it). The hardware input format is cached alongside it (`_inFmt`) — `-inputFormatForBus:` IS
-  `GetHWFormat`, the same wedge site — and can only go stale behind a configuration-change
-  notification, which drops the whole engine. So `g_rec` no longer means “a take is running”;
-  `g_sess` does, and `-stop` now ends the take (tap off, engine stopped) without destroying the
-  engine. A failed `-startFeeding:` drops the engine and clears `_sess` — the cleanup the old
-  throw-the-Recorder-away code got for free. And because a persistent engine turns a one-take
-  annoyance into a permanent one, every start checks afterwards that the engine really landed on
-  `_pinnedDev`; if it did not (a failed `setDeviceID:`, a device that drifted) the engine is marked
-  `_engineSuspect` and rebuilt before the next take — otherwise a single failed pin would leave
-  every later take recording from BlackHole/Teams, i.e. silent, with no error anywhere. It observes
-  `AVAudioEngineConfigurationChangeNotification` and on a device/route change (unplugging AirPods,
-  switching input) **drops the engine entirely**, re-enumerating and re-pinning on the rebuild —
-  that notification means the format and possibly the device id are wrong, and the old per-take
-  rebuild used to refresh both for free. Without any of it the engine stops and the take silently
-  dribbles to an empty transcript.
-  Capture is **pinned to the built-in mic**, not the system default (`prefer_builtin_input` →
-  `find_builtin_input_device`, CoreAudio HAL: `kAudioDeviceTransportTypeBuiltIn` + ≥1 input
-  channel — the channel check matters, the built-in *speakers* also report the built-in
-  transport; aggregates are rejected by `kAudioObjectPropertyClass`, since the one device we can
-  never want to pin to is precisely the `CADefaultDeviceAggregate` above). Without it the default
-  routinely sits on a virtual device (BlackHole, Teams Audio) that carries no mic signal, or on
-  AirPods. Pinning posts one self-induced
-  configuration-change notification, swallowed via `_pinReconfig` (gotcha #22).
-  On a start failure that looks like a stale CoreAudio client (`kAudioHardwareNotRunningError`,
-  `'stop'` = 1937010544), the whole `AVAudioEngine` is rebuilt and start retried **once**
-  (`-buildEngine`/`-dropEngine`/`-startWithHALRecovery:`); if it still fails, the HAL itself
-  is wedged and only `sudo killall coreaudiod` helps — the error says so (gotcha #23).
-  A **different** refusal — `kAudioHardwareIllegalOperationError` (`'nope'` = 1852797029) from
-  `setDeviceID:` or from `-startAndReturnError:` on a device the HAL otherwise describes happily —
-  is not a stale client but rot in this process's own audio state, and only a fresh process clears
-  it. It is also the documented precursor to the `GetHWFormat` wedge (in the 2026-08-19 incident it
-  was logged **five minutes** before the daemon hung mid-take). So it sets `g_audio_poisoned` and
-  arms a 2 s poll (`-armPoisonRestart` / `-poisonTick:`) that restarts the daemon at the next moment
-  with no take, no pending finish and no editor — same ~1 s cure the watchdog applies, except
-  nobody is mid-sentence. Guards: it is ignored until this process has captured at least once
-  (`g_capture_ok_since_launch`), or a Mac where the pin can never work would restart after every
-  take forever; it honours the aborted-restart backoff; and “audio-poisoned” is deliberately not a
-  `wd_reason_is_wedge` reason, so it takes no `sample` snapshot (nothing is stuck). Every successful
-  mic start logs its own timings — `capture live: … (engine N ms, fmt N ms, start N ms)`, plus a
-  warning past `MIC_START_SLOW_MS` — so a mic start creeping toward `DICTATE_TAKESTART_SEC` is
-  visible in `/tmp/dictate.log` before it costs a restart.
+- **StreamingSession**: energy-VAD segments the 16 kHz mono stream at pauses; **one worker
+  thread** runs `whisper_full` per closed segment and appends text in order — that's the
+  streaming win: on stop only the open tail is left for `finish()`. No live interim text (the
+  words surface in the post-take editor). Fixed cost: whisper's encoder always processes a
+  30 s window, so every `whisper_full` costs ~1.1 s on M1 Pro regardless of segment length —
+  the floor for stop latency. Details → `docs/audio-capture.md`.
+- **Recorder** (`AVAudioEngine`): **one engine per daemon**, not per take (gotcha #25) — the
+  `inputNode`/`GetHWFormat` wedge site runs once per process. Capture is **pinned to the
+  built-in mic** (gotcha #22); a route change drops and rebuilds the engine; a stale HAL
+  client (`kAudioHardwareNotRunningError`) rebuilds once (gotcha #23); a
+  `kAudioHardwareIllegalOperationError` books a restart for the next idle moment
+  (`g_audio_poisoned`). Every mic start logs its timings. Details → `docs/audio-capture.md`.
 - **whisper's built-in Silero VAD** is enabled in `make_params` on top of all
   that — it trims silence *inside* each segment (see gotcha #3).
 - **Native UI** (`DictateController`, the `NSApp` delegate): owns the global ⌘⇧D
   hotkey (Carbon `RegisterEventHotKey`, keycode 2) + scoped Esc-cancel, the floating
   banner (`NSPanel`), auto-paste (synthetic ⌘V via `CGEvent`), and the menubar
-  `NSStatusItem` + 60 s auto-stop timer — all on the main thread.
+  `NSStatusItem` + 60 s auto-stop timer — all on the main thread. → `docs/native-ui.md`.
 
 ## Voice editor (post-take correction)
 
-After a take the daemon opens a **foreground editor** instead of pasting directly
-(`dictate editor` — one binary, a mode alongside `daemon`). **Why a separate
-process:** a dedicated **KEY** window composites reliably and gets keyDown — unlike the
-background accessory banner, whose live repaint the WindowServer throttles during a take
-(post-mortem: the `banner-live-paint-unsolved` project memory). The editor
-is an **accessory app** (`NSApplicationActivationPolicyAccessory`) whose window is a
-**non-activating `NSPanel`** (`NSWindowStyleMaskNonactivatingPanel`): it takes keyboard
-focus WITHOUT activating the app, so it surfaces on the user's *current* Space. (It was
-briefly `Regular` + activating, but that activation yanked the user to the main Space —
-gotcha #20.) So correction happens in the editor; the banner
-only shows warm-up + recording status during the take. (The two-model live-preview +
-`dictate ui` isolation explored during that saga are **stashed**, not in this build —
-the editor supersedes live-preview-during-take.)
-
-- **`EditorView`** (in `dictate.mm`): tokenizes the transcript into words + gaps; the
-  cursor is ON a word (highlighted) or IN a gap (a «] [» caret). ←/→ step words+gaps,
-  ↑/↓ jump to the nearest word a line up/down (the view owns its own wrapped layout, so
-  the same geometry drives drawing + line nav). ⏎ or ⌘⇧D accept, Esc cancels, ⌘Z/⌃Z
-  undo and ⌘⇧Z/⌃⇧Z redo the last content edit (a mini-take splice or a delete — NOT
-  navigation; restores words+cursor+confidence exactly). The two-stack `EditHistory`
-  (pure in `src/dictate_editmodel.h`, unit-tested) holds pre-edit snapshots: each edit
-  (`applyResult:`/`deleteCurrent:`) snapshots BEFORE mutating and `recordEdit`s only if the
-  document actually changed (snapshot compare — no phantom undo on a same-text re-dictation),
-  which also forks the redo stack; undo/redo park the current state on the opposite stack so
-  the pair round-trips losslessly. The word
-  body is **clipped to the region between the header and the footer legend and scrolls
-  vertically**: navigation/insert auto-scrolls minimally to keep the cursor line on-screen
-  (`_followCaret`), the scroll wheel scrolls freely, and a faint right-margin knob shows
-  position — so a long transcript can't overrun the legend or the window edge. The pure
-  clamp/cursor-follow arithmetic is `ed_scroll_clamp` (`src/dictate_edscroll.h`, unit-tested);
-  the editor window is sized to a screen-fraction (taller than the old fixed 460 px).
-- **Uncertain-word highlight (whisper logprob)**: words whose min per-token confidence
-  is below `ED_CONF_THRESHOLD` (0.60) are drawn amber (`ed_conf_color`), leading the eye
-  to likely errors. whisper's per-token `p` (`whisper_full_get_token_p`) is pulled in
-  `run_whisper_tok`, mapped tokens→words by `conf::words_confidence` (min-prob over each
-  word's bytes; `src/dictate_conf.h`, unit-tested), assembled per-word in `finish()`,
-  then carried daemon→editor over the `--conf` argv (serialized ints — the transcript itself
-  travels over the editor's **stdin** (`--stdin`), never argv: argv is `ps`-visible to every
-  local user, and the dictated text is the one thing everything else here keeps private). It is **re-aligned onto
-  the post-`finalize_transcript` tokenization** (`conf::realign`) since normalize re-cases
-  words / rewrites punctuation; a count drift disables the highlight (never mis-paints).
-  Voice-corrected/inserted words become confident (`EM_CONF_SURE`). Threshold + colour are
-  editor constants atop the editor section in `src/dictate.mm`.
-- **Mini-take (voice edit)**: SPACE on a word / in a gap → editor sends `corr-start`
-  (daemon mic on), the window goes static + red 🎙; SPACE again → `corr-stop` → daemon
-  transcribes → editor replaces the word / inserts at the gap (async, «расшифровка…»).
-  Esc mid-take → `corr-cancel` (cancels just the take). A standalone `dictate editor`
-  run (no `--from-daemon`) uses a local stub instead of the daemon mic.
-- **Mini-take cleanup (`EditModel::applyMiniTake`, `src/dictate_editmodel.h`)**: whisper
-  transcribes a single dictated word as a standalone sentence — Capital + trailing period
-  («слово» → "Слово.") — which is wrong for a one-word correction. So the mini-take result
-  is cleaned before splicing (NOT via `normalize_text`, which is take-boundary-only and would
-  over-capitalize): (a) drop the spurious trailing sentence dot; (b) re-case the first letter
-  to context — on a word **replace** it inherits the replaced word's case (keeps proper nouns /
-  sentence starts capital, mid-sentence fixes lowercase), at a **gap** insert it Capitalizes
-  only at a sentence start (`atSentenceStart`); (c) **spoken punctuation**: if the whole
-  utterance names a mark (`em_spoken_punct` — «знак вопроса»→`?`, «точка»→`.`, «запятая»→`,`,
-  «тире»→`—`, «открыть скобку»→`(`, «закрыть кавычки»→`»`, …) it inserts that symbol instead
-  of the literal words. All pure + unit-tested. The plain `applyResult` (stub / text-only
-  path) stays verbatim — only the voice path runs the cleanup.
-- **Accept → paste**: the daemon saves the frontmost app at take start (`g_target_app`,
-  `NSWorkspace`); on `accept <text>` it re-activates that app (`activateWithOptions:`
-  `NSApplicationActivateAllWindows` — `Ignoring*` is a no-op on macOS 14+) and
-  `paste_text`s after a short delay. Cancel → `editor-cancel` (refocus, no paste).
-- **⌘⇧D routing**: the daemon **unregisters its global ⌘⇧D** while the editor is open
-  (so the key reaches the editor's key window) and re-registers on accept/cancel/exit.
-  A `waitpid` watcher recovers (re-register ⌘⇧D, clear `g_editor_open`, reap the child)
-  if the editor dies without accept/cancel — see gotcha #15.
+After a take the daemon opens a **foreground editor** (`dictate editor`, a separate process —
+a dedicated KEY window composites reliably where the background banner did not) instead of
+pasting directly: navigate by word (←/→ ↑/↓), fix a word by voice (SPACE = mini-take via
+`corr-start`/`corr-stop`), ⌫/⌦ delete, ⌘Z/⌘⇧Z undo/redo, ⏎ or ⌘⇧D accept → daemon refocuses
+the app that was frontmost at take start and pastes; Esc cancels. Accessory app +
+**non-activating `NSPanel`** so it surfaces on the current Space (gotcha #20). The daemon
+unregisters ⌘⇧D while the editor is open and recovers via `waitpid` if the editor dies
+(gotcha #15). Transcript travels over the editor's stdin (`--stdin`), per-word confidence over
+`--conf` argv; pure model in `src/dictate_editmodel.h` + `src/dictate_conf.h`, unit-tested.
+Everything else → `docs/voice-editor.md`.
 
 ## Architecture decisions & gotchas → Notion
 
@@ -269,149 +180,23 @@ cross-references still scattered through this file resolve to ADR-00NN in that d
 Read the relevant ADR before changing that area, and record the next hard-won lesson as a
 **new ADR there**, not as a new gotcha here.
 
-## Native UI (in-process — Hammerspoon dropped)
+## Native UI + self-recovery (summary)
 
-The daemon is fully self-contained; `DictateController` (the `NSApp` delegate) owns
-all UI on the **main thread**:
+All UI on the **main thread** in `DictateController`. Hotkeys ⌘⇧D (toggle), Esc (cancel,
+registered only during a take), ⌥⌘⇧D (restart, never unregistered — but Carbon delivers to the
+main run loop, so it is dead when main is wedged). Status-only banner (`BANNER_*` constants).
+Menubar: SF Symbol glyph, left-click toggles, right-click menu with state / ⟳ / log; timers in
+`NSRunLoopCommonModes`. → `docs/native-ui.md`.
 
-- **Hotkey**: `RegisterEventHotKey(kVK_ANSI_D=2, ⌘⇧)` toggles a take — keycode 2 is
-  the physical D key, so it survives a Cyrillic layout (and needs no Accessibility).
-  A second hotkey for **Esc** is registered only for the duration of a take (so Esc
-  stays normal everywhere else) and cancels it. A **third**, ⌥⌘⇧D (id 3), restarts the daemon
-  and — unlike ⌘⇧D — is **never unregistered**, not even while the editor is open: it covers a
-  daemon that is stuck but still pumping its run loop, and the menubar ⟳ item it duplicates is
-  unreachable whenever macOS parks the status item off-screen (see Menubar below). All three die
-  with the process. **It is NOT an escape hatch from a wedged main thread**: Carbon delivers
-  hotkeys to the main run loop, so when main is blocked ⌥⌘⇧D is as dead as the ⟳ menu item (this
-  is exactly what the user hits — the 2026-08-17 incident). The only two things that still work
-  there are the socket (`dictate restart`, served on its own thread with a force path) and the
-  automatic watchdog / take-start deadline.
-- **Banner**: a borderless floating `NSPanel` whose content view is a **flat
-  translucent fill** (layer-backed `NSView`, black α`BANNER_BG_ALPHA` — Hammerspoon-
-  style glass, no blur) + a hairline border, holding one centred `NSTextField`. Spans
-  the **full screen width** (`BANNER_HMARGIN` edge gaps), a touch above mid-screen;
-  **height auto-grows** with the text from a **fixed top edge**, capped at
-  `BANNER_MAXH_FRAC` of the screen. It is **status-only** — it never shows live
-  transcript text (the take's words go to the post-take editor); the header is short
-  and stable, so it does not jump. Ignores mouse. One attributed string layers bright
-  title / dim subtitle — all **explicit** colours (no vibrant backdrop now, so a
-  semantic colour like `secondaryLabelColor` would vanish in Light Mode). States:
-  «Запуск микрофона…» (warm-up, gated on `g_sess->live` via a 0.1 s poll) → «🎙 говори»
-  (static, no live text) → «расшифровка…» → hidden. Updated only
-  on the main queue. A `_gen` counter keeps a stale timed auto-hide from hiding a newer
-  take's banner. All look/layout knobs are the `BANNER_*` constants atop `src/dictate.mm`.
-- **Auto-paste**: `paste_text` — clipboard + synthetic ⌘V (`CGEventPost`), restore
-  after 0.4 s; degrades to clipboard-only if not Accessibility-trusted (gotchas #2/#4).
-- **Menubar**: `NSStatusItem` — an **SF Symbol template image** (`setStatusGlyphRecording:`:
-  `mic` idle / `mic.fill` tinted red while recording; text fallback only if the symbol is nil),
-  **left**-click toggles + a 1 Hz `NSTimer` that enforces the 60 s cap and writes the elapsed
-  m:ss into the **tooltip**. The glyph is deliberately narrow and fixed-width: macOS packs menu
-  bar extras right-to-left and silently parks whatever no longer fits (measured on this Mac: the
-  item sat at x≈650-740 pt while the first *drawn* icon was at ≈800 pt), so the old
-  «⏳» / «🎙 m:ss» title — 41 pt idle, ~70 pt recording — was invisible on a full menu bar. Both
-  the 60 s-cap timer and the warm-up poll are registered in `NSRunLoopCommonModes` (menu tracking
-  leaves the default mode; a default-mode-only cap timer would let the mic run past 60 s while
-  the user holds the menu open). **Right/⌃-click opens a menu** (`sendActionOn:` both
-  mouse-ups; `statusClicked:` routes on `NSApp.currentEvent`): a disabled state line
-  (`stateSummary` — `try_lock` on `g_mu`, never `lock`, so a stuck path can't freeze the menu),
-  start/stop, **⟳ перезапустить**, open log. The restart is the user's own way out of a wedged
-  daemon — it used to need an agent.
-- **Restart / watchdog** (`restart_process_now` + `DictateController.setupWatchdog`): the daemon
-  owns state that can't be reset in place (Metal ctx, CoreAudio HAL client, hotkey, windows), so
-  recovery = a fresh process (~1 s model load). `restart_process_now` takes **no locks and never
-  hops to the main queue** — callable from the watchdog/socket thread while main is wedged.
-  **Order matters**: it lines the successor up FIRST (`posix_spawn` of `daemon --replace`, never
-  `fork` — Metal + threads; `--replace` makes the child wait for our socket to vanish instead of
-  bowing out as a duplicate) and only then tears down. So a failed spawn aborts the restart with
-  nothing dropped (a wedged daemon beats no daemon), and under launchd nothing is spawned at all
-  (`XPC_SERVICE_NAME` → `KeepAlive` is the successor). Teardown — unlink the socket —
-  runs exactly once (`g_torn_down`), so a forced second caller can't unlink the successor's fresh
-  socket, and the editor child is `SIGTERM`ed (`g_editor_pid`): a fresh daemon has no
-  `g_target_app` and re-registers ⌘⇧D, so an orphan would paste into the wrong app. `g_restarting`
-  keeps the graceful main-queue path and the `restart` verb's force path to one restart; the force
-  waits `RESTART_DEADLINE_SEC+1` so it doesn't beat the graceful path on a healthy daemon. The
-  watchdog itself: the main queue stamps `g_wd_beat_ms` at 1 Hz, a background thread restarts the
-  process when the stamp is `DICTATE_WATCHDOG_SEC` stale. Four false-positive traps it avoids —
-  the heartbeat timer is in **`NSRunLoopCommonModes`** (menu tracking would starve a default-mode
-  timer), the clock is **`CLOCK_UPTIME_RAW`** (stops during system sleep; `CLOCK_MONOTONIC` does
-  not — a closed lid would look like an 8-hour stall), `wd_checker_starved` skips a round when the
-  watchdog thread's OWN sleep overran (SIGSTOP/suspension starves both threads; `lastCheck` is
-  stamped before the first sleep so round 1 is guarded too), and `g_longop_until_ms` marks an
-  on-demand model reload so a slow one is waited out instead of killing the take — a **deadline**
-  (`LONGOP_GRACE_SEC`), not a flag, because a load that never returns (model on a stalled volume)
-  would otherwise disarm the watchdog forever in the worst wedge of all; and its RAII guard stamps
-  the heartbeat on the way out, since main is still mid-block (mic warm-up) when the exemption
-  lifts. Restart bookkeeping: `g_replacement_spawned` is only the spawn CLAIM — a second caller
-  tears down only once `g_replacement_ready` confirms a successor exists (or launchd is one), and
-  `g_restart_gen` stands the armed deadline/force threads down when a restart aborts, so the
-  daemon can't restart itself moments after telling the user the restart failed.
-  Three more deliberate details, each verified e2e with the `wedge` verb: (a) the heartbeat is armed
-  by the FIRST timer tick, never up-front — a daemon whose run loop never starts is left alone
-  instead of restart-looping; (b) `wd_checker_starved` suppresses a round when the watchdog thread's
-  OWN sleep overran (SIGSTOP / suspension starves both threads — tested with `kill -STOP`); (c) the
-  graceful `restartNow:` arms an off-main `RESTART_DEADLINE_SEC` thread BEFORE stopping the recorder
-  and joining the worker, since those are exactly the calls that can hang. Restart logging is
-  `raw_log` (`write(2)`), not `fprintf` — a thread wedged while holding stderr's stdio lock would
-  deadlock a printf.
-- **Take-start deadline** (`g_takestart_until_ms`, `DICTATE_TAKESTART_SEC`, default 8 s — gotcha #24): a second,
-  much tighter watcher armed only around the mic-start critical section in `daemon_start` — the
-  `AVAudioEngine` build, the built-in-mic pin and the engine start, all synchronous CoreAudio on the
-  main queue **with `g_mu` held**. That is where the wedge actually lands in practice (2026-08-17:
-  `setDeviceID:` → `kAudioHardwareIllegalOperationError` → AVFoundation never returned → 35 s of
-  dead UI), and the heartbeat timeout cannot be lowered to match because it also has to cover the
-  model reload, the editor spawn and every AppKit callback. Own thread, 1 s poll, same
-  `restart_process_now` with reason `take-start`; same `wd_checker_starved` suspension guard.
-  Disarmed the instant `-startFeeding:` returns, not at the end of `daemon_start`: the take-log
-  write and the live-watch thread that follow are disk/bookkeeping work, and leaving them inside a
-  budget sized for CoreAudio would turn a stalled disk into a restart *loop*. Disabled together
-  with the watchdog (`DICTATE_WATCHDOG_SEC=0`).
-  **Mic permission not yet granted** (first run): the TCC dialog owns this exact section until the
-  user answers, and a restart would take the prompt down with the process — an unescapable loop
-  where the permission can never be granted. Suppressing just this deadline is not enough, since
-  the heartbeat is stale for the same reason and fires a few seconds later; so a pending prompt
-  takes the **long-op exemption** instead (the one the model reload uses, bounded by
-  `LONGOP_GRACE_SEC` so an unanswered prompt still cannot disarm the watchdog forever).
-- **Wedge forensics** (`wedge_sample_init` / `wedge_sample_loop` / `request_wedge_sample`, gotcha #24): the
-  restart is also the moment the evidence dies — after it, all that is left of a wedge is *absent*
-  log lines. So an involuntary restart (`wd_reason_is_wedge`: `watchdog` / `socket-force` /
-  `take-start`, never a user-initiated ⟳) `sample`s the process for `WEDGE_SAMPLE_SEC` first,
-  leaving `~/.local/share/dictate/wedge/wedge-<epoch>.txt` with every thread's stack — including
-  the stuck one, the single thing the log cannot give. Two structural rules, both learned the hard
-  way in review: (a) **the restart path allocates nothing** — the report dir, the argv strings and
-  a helper thread parked on a `dispatch_semaphore` are all set up at startup, and the restart only
-  signals the semaphore and polls an atomic with a `WEDGE_SAMPLE_WAIT_SEC` deadline. A wedge inside
-  CoreAudio/AVFoundation can hold the allocator lock, so a `posix_spawn` issued from the restart
-  path could block forever and defeat the restart it was documenting — and under launchd that
-  would be a *new* way to lose the daemon, since the managed path otherwise spawns nothing. The
-  helper blocks instead, where blocking costs only the report (and its blocking `waitpid` is also
-  what keeps a timed-out `sample` from becoming a zombie if the restart later aborts). (b) the
-  report goes under `~/.local/share/dictate/wedge/` (0700), **not** `/tmp`: a predictable name in a
-  world-writable directory lets any local user pre-plant a symlink and have `sample -file` truncate
-  whatever the daemon can write. `DICTATE_WEDGE_SAMPLE=0` turns it off.
-- **Restart backoff** (`g_restart_backoff_until_ms`, `wd_in_backoff`): a restart that ABORTS (no
-  replacement could be spawned — a wedged daemon beats no daemon) leaves main still wedged, so both
-  watchers would fire again on their very next round: a hot loop of failing spawns, one `sample`
-  each. The abort stamps `RESTART_BACKOFF_SEC`, which only the automatic triggers honour — a user
-  asking for a restart is never made to wait.
-- **Stamped log lines** (`slog`/`raw_log`, `ts_prefix`, gotcha #24): every line the daemon writes itself starts
-  with `HH:MM:SS.mmm`; whisper's own chatter stays unstamped, which conveniently makes ours the
-  greppable ones. `/tmp/dictate.log` used to have no time at all — nothing in it could be lined up
-  against `log show`, the take log or `ps`, which is most of what made the 2026-08-17 post-mortem
-  slow. Both go through `write(2)` (never stdio, see above), stamp+message in one `writev` so two
-  threads can't interleave, and the UTC offset is cached at startup rather than calling
-  `localtime_r` (it takes a timezone lock) — a DST flip mid-run skews wall-clock by an hour but
-  never the ordering. The `--file`/client paths keep plain `fprintf`: a timestamp on interactive
-  CLI output is noise.
-- **Known narrow race** (pre-existing, shared with `quit`): between our exit and
-  the replacement binding, a concurrent `dictate start` can spawn a second daemon; whichever binds
-  first wins and the loser bows out via the single-instance guard — but if the loser is the launchd
-  job, `KeepAlive` re-runs it every ~10 s until the other daemon exits. Not worth a lock file today.
-
-The Unix socket + client verbs stay (scripts/tests). The old `/tmp/dictate.recording`
-state file (and the per-take thread that touched it) is gone — nothing read it once
-Hammerspoon left; `g_sess->live` is the in-process signal. `~/.hammerspoon/init.lua` no longer references dictate (its
-dictate block was removed, `clip2vps` kept); the prior version is archived at
-`~/.hammerspoon/init.lua.pre-dictate-removal.bak`.
+Recovery = a fresh process (`restart_process_now`: takes no locks, spawns the successor first,
+allocates nothing). Triggers: menubar ⟳ / ⌥⌘⇧D / `restart` verb (graceful, forced after
+`RESTART_DEADLINE_SEC`), the heartbeat **watchdog** (`DICTATE_WATCHDOG_SEC`, `CLOCK_UPTIME_RAW`,
+common modes, checker-starvation + long-op guards), the **take-start deadline**
+(`DICTATE_TAKESTART_SEC`, around the mic-start critical section only), and the deferred
+`audio-poisoned` restart. Involuntary restarts `sample` the process first
+(`~/.local/share/dictate/wedge/`), aborted restarts back off. Every daemon log line is stamped
+`HH:MM:SS.mmm` via `write(2)`, never stdio. Pure gates: `src/dictate_watchdog.h`.
+→ `docs/self-recovery.md` before touching any of it.
 
 ## Daemon lifecycle (LaunchAgent)
 
@@ -522,42 +307,7 @@ non-owning `const char*`, backed by the `g_initial_prompt` global — gotcha #21
 
 ## Status / roadmap
 
-Done: resident model · daemon+client over Unix socket · streaming (VAD-segmented) ·
-Silero VAD (silence-hallucination fix) · NSPasteboard clipboard · LaunchAgent
-autostart · `--file`/`feedfile` test paths · Metal flash attention (~20% faster) ·
-perf-core thread default · vectorized (Accelerate) VAD RMS · self-contained native hotkey + banner + auto-paste + menubar —
-Hammerspoon dropped · **post-take voice-editor: navigate (←/→ ↑/↓) + voice-edit
-(replace/insert via mini-takes) + accept→focus-restore→paste** · **unit tests (doctest,
-`make test`): pure logic factored into `src/dictate_*.h` — WAV parse, VAD/segmentation +
-cap, editor model, socket parse, peer-auth, paste-gen — host-portable, gotcha #19** ·
-**user-dictionary lexical bias → whisper `initial_prompt` (token-budgeted, env-toggled;
-`src/dictate_dict.h` + `scripts/bench-wer.py` WER harness — gotcha #21)** ·
-**post-normalization of the final transcript (`normalize_text`: capitalization/punctuation/
-typography, `DICTATE_NORMALIZE`; applied at the take boundary, not inside `finish()`)** ·
-**uncertain-word highlight in the editor (whisper per-token logprob → per-word min
-confidence → amber below `ED_CONF_THRESHOLD`; `src/dictate_conf.h` incl. `realign` across
-`normalize_text`, unit-tested — see the Voice-editor section)** ·
-**idle-unload: free the resident model after `DICTATE_IDLE_UNLOAD_SEC` idle, reload on
-demand — opt-in, off by default; `src/dictate_idle.h` + `idleTick` under `g_mu`, gotcha #7** ·
-**self-recovery: menubar right-click menu (state + ⟳ перезапустить + лог), `restart` socket
-verb / CLI, and a main-thread watchdog that relaunches the daemon after
-`DICTATE_WATCHDOG_SEC` (15 s in the installed plist) of a stalled run loop —
-`src/dictate_watchdog.h`** ·
-**wedge diagnostics + faster recovery (after the 2026-08-17 mic-start wedge): a `DICTATE_TAKESTART_SEC`
-(8 s) deadline around the mic-start critical section, a `/usr/bin/sample` snapshot of the stuck
-stacks (`~/.local/share/dictate/wedge/`, taken by a helper parked since startup so the restart path
-still allocates nothing) before any involuntary restart, a backoff after an aborted restart, and
-`HH:MM:SS.mmm` stamps on every daemon log line** ·
-**per-process `AVAudioEngine` + deferred `audio-poisoned` restart (after the 2026-08-19 repeat of the
-mic-start wedge): the engine and the hardware format are built once per daemon instead of once per
-take (the `inputNode`/`GetHWFormat` wedge site now runs once, and a warm take starts in ~110 ms
-instead of ~190 ms), a `kAudioHardwareIllegalOperationError` books a restart for the next idle
-moment rather than waiting to be wedged mid-take, and every mic start logs its per-step timings —
-gotcha #25** ·
-**status-only banner: no live transcript in the banner (it jumped/grew as words streamed) —
-the take's words appear in the post-take editor. The open-segment live-preview machinery
-(callback, tap snapshot, `maybePreview`, `PREVIEW_*`, `--interim`/`--realtime`) was removed
-entirely; per-segment streaming into `parts_` stays (the latency win) — gotcha #12**.
+Done list (in order) → `docs/status.md`.
 
 Declined: warm-mic option (pre-open device to kill the ~0.5–1.5 s avfoundation warm-up) —
 deliberately not pursued; don't re-propose.

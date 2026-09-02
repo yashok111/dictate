@@ -7,8 +7,8 @@
 *.wav
 *.aiff
 
-# local working docs (plans/specs/research) — not published
-/docs/
+# local working docs (plans/specs/research) — not published; docs/*.md deep dives ARE tracked
+/docs/superpowers/
 
 # third-party agent skills installed via scripts/install-skills.sh
 # (skills-lock.json IS committed; agent directories are repopulated from it).
