@@ -1439,6 +1439,7 @@ static void daemon_cancel(const char *reason) {
     if (!take) return;
     [r stop];
     log_take_cancel(take.meta, take.session->seconds(), reason);
+    slog("cancel (%s): %.2fs discarded\n", reason ? reason : "?", take.session->seconds());   // NDJSON has it, /tmp/dictate.log didn't
     // cancel() joins the whisper worker, which can be mid-whisper_full (~1-2 s). Run it OFF the main
     // thread so Esc-cancel / corr-cancel / editor-cancel don't freeze the run loop (mirrors requestStop's
     // detached finish()). g_finishing (set above) keeps a new take off g_ctx until the worker is joined.
