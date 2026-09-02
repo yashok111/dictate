@@ -20,7 +20,10 @@ the editor supersedes live-preview-during-take.)
 - **`EditorView`** (in `dictate.mm`): tokenizes the transcript into words + gaps; the
   cursor is ON a word (highlighted) or IN a gap (a «] [» caret). ←/→ step words+gaps,
   ↑/↓ jump to the nearest word a line up/down (the view owns its own wrapped layout, so
-  the same geometry drives drawing + line nav). ⏎ or ⌘⇧D accept, Esc cancels, ⌘Z/⌃Z
+  the same geometry drives drawing + line nav). ⌘V/⌃V pastes the clipboard text at the cursor —
+  insert at a gap, replace on a word — via `EditModel::applyPaste`, which splits on whitespace
+  ONLY (`em_split_ws`): a pasted URL/path must stay one token, since `em_tokenize` would isolate
+  every `.`/`:` and `em_join` would then space them apart. Undoable. ⏎ or ⌘⇧D accept, Esc cancels, ⌘Z/⌃Z
   undo and ⌘⇧Z/⌃⇧Z redo the last content edit (a mini-take splice or a delete — NOT
   navigation; restores words+cursor+confidence exactly). The two-stack `EditHistory`
   (pure in `src/dictate_editmodel.h`, unit-tested) holds pre-edit snapshots: each edit

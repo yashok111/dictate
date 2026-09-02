@@ -533,3 +533,67 @@ TEST_CASE("EditHistory: clear empties both stacks") {
     h.clear();
     CHECK_FALSE(h.canUndo()); CHECK_FALSE(h.canRedo());
 }
+
+// ── paste (⌘V/⌃V in the editor): whitespace-only split, so URLs / paths stay one token ──
+TEST_CASE("em_split_ws: splits on whitespace only, keeps punctuation attached, drops empties") {
+    CHECK(em_split_ws("https://git.sumka.site/yakov/dictate/pulls/20")
+          == std::vector<std::string>{"https://git.sumka.site/yakov/dictate/pulls/20"});
+    CHECK(em_split_ws("  слово,  ещё\tодно\nи src/dictate.mm ") == std::vector<std::string>{"слово,", "ещё", "одно", "и", "src/dictate.mm"});
+    CHECK(em_split_ws("").empty());
+    CHECK(em_split_ws(" \n\t ").empty());
+}
+
+TEST_CASE("EditModel::applyPaste: a URL inserted at a gap survives the join verbatim") {
+    EditModel m = EditModel::fromText("Так, наговариваю проверку.");   // Так , наговариваю проверку .
+    REQUIRE(m.words.size() == 5);
+    m.pos = 4;                                                          // gap between «,» and «наговариваю»
+    m.applyPaste("https://git.sumka.site/yakov/dictate/pulls/20");
+    CHECK(m.words.size() == 6);
+    CHECK(m.words[2] == "https://git.sumka.site/yakov/dictate/pulls/20");   // ONE token, not "https" ":" "//git" "." …
+    CHECK(m.pos == 5);                                                  // cursor lands ON the pasted token
+    CHECK(m.joined() == "Так, https://git.sumka.site/yakov/dictate/pulls/20 наговариваю проверку.");
+}
+
+TEST_CASE("EditModel::applyPaste: multi-word prose inserts word by word; on a word it replaces") {
+    EditModel m = EditModel::fromText("один три");
+    m.pos = 2;                                                          // gap between
+    m.applyPaste("два, два-с-половиной\nдва.5");
+    CHECK(m.joined() == "один два, два-с-половиной два.5 три");
+    CHECK(m.pos == 3);                                                  // on the first pasted word
+    EditModel r = EditModel::fromText("один два три");
+    r.pos = 3;                                                          // on «два»
+    r.applyPaste("2");
+    CHECK(r.joined() == "один 2 три");
+}
+
+TEST_CASE("EditModel::applyPaste: empty / whitespace clipboard is a no-op; confidence stays aligned") {
+    EditModel m = EditModel::fromText("а б"); m.conf = {0.2f, 0.9f};
+    EditSnapshot before = m.snapshot();
+    m.applyPaste("   \n");
+    CHECK(m.snapshot() == before);
+    m.pos = 2; m.applyPaste("x y");                                     // insert 2 tokens at the middle gap
+    REQUIRE(m.words.size() == 4); REQUIRE(m.conf.size() == 4);
+    CHECK(m.conf[0] == 0.2f); CHECK(m.conf[1] == EM_CONF_SURE); CHECK(m.conf[2] == EM_CONF_SURE); CHECK(m.conf[3] == 0.9f);
+}
+
+TEST_CASE("applyMiniTake after a paste ending in sentence punctuation capitalizes the next word") {
+    CHECK(em_ends_with_sentence_punct("предложение."));
+    CHECK(em_ends_with_sentence_punct("что?"));
+    CHECK(em_ends_with_sentence_punct("так\xE2\x80\xA6"));          // …
+    CHECK(em_ends_with_sentence_punct("."));
+    CHECK_FALSE(em_ends_with_sentence_punct("слово,"));
+    CHECK_FALSE(em_ends_with_sentence_punct("src/dictate.mm"));
+    CHECK_FALSE(em_ends_with_sentence_punct(""));
+    EditModel m = EditModel::fromText("начало");
+    m.pos = 2;                                                       // trailing gap
+    m.applyPaste("Вставленное предложение.");                        // «предложение.» stays one token
+    REQUIRE(m.words.back() == "предложение.");
+    m.pos = m.maxPos();                                              // gap after the pasted sentence
+    CHECK(m.atSentenceStart(m.gapIndex()));
+    m.applyMiniTake("продолжение.");                                 // whisper's mini-sentence → Capital, dot stripped
+    CHECK(m.words.back() == "Продолжение");
+    EditModel k = EditModel::fromText("начало");
+    k.pos = 2; k.applyPaste("слово,"); k.pos = k.maxPos();
+    k.applyMiniTake("Дальше.");
+    CHECK(k.words.back() == "дальше");                               // mid-sentence after «слово,» → lowercase
+}

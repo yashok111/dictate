@@ -157,7 +157,8 @@ logs `/tmp/dictate.log`, `/tmp/dictate-editor.log`.
 After a take the daemon opens a **foreground editor** (`dictate editor`, a separate process —
 a dedicated KEY window composites reliably where the background banner did not) instead of
 pasting directly: navigate by word (←/→ ↑/↓), fix a word by voice (SPACE = mini-take via
-`corr-start`/`corr-stop`), ⌫/⌦ delete, ⌘Z/⌘⇧Z undo/redo, ⏎ or ⌘⇧D accept → daemon refocuses
+`corr-start`/`corr-stop`), ⌘V/⌃V paste the clipboard at the cursor (whitespace-split only, so a
+URL stays one token — `EditModel::applyPaste`), ⌫/⌦ delete, ⌘Z/⌘⇧Z undo/redo, ⏎ or ⌘⇧D accept → daemon refocuses
 the app that was frontmost at take start and pastes; Esc cancels. Accessory app +
 **non-activating `NSPanel`** so it surfaces on the current Space (gotcha #20). The daemon
 unregisters ⌘⇧D while the editor is open and recovers via `waitpid` if the editor dies

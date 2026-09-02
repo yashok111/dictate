@@ -194,7 +194,11 @@ blindly — so you can catch whisper's mistakes before they land:
   «двоеточие» → `:`, «тире» → `—`, «многоточие» → `…`, «открыть/закрыть скобку» → `(` `)`,
   «открыть/закрыть кавычки» → `«` `»`. Handy for marks dictation won't reliably produce on
   its own — stand in the gap where you want it and dictate the name.
+- **Paste from the clipboard** with **⌘V** (or ⌃V): in a gap it inserts, on a word it replaces.
+  Handy for a link — say the sentence, ⌘V the URL into the gap, keep talking. Pasted text is
+  split on spaces only, so a URL or a path stays one word.
 - **Delete** the current word (or the one before the cursor) with **⌫**, the next one with **⌦**.
+- **⌘Z** undoes the last edit (a voice fix, a paste, a delete — not navigation), **⌘⇧Z** redoes.
 - **Low-confidence words are highlighted** (amber): whisper's per-token probability is
   mapped to a per-word confidence, so the words most likely to be wrong draw your eye.
 - **⏎** or **⌘⇧D** accepts — the editor closes, refocuses the app you were in, and pastes.

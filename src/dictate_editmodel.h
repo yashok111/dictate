@@ -100,6 +100,18 @@ inline std::vector<EmSpan> em_tokenize_spans(const std::string &s) {
     return out;
 }
 
+// Whitespace-only split (space/tab/CR/LF/FF/VT), punctuation left attached — for pasted text,
+// where a URL / path / "слово," must survive as one token. Drops empties.
+inline std::vector<std::string> em_split_ws(const std::string &s) {
+    std::vector<std::string> out; std::string cur;
+    for (char c : s) {
+        if (c==' '||c=='\t'||c=='\n'||c=='\r'||c=='\f'||c=='\v') { if (!cur.empty()) { out.push_back(cur); cur.clear(); } }
+        else cur.push_back(c);
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
 // Token text only (drops the spans). Behaviour identical to the original em_tokenize.
 inline std::vector<std::string> em_tokenize(const std::string &s) {
     std::vector<std::string> out;
@@ -182,6 +194,15 @@ inline constexpr float EM_CONF_SURE = 1.0f;
 // A token that is exactly one sentence-ending mark: . ! ? or … (U+2026).
 inline bool em_is_sentence_punct(const std::string &t) {
     return t=="." || t=="!" || t=="?" || t=="\xE2\x80\xA6";
+}
+
+// `t` ENDS with a sentence-ending mark (its last codepoint is . ! ? or …) — for tokens that
+// carry attached punctuation, i.e. pasted text («предложение.»). Single-mark tokens qualify too.
+inline bool em_ends_with_sentence_punct(const std::string &t) {
+    if (t.empty()) return false;
+    unsigned char last = (unsigned char)t.back();
+    if (last=='.' || last=='!' || last=='?') return true;
+    return t.size() >= 3 && t.compare(t.size()-3, 3, "\xE2\x80\xA6") == 0;   // …
 }
 
 // First codepoint of `t` is a letter (ASCII or — crudely — any Cyrillic/multibyte lead).
@@ -321,6 +342,15 @@ struct EditModel {
     // (no case/punct cleanup). Used by the text-only / stub path. Mirrors EditorView::applyResult:.
     void applyResult(const std::string &resultText) { applyTokens(em_tokenize(resultText)); }
 
+    // Paste clipboard TEXT at the cursor (⌘V/⌃V in the editor): insert at a gap, replace the
+    // current word. Split on WHITESPACE ONLY (em_split_ws), not em_tokenize: a pasted URL or
+    // file path ("https://git.sumka.site/x/y", "src/dictate.mm") must stay ONE token — em_tokenize
+    // would isolate every '.' and ':' and em_join would then space them apart ("https: //git.
+    // sumka. site"). Attached punctuation ("слово,") rides inside its token, which em_join spaces
+    // like any word, so pasted prose reads verbatim too. Newlines collapse to spaces (the output
+    // is one line of dictation). Empty / whitespace-only → no change.
+    void applyPaste(const std::string &text) { applyTokens(em_split_ws(text)); }
+
     // Is the slot at word index `start` at a sentence start? True when nothing precedes it,
     // or the nearest preceding token (skipping closing quotes/brackets) is a sentence-ender.
     // Drives whether a voice-corrected word should be Capitalized or lowercased.
@@ -328,6 +358,9 @@ struct EditModel {
         for (int j = start - 1; j >= 0; j--) {
             const std::string &t = words[j];
             if (em_is_sentence_punct(t)) return true;
+            // A PASTED token keeps its punctuation attached («предложение.» — applyPaste splits on
+            // whitespace only), so a trailing sentence mark inside the token is a boundary too.
+            if (em_ends_with_sentence_punct(t)) return true;
             if (t=="\xC2\xBB" /*»*/ || t==")" || t=="]" || t=="\xE2\x80\x9D" /*”*/ || t=="\"") continue;
             return false;                       // a word (or non-closing punct) → mid-sentence
         }

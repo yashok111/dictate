@@ -2808,6 +2808,7 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     if ((m & NSEventModifierFlagCommand) && (m & NSEventModifierFlagShift) && e.keyCode == 2) { [self accept]; return; }
     if ([self isUndoEvent:e]) { [self undo]; return; }                  // ⌘Z / ⌃Z — отменить правку
     if ([self isRedoEvent:e]) { [self redo]; return; }                  // ⌘⇧Z / ⌃⇧Z — вернуть
+    if ([self isPasteEvent:e]) { [self pasteClipboard]; return; }       // ⌘V / ⌃V — вставить из буфера
     switch (e.keyCode) {
         case 49:  [self startTake];                 return;               // space — start a mini dictation
         case 123: _pos = em_clamp_step(_pos, -1, [self maxPos]); [self moved]; return;  // ←
@@ -2829,7 +2830,35 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     }
     if ([self isUndoEvent:e]) { edlog(@"performKeyEquivalent ⌘Z → undo"); [self undo]; return YES; }
     if ([self isRedoEvent:e]) { edlog(@"performKeyEquivalent ⌘⇧Z → redo"); [self redo]; return YES; }
+    if ([self isPasteEvent:e]) { edlog(@"performKeyEquivalent ⌘V → paste"); [self pasteClipboard]; return YES; }
     return [super performKeyEquivalent:e];
+}
+// ⌘V / ⌃V (no Shift) = paste the clipboard text at the cursor. keyCode 9 = physical V, so it
+// fires on a Cyrillic layout too (same reasoning as the Z chords).
+- (BOOL)isPasteEvent:(NSEvent *)e {
+    NSEventModifierFlags m = e.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    BOOL cmdOrCtrl = (m & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) != 0;
+    return cmdOrCtrl && !(m & NSEventModifierFlagShift) && e.keyCode == 9;
+}
+// Insert the clipboard's text at a gap / replace the word under the cursor. Split on whitespace
+// only (EditModel::applyPaste) so a URL or path stays one token — the whole point: say a
+// sentence, paste a link into the gap, keep talking. Undoable like any edit. The daemon's own
+// paste_text never runs here (this is the editor process reading, not writing, the pasteboard).
+- (void)pasteClipboard {
+    NSString *clip = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString] ?: @"";
+    std::string text = clip.UTF8String ?: "";
+    if (em_split_ws(text).empty()) { edlog(@"paste → clipboard has no text, no change"); return; }
+    EditModel m; m.pos = _pos;                                  // bridge NSArray<NSString*> ↔ the pure model
+    for (NSString *s in _words) m.words.push_back(s.UTF8String ?: "");
+    m.conf = _conf;
+    EditSnapshot before = m.snapshot();
+    BOOL wasOnWord = m.onWord();
+    m.applyPaste(text);
+    if (m.snapshot() != before) _history.recordEdit(before);   // undoable; forks redo
+    [self loadWords:m.words conf:m.conf pos:m.pos];             // model → view (re-measures)
+    edlog(@"paste → %@ %lu chars as %lu token(s)", wasOnWord ? @"replace word with" : @"insert",
+          (unsigned long)clip.length, (unsigned long)em_split_ws(text).size());   // count only — never the text
+    [self setNeedsDisplay:YES];
 }
 // ⌘Z / ⌃Z (no Shift) = undo; ⌘⇧Z / ⌃⇧Z = redo. keyCode 6 = physical Z, so both fire on a
 // Cyrillic layout too (like the ⌘⇧D / keycode-2 hotkey — see the Native UI notes).
@@ -3040,7 +3069,7 @@ static std::string editor_request(const std::string &line);  // editor → daemo
                   : [NSColor colorWithWhite:1 alpha:0.7];
     [status drawInRect:NSMakeRect(0, b.size.height - 56, b.size.width, 22)
         withAttributes:@{NSForegroundColorAttributeName:sfg, NSFontAttributeName:[NSFont systemFontOfSize:15], NSParagraphStyleAttributeName:ctr}];
-    [@"←/→ ↑/↓ навигация · пробел — диктовка · ⌫/⌦ удалить · ⌘Z отменить · ⌘⇧Z вернуть · ⏎ принять · Esc отмена"
+    [@"←/→ ↑/↓ навигация · пробел — диктовка · ⌘V вставить из буфера · ⌫/⌦ удалить · ⌘Z отменить · ⌘⇧Z вернуть · ⏎ принять · Esc отмена"
         drawInRect:NSMakeRect(0, b.size.height - 30, b.size.width, 20)
         withAttributes:@{NSForegroundColorAttributeName:[NSColor colorWithWhite:1 alpha:0.45], NSFontAttributeName:[NSFont systemFontOfSize:13], NSParagraphStyleAttributeName:ctr}];
 }
