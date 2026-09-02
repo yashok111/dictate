@@ -27,7 +27,9 @@ daemon** keeps the model in GPU memory (no per-take reload) and enables
   `dictate_idle.h` (idle-unload gate + poll-cadence arithmetic — gotcha #7),
   `dictate_watchdog.h` (main-thread watchdog gate: heartbeat staleness + poll cadence, the
   take-start deadline arithmetic, and which restart reasons are worth a `sample` snapshot),
-  `dictate_edscroll.h` (editor vertical-scroll clamp / cursor-follow arithmetic).
+  `dictate_edscroll.h` (editor vertical-scroll clamp / cursor-follow arithmetic),
+  `dictate_capture.h` (stop-action gate + banner text assembly), `dictate_log.h` (NDJSON
+  take-log serialization + the 7-day retention rule).
 - `tests/` — doctest unit tests (`tests/doctest.h` vendored; `tests/test_*.cpp`). `make test`.
 - `Makefile` — clang++ build; bakes `-DGGML_LIBEXEC` from `brew --prefix ggml`. Also the
   `test` target (host `c++`, no brew/whisper needed — gotcha #19).
@@ -101,7 +103,7 @@ job is to break that wedge — was never even read. Editor protocol (daemon ↔ 
 `edit <text>`→`ok` (debug: open the editor on text, no mic). Standalone:
 `dictate editor "слова"` runs the editor alone (stubbed mini-take). Socket
 `/tmp/dictate.sock` (override `$DICTATE_SOCK` to run a test daemon off the live one) ·
-state file `/tmp/dictate.recording` · logs `/tmp/dictate.log`, `/tmp/dictate-editor.log`.
+logs `/tmp/dictate.log`, `/tmp/dictate-editor.log`.
 
 ## Architecture
 
@@ -219,7 +221,9 @@ the editor supersedes live-preview-during-take.)
   to likely errors. whisper's per-token `p` (`whisper_full_get_token_p`) is pulled in
   `run_whisper_tok`, mapped tokens→words by `conf::words_confidence` (min-prob over each
   word's bytes; `src/dictate_conf.h`, unit-tested), assembled per-word in `finish()`,
-  then carried daemon→editor over the `--conf` argv (serialized ints). It is **re-aligned onto
+  then carried daemon→editor over the `--conf` argv (serialized ints — the transcript itself
+  travels over the editor's **stdin** (`--stdin`), never argv: argv is `ps`-visible to every
+  local user, and the dictated text is the one thing everything else here keeps private). It is **re-aligned onto
   the post-`finalize_transcript` tokenization** (`conf::realign`) since normalize re-cases
   words / rewrites punctuation; a count drift disables the highlight (never mis-paints).
   Voice-corrected/inserted words become confident (`EM_CONF_SURE`). Threshold + colour are
@@ -320,7 +324,7 @@ all UI on the **main thread**:
   `fork` — Metal + threads; `--replace` makes the child wait for our socket to vanish instead of
   bowing out as a duplicate) and only then tears down. So a failed spawn aborts the restart with
   nothing dropped (a wedged daemon beats no daemon), and under launchd nothing is spawned at all
-  (`XPC_SERVICE_NAME` → `KeepAlive` is the successor). Teardown — unlink socket + state file —
+  (`XPC_SERVICE_NAME` → `KeepAlive` is the successor). Teardown — unlink the socket —
   runs exactly once (`g_torn_down`), so a forced second caller can't unlink the successor's fresh
   socket, and the editor child is `SIGTERM`ed (`g_editor_pid`): a fresh daemon has no
   `g_target_app` and re-registers ⌘⇧D, so an orphan would paste into the wrong app. `g_restarting`
@@ -403,9 +407,9 @@ all UI on the **main thread**:
   first wins and the loser bows out via the single-instance guard — but if the loser is the launchd
   job, `KeepAlive` re-runs it every ~10 s until the other daemon exits. Not worth a lock file today.
 
-The Unix socket + client verbs stay (scripts/tests). `/tmp/dictate.recording` is
-still touched while capture is live — a cheap external flag; nothing reads it now
-that Hammerspoon is gone. `~/.hammerspoon/init.lua` no longer references dictate (its
+The Unix socket + client verbs stay (scripts/tests). The old `/tmp/dictate.recording`
+state file (and the per-take thread that touched it) is gone — nothing read it once
+Hammerspoon left; `g_sess->live` is the in-process signal. `~/.hammerspoon/init.lua` no longer references dictate (its
 dictate block was removed, `clip2vps` kept); the prior version is archived at
 `~/.hammerspoon/init.lua.pre-dictate-removal.bak`.
 
@@ -472,11 +476,19 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
 - `WHISPER_THREADS=N` overrides the CPU-thread count. Default = performance-core
   count (`hw.perflevel0.physicalcpu`), not all logical cores: the workload is
   GPU-bound so thread count barely matters, and this keeps whisper off the E-cores.
-- `DICTATE_IDLE_UNLOAD_SEC=N` (default OFF / `0`) — free the ~573 MB resident model after
-  N seconds with no take, reloading on demand on the next take (~600 ms–1 s). Trades the
-  resident-speed win for memory when idle (gotcha #7). The idle gate (`src/dictate_idle.h`,
-  unit-tested — gotcha #19) is polled by an `NSTimer` at `idle_poll_interval_sec(N)`
-  (timeout/3, clamped to 1–10 s).
+- `DICTATE_IDLE_UNLOAD_SEC=N` (built-in default OFF / `0`, **`3600` in the installed plist**) —
+  free the ~573 MB resident model after N seconds with no take, reloading on demand on the next
+  take (~300–600 ms, on the main queue, BEFORE the mic starts — ten times the mic start itself).
+  Trades the resident-speed win for memory when idle (gotcha #7). The plist used to say 300 s,
+  and over a week that made 8 of 10 takes pay the reload (measured 2026-09-02); an hour keeps
+  the model warm through a working session and still frees it overnight. The idle gate
+  (`src/dictate_idle.h`, unit-tested — gotcha #19) is polled by an `NSTimer` at
+  `idle_poll_interval_sec(N)` (timeout/3, clamped to 1–10 s).
+- `DICTATE_LOG=1` (default OFF, **on in the installed plist**) — owner-only daily NDJSON take
+  logs under `~/.local/share/dictate/logs/YYYY-MM-DD.ndjson` (0600): take start/cancel, raw +
+  normalized transcript, editor accept/cancel, each mini-take correction with what it replaced.
+  Pruned to 7 days at daemon start (`TakeLogger::prune`, pure rules in `src/dictate_log.h`).
+  It is the corpus for WER work and for reconstructing what a take produced.
 - `DICTATE_WATCHDOG_SEC=N` (built-in default `30`, **`15` in the installed plist**, `0` = off,
   values < 10 clamp up to 10) — restart the daemon if the main run loop stops stamping its 1 Hz
   heartbeat for N seconds. The pure gate is `src/dictate_watchdog.h` (unit-tested); see the

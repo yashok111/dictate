@@ -77,10 +77,6 @@ tsan: $(SRC) Makefile
 asan: $(SRC) Makefile
 	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -g $(SRC) -o $(BIN)-asan $(LDFLAGS)
 
-# Static analysis (skill: static-analysis) — clang-tidy reads the build flags after `--`.
-tidy: $(SRC)
-	clang-tidy $(SRC) -- $(CXXFLAGS)
-
 # ── Unit tests (doctest; skill: cpp-testing) ─────────────────────────────────────
 # Compiles the pure-logic units extracted into src/dictate_*.h against the doctest
 # harness. Deliberately links NO whisper/ggml/AVFoundation/AppKit — the tested logic is
@@ -91,14 +87,26 @@ tidy: $(SRC)
 TEST_CXX    ?= c++
 TEST_BIN    := tests/run
 TEST_SRCS   := $(wildcard tests/*.cpp)
+TEST_OBJS   := $(TEST_SRCS:.cpp=.o)
 TEST_CXXFLAGS := -std=c++17 -O0 -g -Wall -Wextra -Wshadow -pthread -I src -I tests
 
-test:
-	$(TEST_CXX) $(TEST_CXXFLAGS) $(TEST_SRCS) -o $(TEST_BIN)
+# One object per test TU with compiler-generated header deps (-MMD), so an edit to one
+# src/dictate_*.h or tests/test_*.cpp rebuilds only what includes it. A single-command build
+# re-parsed the 314 KB doctest.h in every TU on every run (~9 s); incremental is ~1 s.
+# Parallel-safe: `make -j test`.
+tests/%.o: tests/%.cpp
+	$(TEST_CXX) $(TEST_CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(TEST_BIN): $(TEST_OBJS)
+	$(TEST_CXX) $(TEST_CXXFLAGS) $^ -o $@
+
+test: $(TEST_BIN)
 	./$(TEST_BIN)
 
-clean:
-	rm -f $(BIN) $(BIN)-tsan $(BIN)-asan $(TEST_BIN)
-	rm -rf $(BIN).dSYM $(BIN)-tsan.dSYM $(BIN)-asan.dSYM
+-include $(TEST_OBJS:.o=.d)
 
-.PHONY: run post-build-check deploy clean tsan asan tidy test
+clean:
+	rm -f $(BIN) $(BIN)-tsan $(BIN)-asan $(TEST_BIN) tests/*.o tests/*.d
+	rm -rf $(BIN).dSYM $(BIN)-tsan.dSYM $(BIN)-asan.dSYM $(TEST_BIN).dSYM
+
+.PHONY: run post-build-check deploy clean tsan asan test

@@ -97,7 +97,6 @@
 // clashing with the installed daemon (default /tmp/dictate.sock).
 static const std::string SOCK_PATH_S = getenv("DICTATE_SOCK") ? getenv("DICTATE_SOCK") : "/tmp/dictate.sock";
 static const char *SOCK_PATH  = SOCK_PATH_S.c_str();
-static const char *STATE_FILE = "/tmp/dictate.recording";   // present iff capture is live
 
 // VAD / segmentation tuning (FRAME, SPEECH_FACTOR, ABS_FLOOR, SPEECH_CONFIRM_FR,
 // SILENCE_CLOSE_FR, PREROLL_FR, MAX_SEG_FR) + the pure energy-VAD state machine moved to
@@ -109,7 +108,6 @@ static const int    MAX_TAKE_SEC      = 120;     // hard cap on ONE take's buffe
 // Daemon spawn / liveness polling — named to avoid magic numbers (ES.45).
 static const int    DAEMON_POLL_TRIES = 300;          // ~6 s total (covers the model-load window)
 static const long   DAEMON_POLL_NS    = 20*1000*1000; // 20 ms between client connect attempts
-static const long   LIVE_POLL_NS      = 10*1000*1000; // 10 ms between live-flag checks
 
 static double now_ms(void) { return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1.0e6; }
 // Sleep-EXCLUDING monotonic clock, for the main-thread watchdog only. CLOCK_MONOTONIC keeps
@@ -214,6 +212,8 @@ static int default_threads(void) {
 
 static std::string g_vad_model;       // Silero VAD model path; empty → VAD disabled
 static std::string g_initial_prompt;  // user-dictionary lexical bias (whisper initial_prompt); empty → none
+static bool        g_daemon_logs = false;   // set by run_daemon: StreamingSession logs per-segment decode timings
+                                            // (stamped slog lines are noise on the interactive --file path)
 
 // whisper context params shared by daemon + --file paths. Flash attention runs the
 // attention on Metal with far less memory traffic — measured ~20% faster transcription
@@ -362,10 +362,17 @@ public:
 
     // Flush the open segment, drain the worker, return the assembled transcript.
     std::string finish() {
+        const double t0 = now_ms();
+        const double tailSec = (seg_.inSpeech && cur_.size() >= (size_t)FRAME) ? (double)cur_.size() / WHISPER_SAMPLE_RATE : 0.0;
+        size_t queued; { std::lock_guard<std::mutex> lk(qmu_); queued = q_.size(); }
         if (seg_.inSpeech && cur_.size() >= (size_t)FRAME) enqueue(std::move(cur_));
         cur_.clear(); seg_.inSpeech = false;
         { std::lock_guard<std::mutex> lk(qmu_); finishing_ = true; } qcv_.notify_all();
         if (worker_.joinable()) worker_.join();
+        // What the user actually waited for after ⌘⇧D: the open tail (decoded from scratch) plus
+        // whatever closed segments the worker had not caught up with. `stop:` alone can't tell.
+        if (g_daemon_logs) slog("finish: %.0f ms (tail %.1f s, %zu segment(s) still queued at stop)\n",
+                                now_ms() - t0, tailSec, queued);
 
         std::string joined; conf_.clear();
         { std::lock_guard<std::mutex> lk(tmu_);
@@ -477,7 +484,13 @@ private:
                 seg = std::move(q_.front()); q_.pop();   // a queued segment outranks finishing → drain it
             }
             if (canceled_) continue;
+            const double t0 = now_ms();
             WhisperOut wt = run_whisper_tok(ctx_, seg, lang_.c_str(), nthreads_);
+            // Per-segment decode time: the only number that says whether the worker keeps up with
+            // speech (a segment decoding slower than it was spoken means finish() will wait), and
+            // the input for tuning MAX_SEG_FR / SILENCE_CLOSE_FR.
+            if (g_daemon_logs) slog("seg %zu: %.1f s audio → %.0f ms decode\n",
+                                    nseg_.fetch_add(1) + 1, (double)seg.size() / WHISPER_SAMPLE_RATE, now_ms() - t0);
             std::vector<float> cw;   // per-word confidence (computed outside tmu_ to keep the lock tight)
             if (!wt.text.empty()) cw = conf::words_confidence(wt.tokens);
             { std::lock_guard<std::mutex> lk(tmu_);
@@ -497,6 +510,7 @@ private:
     std::vector<std::vector<float>> recycle_;   // pool of pre-reserved segment buffers the worker returns and the tap reuses (guarded by qmu_; gotcha #6)
     Segmenter seg_;                      // pure energy-VAD scalar state machine (src/dictate_vad.h)
     std::atomic<bool> capped_{false};    // feed() hit MAX_TAKE_SEC and dropped audio (set on the tap thread, relaxed)
+    std::atomic<size_t> nseg_{0};        // segments decoded so far (worker; read by finish() for its log line)
     std::queue<std::vector<float>> q_;
     mutable std::mutex qmu_, tmu_;
     std::condition_variable qcv_;
@@ -521,6 +535,7 @@ static void on_audio_poisoned(const char *what);   // CoreAudio told us the proc
 - (BOOL)startFeeding:(StreamingSession *)sess error:(NSError **)err;
 - (void)stop;
 - (void)debugReconfigure;   // debug: run the route-change path on demand (see the `reconfig` verb)
+- (NSString *)activeInputName;   // name of the device the running engine reads from ("" if none); main only
 @end
 
 // ── input-device pinning ─────────────────────────────────────────────────────
@@ -590,6 +605,18 @@ static AudioDeviceID find_builtin_input_device(void) {
     }
     return kAudioObjectUnknown;
 }
+// Human-readable name of a HAL device (kAudioObjectPropertyName), "" if it can't be read. One
+// synchronous coreaudiod round-trip — call it once per engine start and cache, never per frame.
+static NSString *hal_device_name(AudioDeviceID dev) {
+    if (dev == kAudioObjectUnknown) return @"";
+    CFStringRef name = nullptr; UInt32 sz = sizeof(name);
+    AudioObjectPropertyAddress addr = { kAudioObjectPropertyName,
+                                        kAudioObjectPropertyScopeGlobal,
+                                        kAudioObjectPropertyElementMain };
+    if (AudioObjectGetPropertyData(dev, &addr, 0, nullptr, &sz, &name) != noErr || !name) return @"";
+    return CFBridgingRelease(name) ?: @"";
+}
+
 // Pin `engine`'s input to the built-in mic. Returns YES only when it actually CHANGED the
 // device — that mutates the engine config and posts exactly ONE configuration-change
 // notification, which -reconfigure must swallow (else every take rebuilds capture for nothing).
@@ -641,7 +668,7 @@ static BOOL prefer_builtin_input(AVAudioEngine *engine, AudioDeviceID *cache) {
 // permission the second attempt just returns the same error.
 static BOOL capture_err_is_recoverable(NSError *e) {
     if (!e) return NO;
-    if (e.code == 1937010544) return YES;                                 // 'stop' — HAL not running
+    if (e.code == kAudioHardwareNotRunningError) return YES;              // 'stop' (1937010544) — HAL not running
     return [e.domain isEqualToString:@"dictate"] && e.code == 1;          // 0 Hz input format
 }
 
@@ -657,6 +684,7 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     AudioDeviceID     _pinnedDev;      // built-in mic found for THIS engine; reused on a rebuild instead of re-enumerating
     BOOL              _engineSuspect;  // this engine did NOT end up on _pinnedDev → don't keep it past the take
     AVAudioFormat    *_inFmt;          // hardware input format, cached per engine (see -installTapAndStart:)
+    NSString         *_devName;        // name of the device the STARTED engine reads from (banner «Вход: …»); nil until then
     double            _tBuild, _tFmt, _tStart;   // per-step mic-start timings, ms (logged on success)
     std::shared_ptr<std::atomic<int>> _tapGuard;   // in-flight tap-callback count; -stop waits it to 0
 }
@@ -756,6 +784,7 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     }
     _conv  = nil;
     _inFmt = nil;   // the cached hardware format described the engine we just dropped
+    _devName = nil;
     _engineSuspect = NO;
 }
 // Start; on a stale-HAL-shaped failure rebuild the whole engine and try ONCE more.
@@ -863,9 +892,12 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     // The timings ride along: they are the only per-take record of how long CoreAudio took, and
     // a mic start creeping from ~100 ms toward the DICTATE_TAKESTART_SEC budget is the warning
     // that used to be invisible until the daemon was already being restarted mid-take.
-    slog("capture live: device %u, %.0f Hz, %u ch (engine %.0f ms, fmt %.0f ms, start %.0f ms)\n",
-         (unsigned)input.AUAudioUnit.deviceID, inFmt.sampleRate, (unsigned)inFmt.channelCount,
-         _tBuild, _tFmt, _tStart);
+    // The banner's «Вход: …» line names THIS device — not the system default, which is precisely
+    // the device the built-in-mic pin exists to avoid (BlackHole / Teams Audio / AirPods).
+    _devName = hal_device_name(input.AUAudioUnit.deviceID);
+    slog("capture live: device %u (%s), %.0f Hz, %u ch (engine %.0f ms, fmt %.0f ms, start %.0f ms)\n",
+         (unsigned)input.AUAudioUnit.deviceID, _devName.UTF8String ?: "?", inFmt.sampleRate,
+         (unsigned)inFmt.channelCount, _tBuild, _tFmt, _tStart);
     if (_tBuild + _tFmt + _tStart > MIC_START_SLOW_MS)
         slog("⚠ mic start took %.1f s — CoreAudio is degrading (ADR-0024); the take-start deadline "
              "is %d s\n", (_tBuild + _tFmt + _tStart)/1000.0, g_takestart_sec);
@@ -926,14 +958,11 @@ static BOOL capture_err_is_recoverable(NSError *e) {
 // the engine, and it is the one branch of the persistent-engine design that no test and no
 // `--file` run can reach — a real route change means physically unplugging something.
 - (void)debugReconfigure { [self reconfigure]; }
+- (NSString *)activeInputName { return _devName ?: @""; }
 - (void)dealloc {   // safety net: if startFeeding: failed after registering the observer, -stop is never
     if (_cfgObs) [[NSNotificationCenter defaultCenter] removeObserver:_cfgObs];   // called → remove it here
 }
 @end
-
-// ── state file (Hammerspoon reads it natively to know capture is live) ────────
-static void touch_state(void){ int fd=open(STATE_FILE,O_CREAT|O_WRONLY|O_CLOEXEC|O_NOFOLLOW,0600); if(fd>=0) close(fd); }
-static void clear_state(void){ unlink(STATE_FILE); }
 
 // ── local text logs: owner-only daily NDJSON under ~/.local/share/dictate/logs ──
 struct TakeMeta {
@@ -1134,8 +1163,6 @@ static std::string g_lang = "ru";
 static Recorder *g_rec = nil;
 static std::unique_ptr<StreamingSession> g_sess;
 static std::mutex g_mu;                 // guards g_sess / recording transitions
-static std::thread g_liveWatch;         // touches STATE_FILE once capture is live
-static std::atomic<bool> g_liveWatchStop{false};
 static std::atomic<bool> g_finishing{false};   // an async stop (hotkey/timer) is still finalizing a take
                                                // on g_ctx; refuse a new take until it clears, so two
                                                // workers never touch the whisper context (gotcha #5)
@@ -1195,7 +1222,8 @@ static bool ensure_model_loaded(void) {
 - (void)requestStop;                                       // main; async finish+paste (hotkey/menubar)
 - (DetachedTake)stopDetachForSocket;                       // main; hand the take to the socket thread
 - (void)stopFinishedWithText:(NSString *)ns conf:(NSString *)conf takeId:(NSString *)takeId;  // main; open editor + per-word confidence
-- (void)cancel;                                            // main
+- (void)cancel;                                            // main; user-initiated (Esc / menu / `cancel` verb)
+- (void)cancelWithReason:(const char *)reason;             // main; same, with the take-log reason spelled out
 - (void)toggle;                                            // main; one entry for hotkey/menubar/socket
 - (void)showHint:(NSString *)h;                                  // main; transient banner hint (paste fallback)
 - (void)editorAccept:(NSString *)text;                          // main; editor accepted → refocus target + paste
@@ -1215,7 +1243,7 @@ static void spawn_editor(NSString *transcript, NSString *conf);    // defined in
 // A mid-take device/route change whose capture rebuild failed (Recorder reconfigure): the mic is
 // dead, so stop the take cleanly (instead of dribbling to the 60 s cap) and tell the user. Main thread.
 static void on_capture_lost(void) {
-    [g_ctrl cancel];
+    [g_ctrl cancelWithReason:"capture_lost"];
     [g_ctrl showHint:@"⚠ устройство ввода изменилось — запись прервана"];
 }
 
@@ -1376,7 +1404,7 @@ static std::string daemon_start(const char *kind) {
         // the HAL itself is wedged system-wide (a stuck virtual device, a hung input) — a fresh
         // process fails too and only a coreaudiod restart clears it. Say so instead of leaving
         // the user with a bare OSStatus.
-        if (err.code == 1937010544) msg += "\nCoreAudio завис — выполни: sudo killall coreaudiod";
+        if (err.code == kAudioHardwareNotRunningError) msg += "\nCoreAudio завис — выполни: sudo killall coreaudiod";
         g_sess.reset();   // dtor joins the worker — safe (was: delete on a live thread → std::terminate).
         return msg;       // g_rec STAYS: it is the daemon's, not the take's, and -startFeeding:
                           // already cleared its session pointer and dropped the engine on the way out.
@@ -1384,30 +1412,11 @@ static std::string daemon_start(const char *kind) {
     tsGuard.disarm();   // CoreAudio returned — everything below is out of scope for both watchers
     g_active_take = g_take_logger.start(kind);
     g_has_active_take = !g_active_take.id.empty();
-    // touch STATE_FILE only once real audio flows. The native warm-up poll
-    // (DictateController warmTick) reads g_sess->live directly; the file is now just a
-    // cheap external "is-recording" flag for scripts/debugging.
-    // Self-defend: std::thread::operator= calls std::terminate() if the target is still
-    // joinable. The stop/cancel paths join it, but don't rely on that invariant here —
-    // join any prior watch locally so a new entry path can never crash the daemon.
-    if (g_liveWatch.joinable()) { g_liveWatchStop.store(true); g_liveWatch.join(); }
-    g_liveWatchStop.store(false);
-    StreamingSession *s = g_sess.get();   // non-owning; the watch is joined before g_sess is released
-    g_liveWatch = std::thread([s]{
-        while (!g_liveWatchStop.load()) {
-            if (s->live.load()) { touch_state(); return; }
-            struct timespec ts{0, LIVE_POLL_NS}; nanosleep(&ts, nullptr);
-        }
-    });
+    // The native warm-up poll (DictateController warmTick) reads g_sess->live directly.
     return "";
 }
 
-static void stop_live_watch(void) {
-    g_liveWatchStop.store(true);
-    if (g_liveWatch.joinable()) g_liveWatch.join();
-}
-
-// Detach the current take: stop the engine + live-watch + state file (quick, main-thread
+// Detach the current take: stop the engine (quick, main-thread
 // safe), and hand the session back so the caller runs the blocking finish() OFF the main
 // thread (finish() joins the worker and must not freeze the Cocoa run loop).
 static DetachedTake daemon_stop_detach(void) {
@@ -1419,7 +1428,6 @@ static DetachedTake daemon_stop_detach(void) {
                                           // concurrent start/feedfile can't slip a 2nd worker onto g_ctx
     if (!out.session) return {};
     [r stop];
-    stop_live_watch(); clear_state();
     return out;
 }
 
@@ -1430,7 +1438,6 @@ static void daemon_cancel(const char *reason) {
       if (take.session) g_finishing.store(true); }   // block a new take until the detached cancel frees g_ctx (gotcha #5)
     if (!take) return;
     [r stop];
-    stop_live_watch(); clear_state();
     log_take_cancel(take.meta, take.session->seconds(), reason);
     // cancel() joins the whisper worker, which can be mid-whisper_full (~1-2 s). Run it OFF the main
     // thread so Esc-cancel / corr-cancel / editor-cancel don't freeze the run loop (mirrors requestStop's
@@ -1610,7 +1617,7 @@ static std::atomic<bool> g_replacement_spawned{false};   // someone CLAIMED the 
 static std::atomic<bool> g_replacement_ready{false};     // …and here it actually succeeded
 static std::atomic<unsigned long long> g_restart_gen{0}; // bumped when a restart aborts, so its
                                                          // armed deadline/force threads stand down
-static std::atomic<bool> g_torn_down{false};       // socket + state file already dropped by whoever got here first
+static std::atomic<bool> g_torn_down{false};       // socket already dropped by whoever got here first
 static std::atomic<pid_t> g_editor_pid{0};         // live `dictate editor` child, so a restart doesn't orphan it
 // Aborted restarts hold the AUTOMATIC triggers off for a bit (src/dictate_watchdog.h,
 // wd_in_backoff): main is still wedged when a restart aborts, so without this both watchers
@@ -1675,10 +1682,10 @@ static void restart_process_now(const char *reason) {
             }
         }
     }
-    // 2) Hand over: drop the socket + state file exactly once (a forced second caller must NOT
-    //    unlink the successor's freshly bound socket), and take the editor child with us — a fresh
+    // 2) Hand over: drop the socket exactly once (a forced second caller must NOT unlink the
+    //    successor's freshly bound socket), and take the editor child with us — a fresh
     //    daemon has no g_target_app and re-registers ⌘⇧D, so an orphaned editor would misbehave.
-    if (!g_torn_down.exchange(true)) { unlink(SOCK_PATH); clear_state(); }
+    if (!g_torn_down.exchange(true)) unlink(SOCK_PATH);
     pid_t ed = g_editor_pid.load();
     if (ed > 0) kill(ed, SIGTERM);
     _exit(0);
@@ -1699,7 +1706,7 @@ static std::string daemon_feed_audio(const std::vector<float> &audio) {
     size_t step = WHISPER_SAMPLE_RATE/10;                    // 100 ms chunks
     for (size_t i=0;i<audio.size();i+=step)
         g_sess->feed(audio.data()+i, std::min(step, audio.size()-i));
-    g_sess->live.store(true); touch_state();
+    g_sess->live.store(true);
     return "";
 }
 
@@ -1839,7 +1846,8 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     NSRunningApplication *app = g_target_app; g_target_app = nil; // release the retained target once used
     if (app) [app activateWithOptions:NSApplicationActivateAllWindows];
 }
-- (void)cancel { unregister_esc(); [self stopTimer]; daemon_cancel("user"); [self hideUI]; }
+- (void)cancel { [self cancelWithReason:"user"]; }
+- (void)cancelWithReason:(const char *)reason { unregister_esc(); [self stopTimer]; daemon_cancel(reason); [self hideUI]; }
 - (void)toggle {
     if (g_editor_open.load()) return;                            // editor owns ⌘⇧D while open (hotkey unregistered)
     bool rec; { std::lock_guard<std::mutex> lk(g_mu); rec = (bool)g_sess; }
@@ -1928,12 +1936,11 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     [self layoutForTextHeight:textH];
     [_banner orderFrontRegardless];
 }
-- (NSString *)currentInputSourceName {
-    AVCaptureDevice *dev = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-    NSString *name = dev.localizedName ?: dev.uniqueID;
-    if (!name.length) return @"";
-    return name;
-}
+// The device the RUNNING engine reads from, cached by the Recorder at engine start. It used to
+// ask AVCaptureDevice for the system default input — which is a different device whenever the
+// built-in-mic pin has done its job (default on BlackHole / AirPods, capture on the MacBook mic),
+// so the banner named the wrong one; and it was one more CoreAudio round-trip on main per take.
+- (NSString *)currentInputSourceName { return [g_rec activeInputName] ?: @""; }
 - (NSString *)captureHeader:(NSString *)status controls:(NSString *)controls {
     std::string text = capture_banner_text(status.UTF8String ?: "",
                                            [self currentInputSourceName].UTF8String ?: "",
@@ -2474,7 +2481,8 @@ static void socket_accept_loop(int srv) {
 
 static int run_daemon(const std::string &modelPath, bool replacing) {
     signal(SIGPIPE, SIG_IGN);   // a client that disconnects mid-reply must not kill the daemon
-    umask(0077);                // daemon-created files (socket, state file, editor log) → owner-only, not world-readable
+    g_daemon_logs = true;       // per-segment decode + finish() timings go to /tmp/dictate.log
+    umask(0077);                // daemon-created files (socket, editor log) → owner-only, not world-readable
     g_take_logger.prune();
     // single instance: if a daemon already answers, bow out. EXCEPT when we were spawned as a
     // replacement (`daemon --replace`): the outgoing daemon is still listening at that moment
@@ -3053,29 +3061,39 @@ static std::string editor_request(const std::string &line) {
     while (!reply.empty() && (reply.back()=='\n'||reply.back()=='\r')) reply.pop_back();
     return reply;
 }
-// daemon → editor: spawn `dictate editor --from-daemon <transcript>`. posix_spawn (not fork+exec):
+// daemon → editor: spawn `dictate editor --from-daemon --stdin --conf <ints>`, transcript on stdin. posix_spawn (not fork+exec):
 // the daemon is multithreaded with Metal loaded, so a bare fork trips the ObjC fork-safety abort.
+// The transcript goes over a PIPE on the editor's stdin, not argv: argv is world-readable (`ps`
+// shows every user's command lines), and the dictated text is the one thing everything else here
+// keeps private (0600 take logs, 0700 wedge dir, edlog never prints words). `--conf` stays in argv:
+// digits and commas, nothing to leak. The write happens on the reaper thread — a transcript is a
+// few KB against a 64 KB pipe buffer, but the main queue must not be the one to find out otherwise.
 static void spawn_editor(NSString *transcript, NSString *conf) {
     std::string self = self_path();
     std::string t = transcript.UTF8String ?: "";
     std::string c = conf.UTF8String ?: "";   // serialized per-word confidence (comma-separated ints), may be empty
+    int pfd[2];
+    if (pipe(pfd) != 0) { slog("spawn_editor: pipe failed (%s)\n", strerror(errno)); return; }
+    fcntl(pfd[0], F_SETFD, FD_CLOEXEC); fcntl(pfd[1], F_SETFD, FD_CLOEXEC);   // only the dup2 below crosses
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null",                O_RDONLY,                  0);
+    posix_spawn_file_actions_adddup2(&fa, pfd[0], 0);                                   // read end → editor stdin
     posix_spawn_file_actions_addopen(&fa, 1, "/tmp/dictate-editor.log",  O_CREAT|O_WRONLY|O_APPEND|O_NOFOLLOW, 0600);
     posix_spawn_file_actions_adddup2(&fa, 1, 2);
-    // `--conf <ints>` BEFORE the transcript so the editor consumes its value as a flag (the
-    // transcript words are the trailing positional args). conf is digits/commas → argv-safe.
-    char *argv[] = { (char*)"dictate", (char*)"editor", (char*)"--from-daemon",
-                     (char*)"--conf", (char*)c.c_str(), (char*)t.c_str(), nullptr };
-    pid_t pid;
+    char *argv[] = { (char*)"dictate", (char*)"editor", (char*)"--from-daemon", (char*)"--stdin",
+                     (char*)"--conf", (char*)c.c_str(), nullptr };
+    pid_t pid = 0;
     int rc = posix_spawn(&pid, self.c_str(), &fa, nullptr, argv, *_NSGetEnviron());
     posix_spawn_file_actions_destroy(&fa);
+    close(pfd[0]);   // ours is done either way: the child holds its own copy (or never existed)
     slog("spawn_editor rc=%d pid=%d\n", rc, (int)pid);
-    if (rc == 0) {
+    if (rc != 0) { close(pfd[1]); return; }
+    {
         g_editor_pid.store(pid);   // so a restart can take the editor with it instead of orphaning it
+        const int wfd = pfd[1];
         // Reap the child AND recover if it dies WITHOUT sending accept/editor-cancel (crash, ⌘Q):
         // otherwise g_editor_open stays true and ⌘⇧D stays unregistered → daemon wedged.
-        std::thread([pid]{
+        std::thread([pid, wfd, t]{
+            write_all(wfd, t.data(), t.size()); close(wfd);   // EOF is the editor's end-of-transcript
             int st; while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
             pid_t mine = pid;                                // the lambda capture is const; CAS needs an lvalue
             g_editor_pid.compare_exchange_strong(mine, 0);   // reaped → the pid is no longer ours to signal
@@ -3220,11 +3238,17 @@ int main(int argc, char **argv) {
 
         // ---- foreground voice-editor (Phase 3; transcript from argv for now) ----
         if (verb=="editor") {
-            bool fromDaemon=false; NSMutableString *t = [NSMutableString string]; NSString *confStr=@"";
+            bool fromDaemon=false, fromStdin=false; NSMutableString *t = [NSMutableString string]; NSString *confStr=@"";
             for (int i=2;i<argc;i++){ if(!strcmp(argv[i],"--from-daemon")){ fromDaemon=true; continue; }
+                if(!strcmp(argv[i],"--stdin")){ fromStdin=true; continue; }   // transcript arrives on stdin (daemon spawn — keeps it out of `ps`)
                 if(!strcmp(argv[i],"--conf")){ if(i+1<argc) confStr=[NSString stringWithUTF8String:argv[++i]]?:@""; continue; }   // consume its value
                 if(!strncmp(argv[i],"--",2)) continue;
                 if (t.length) [t appendString:@" "]; [t appendString:[NSString stringWithUTF8String:argv[i]]?:@""]; }
+            if (fromStdin) {   // slurp to EOF; the daemon closes its end right after the write
+                std::string in; char b[4096];
+                for (;;){ ssize_t r=read(0,b,sizeof(b)); if(r>0){ in.append(b,(size_t)r); continue; } if(r<0&&errno==EINTR) continue; break; }
+                t = [NSMutableString stringWithString:[NSString stringWithUTF8String:in.c_str()] ?: @""];
+            }
             return run_editor(t.length ? t : @"привет это проверка редактора", fromDaemon, confStr);
         }
 

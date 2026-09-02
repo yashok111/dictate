@@ -38,8 +38,7 @@ dictate --file a.wav          one-shot, no daemon: stream a 16 kHz mono WAV
 dictate --file a.wav --once   one-shot, single-pass (A/B comparison)
 ```
 
-Socket: `/tmp/dictate.sock` · state file (capture-is-live): `/tmp/dictate.recording`
-· daemon log: `/tmp/dictate.log`.
+Socket: `/tmp/dictate.sock` · daemon log: `/tmp/dictate.log`.
 
 ## Build
 
@@ -294,15 +293,16 @@ python3 scripts/bench-wer.py --clips bench/clips
 The daemon keeps the model resident (~573 MB of Metal memory) so every take is fast — no
 per-take reload. If you'd rather reclaim that memory when you're not dictating, set
 `DICTATE_IDLE_UNLOAD_SEC=N`: after `N` seconds with no take, the daemon frees the model, and
-the **next** take reloads it on demand (a one-time ~0.5–1 s wait before that take starts).
+the **next** take reloads it on demand (a one-time ~0.3–0.6 s wait before that take starts).
 
 ```sh
-# free the model after 5 minutes idle (set in the LaunchAgent plist's env, then reload)
-DICTATE_IDLE_UNLOAD_SEC=300
+# free the model after an hour idle (set in the LaunchAgent plist's env, then reload)
+DICTATE_IDLE_UNLOAD_SEC=3600
 ```
 
 Off by default — the resident model is the whole point of the daemon, so unloading is an
-explicit memory-vs-latency trade-off you opt into.
+explicit memory-vs-latency trade-off you opt into. Pick a timeout longer than your usual
+gap between takes: at 5 minutes, most takes in a working session ended up paying the reload.
 
 ## Roadmap
 
