@@ -75,6 +75,12 @@ fi
 if launchctl print "$service" >/dev/null 2>&1; then
   if [[ $plist_changed -eq 1 ]]; then
     launchctl bootout "$service" || true
+    # bootout returns before the service is gone; bootstrapping too early fails with
+    # "Bootstrap failed: 5: Input/output error". Wait (up to ~10 s) for it to disappear.
+    for _ in $(seq 1 50); do
+      launchctl print "$service" >/dev/null 2>&1 || break
+      sleep 0.2
+    done
     launchctl bootstrap "gui/$(id -u)" "$plist"
     printf 're-bootstrapped %s (plist changed)\n' "$service"
   else

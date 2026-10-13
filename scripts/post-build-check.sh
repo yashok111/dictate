@@ -20,7 +20,8 @@ check_file() {
 check_signature() {
   local p="$1" name="$2"
   local sig ident
-  sig="$(codesign -dv "$p" 2>&1 || true)"
+  # -dvv, not -dv: the Authority= lines (checked below) are printed only at verbosity 2.
+  sig="$(codesign -dvv "$p" 2>&1 || true)"
   ident="$(printf '%s\n' "$sig" | awk -F= '/^Identifier=/{print $2; exit}')"
   if printf '%s\n' "$sig" | grep -q 'Signature=adhoc'; then
     bad "$name is ad-hoc signed"
