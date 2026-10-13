@@ -159,3 +159,24 @@ TEST_CASE("clamp_feed: MAX_TAKE_SEC truncation arithmetic") {
         CHECK(r.take == 0u); CHECK(r.capped == false);
     }
 }
+
+// ── forced-cut placement (bug-hunt F107, F042) ──
+TEST_CASE("cut_tail_frames: carries the frames after the quietest recent frame") {
+    const double r1[] = {0.5, 0.4, 0.1, 0.6, 0.7};          // quietest at index 2 → carry 2
+    CHECK(cut_tail_frames(r1, 5) == 2);
+    const double r2[] = {0.5, 0.6, 0.7};                     // quietest first → carry the rest
+    CHECK(cut_tail_frames(r2, 3) == 2);
+    const double r3[] = {0.7, 0.6, 0.2};                     // quietest last → cut at the cap
+    CHECK(cut_tail_frames(r3, 3) == 0);
+    const double r4[] = {0.2, 0.5, 0.2, 0.5};                // tie → the later one, shorter tail
+    CHECK(cut_tail_frames(r4, 4) == 1);
+    CHECK(cut_tail_frames(r1, 0) == 0);
+    CHECK(cut_tail_frames(r1, 1) == 0);
+}
+TEST_CASE("preroll_overflow_armed: holds tail + a full close of silence beyond the normal pre-roll") {
+    const std::size_t armed = (std::size_t)(PREROLL_FR + CUT_WIN_FR + SILENCE_CLOSE_FR) * FRAME;
+    CHECK(preroll_overflow_armed(armed) == 0);
+    CHECK(preroll_overflow_armed(armed + 7) == 7);
+    CHECK(preroll_overflow((std::size_t)(PREROLL_FR + 1) * FRAME) == (std::size_t)FRAME);   // the normal budget is unchanged
+}
+
