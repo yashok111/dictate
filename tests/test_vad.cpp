@@ -180,3 +180,32 @@ TEST_CASE("preroll_overflow_armed: holds tail + a full close of silence beyond t
     CHECK(preroll_overflow((std::size_t)(PREROLL_FR + 1) * FRAME) == (std::size_t)FRAME);   // the normal budget is unchanged
 }
 
+TEST_CASE("Segmenter: a louder room raises the floor; speech dips do not (bug-hunt F043)") {
+    Segmenter s;                                   // floor starts at 1e-4
+    for (int i = 0; i < 400; i++) s.observeIdle(0.05);   // a fan comes on: constant 0.05
+    CHECK_FALSE(s.isVoiced(0.05));                 // after ~6 s the fan is the new floor
+    Segmenter t;
+    for (int i = 0; i < 400; i++) t.observeIdle(i % 10 == 0 ? 0.001 : 0.2);   // speech with dips
+    CHECK(t.isVoiced(0.2));                        // dips keep the floor low → speech stays voiced
+}
+TEST_CASE("Segmenter: cap and pause on the same frame do not arm the contiguous seam (bug-hunt F108)") {
+    Segmenter s; s.inSpeech = true; s.silenceRun = SILENCE_CLOSE_FR - 1;
+    CHECK(s.observeSpeech(0.0, /*tooLong=*/true));
+    CHECK_FALSE(s.contiguousReopen);
+    Segmenter t; t.inSpeech = true;
+    CHECK(t.observeSpeech(0.5, true));             // cap mid-speech → armed
+    CHECK(t.contiguousReopen);
+}
+
+TEST_CASE("Segmenter: a raised floor never sits above what a room that was loud from the start gets (bug-hunt F043 review)") {
+    // The floor is raised to HALF the quiet level, then the ordinary idle adaptation takes over —
+    // so it ends where a take started in that room would be, never higher: the steady level reads
+    // as silence and speech clearly above it (SPEECH_FACTOR) reads as speech.
+    Segmenter raised;
+    for (int i = 0; i < 400; i++) raised.observeIdle(0.020);   // the room got louder mid-take
+    Segmenter fromStart; fromStart.noise = 0.020;               // the room was this loud all along
+    for (int i = 0; i < 400; i++) fromStart.observeIdle(0.020);
+    CHECK(raised.noise <= fromStart.noise + 1e-12);
+    CHECK_FALSE(raised.isVoiced(0.020));
+    CHECK(raised.isVoiced(0.080));
+}

@@ -40,9 +40,12 @@
         <key>DICTATE_WATCHDOG_SEC</key>
         <string>15</string>
     </dict>
+    <!-- Owner-only directory, NOT world-writable /tmp: launchd opens this path itself (no
+         O_NOFOLLOW), so another local user could plant a symlink at /tmp/dictate.log and have the
+         daemon's output appended to any file the owner can write. deploy.sh creates the dir. -->
     <key>StandardOutPath</key>
-    <string>/tmp/dictate.log</string>
+    <string>/Users/YOUR_USERNAME/.local/share/dictate/dictate.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/dictate.log</string>
+    <string>/Users/YOUR_USERNAME/.local/share/dictate/dictate.log</string>
 </dict>
 </plist>

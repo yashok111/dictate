@@ -96,6 +96,7 @@ def looks_like_loop(ref_n, hyp_words):
 def transcribe(binpath, wav, env_overrides, once, timeout):
     """Run the dictate binary on one WAV and return its stdout transcript."""
     env = dict(os.environ)
+    env["DICTATE_NO_CLIPBOARD"] = "1"   # `--file` otherwise copies every transcript to the clipboard
     env.update(env_overrides)
     args = [binpath, "--file", wav] + (["--once"] if once else [])
     try:
@@ -145,6 +146,10 @@ def main():
     if not clips:
         ap.error("no clips with references found in %r" % args.clips)
 
+    if args.dict and not os.path.isfile(os.path.expanduser(args.dict)):
+        # dictate silently builds no prompt from a missing file, so the "biased" run would be a
+        # second baseline and the verdict a meaningless "no change".
+        ap.error("--dict %r is not a file" % args.dict)
     biased_env = {"WHISPER_DICT": os.path.expanduser(args.dict)} if args.dict else {}
     biased_env.setdefault("WHISPER_PROMPT", "1")  # ensure not disabled by an inherited env
     once = not args.stream

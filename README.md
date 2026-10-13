@@ -1,7 +1,7 @@
 # dictate
 
 A small native macOS dictation tool in Objective-C++, with **streaming**
-transcription. Hold **⌘⇧D**, speak, press again to stop — it captures the microphone
+transcription. Press **⌘⇧D**, speak, press again to stop — it captures the microphone
 with **AVFoundation**, transcribes locally with **whisper.cpp** (libwhisper, Metal
 GPU), shows a **status banner** while you talk, then opens a **post-take voice editor**
 to review and fix the transcript (by voice or keyboard) and, on accept, **pastes** it
@@ -38,7 +38,8 @@ dictate --file a.wav          one-shot, no daemon: stream a 16 kHz mono WAV
 dictate --file a.wav --once   one-shot, single-pass (A/B comparison)
 ```
 
-Socket: `~/.local/share/dictate/dictate.sock` (owner-only directory) · daemon log: `/tmp/dictate.log`.
+Socket: `~/.local/share/dictate/dictate.sock` · daemon log: `~/.local/share/dictate/dictate.log`
+(both in an owner-only directory).
 
 ## Build
 
@@ -52,6 +53,25 @@ make
 Model path defaults to `~/.config/whisper/ggml-large-v3-turbo-q5_0.bin`
 (override with `$WHISPER_MODEL` / `--model`; language `$WHISPER_LANG` / `--lang`,
 default `ru`).
+
+### Models
+
+The build ships no model; download both into `~/.config/whisper/` once (pinned revisions,
+the same ones the transcriber app verifies):
+
+```sh
+mkdir -p ~/.config/whisper && cd ~/.config/whisper
+curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin
+curl -LO https://huggingface.co/ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin
+shasum -a 256 ggml-large-v3-turbo-q5_0.bin ggml-silero-v6.2.0.bin
+# 394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2  ggml-large-v3-turbo-q5_0.bin
+# 2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987  ggml-silero-v6.2.0.bin
+```
+
+The Silero VAD model is what keeps silence from hallucinating text: when
+`~/.config/whisper/ggml-silero-v6.2.0.bin` (or the older `ggml-silero-v5.1.2.bin`) is missing,
+the daemon runs without whisper's Silero VAD (its own energy VAD still segments). `$WHISPER_VAD_MODEL` points at another file; `WHISPER_VAD=0`
+disables it on purpose.
 
 ### Tests
 
@@ -151,7 +171,7 @@ restart the daemon. Fastest first:
      and the mic deadline is not armed at all until the microphone permission has been granted.
    - Before such a restart the daemon snapshots its own stuck stacks to
      `~/.local/share/dictate/wedge/wedge-<epoch>.txt` (`sample`, ~1.5 s). If it keeps happening,
-     that file plus the timestamped `/tmp/dictate.log` is what to look at — between them they say
+     that file plus the timestamped `~/.local/share/dictate/dictate.log` is what to look at — between them they say
      which thread was stuck and where. `DICTATE_WEDGE_SAMPLE=0` opts out.
 
 If a *fresh* daemon still gets no audio, the CoreAudio HAL itself is wedged — that one needs

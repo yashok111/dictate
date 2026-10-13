@@ -101,17 +101,34 @@ TEST_CASE("data chunk before fmt is rejected (got_fmt false)") {
     unlink(p.c_str());
 }
 
-TEST_CASE("absurd data chunk size (>256MB) is rejected without allocating") {
+TEST_CASE("absurd data chunk size is clamped to the file, never allocated (bug-hunt F046)") {
     std::vector<int16_t> pcm = {1,2,3};
-    // forge data size field to 300MB; the reader must refuse before allocating
+    // forge data size field to 300MB: the reader clamps it to the 6 bytes present
     std::string p = write_tmp(make_wav(1, 16000, 16, pcm, /*dataOverrideSize=*/300u*1024*1024));
     std::vector<float> out; uint32_t rate=0;
-    CHECK_FALSE(load_wav_pcm16(p.c_str(), out, &rate));
+    CHECK(load_wav_pcm16(p.c_str(), out, &rate));
+    CHECK(out.size() == 3u);
+    unlink(p.c_str());
+}
+TEST_CASE("a streamed WAV (data size 0xFFFFFFFF) loads what is present (bug-hunt F046)") {
+    std::vector<int16_t> pcm = {100, 200, 300, 400};
+    std::string p = write_tmp(make_wav(1, 16000, 16, pcm, /*dataOverrideSize=*/0xFFFFFFFFL));
+    std::vector<float> out; uint32_t rate=0;
+    CHECK(load_wav_pcm16(p.c_str(), out, &rate));
+    CHECK(out.size() == 4u);
     unlink(p.c_str());
 }
 
-TEST_CASE("truncated data chunk (size claims more than present) is rejected") {
+TEST_CASE("truncated data chunk (size claims more than present) loads the samples present (bug-hunt F046)") {
     std::vector<int16_t> pcm = {1,2,3};
+    std::string p = write_tmp(make_wav(1, 16000, 16, pcm, /*dataOverrideSize=*/2000));
+    std::vector<float> out; uint32_t rate=0;
+    CHECK(load_wav_pcm16(p.c_str(), out, &rate));
+    CHECK(out.size() == 3u);
+    unlink(p.c_str());
+}
+TEST_CASE("a data chunk with no sample at all is still rejected") {
+    std::vector<int16_t> pcm = {};
     std::string p = write_tmp(make_wav(1, 16000, 16, pcm, /*dataOverrideSize=*/2000));
     std::vector<float> out; uint32_t rate=0;
     CHECK_FALSE(load_wav_pcm16(p.c_str(), out, &rate));

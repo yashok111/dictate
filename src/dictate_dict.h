@@ -53,7 +53,11 @@ inline std::size_t estimate_tokens(const std::string &s) {
 //   • leading/trailing ASCII whitespace (space/tab/CR/LF) is trimmed.
 //   • blank lines (after comment-strip + trim) are skipped.
 //   • exact duplicates (after trim) are dropped, keeping the FIRST (highest-priority) one.
-inline std::vector<std::string> parse_dictionary(const std::string &content) {
+inline std::vector<std::string> parse_dictionary(const std::string &content_in) {
+    // A UTF-8 BOM (older Notepad, some editors) would glue onto line 1 and defeat its '#'
+    // comment check, making the header comment the top-priority prompt entry.
+    const bool bom = content_in.size() >= 3 && content_in.compare(0, 3, "\xEF\xBB\xBF") == 0;
+    const std::string content = bom ? content_in.substr(3) : content_in;
     std::vector<std::string> out;
     std::unordered_set<std::string> seen;            // O(1) dedup membership; `out` keeps order
     auto add_line = [&](std::string ln) {

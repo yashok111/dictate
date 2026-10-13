@@ -112,5 +112,6 @@ inline bool wd_reason_is_wedge(const char *reason) {
     if (!reason) return false;
     return std::strcmp(reason, "watchdog")     == 0 ||
            std::strcmp(reason, "socket-force") == 0 ||
-           std::strcmp(reason, "take-start")   == 0;
+           std::strcmp(reason, "take-start")   == 0 ||
+           std::strcmp(reason, "deadline")     == 0;   // restartNow's graceful path itself wedged
 }

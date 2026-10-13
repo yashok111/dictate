@@ -42,23 +42,50 @@ step "make"
 make
 
 # 3. Install into ~/.local/bin (the LaunchAgent runs THIS copy, not the repo build — gotcha #13).
+#    Copy beside it, then rename over it: a new inode swapped in atomically. An in-place `cp`
+#    rewrote the image the running daemon has mapped (macOS may kill it for an invalid code
+#    signature) and a Ctrl-C mid-copy left a truncated binary for KeepAlive to crash-loop on.
 step "install → $installed"
 mkdir -p "$(dirname "$installed")"
-cp "$bin" "$installed"
-printf 'copied %s → %s\n' "$bin" "$installed"
+cp "$bin" "$installed.new"
+mv -f "$installed.new" "$installed"
+printf 'installed %s → %s\n' "$bin" "$installed"
 
-# 4. Restart the LaunchAgent so the new binary is picked up. kickstart -k restarts a loaded service;
-#    if it isn't loaded yet, bootstrap it from the installed plist.
+# The daemon's socket and logs live in this owner-only directory; launchd opens the log path in
+# the plist itself, so it must exist before the agent starts. (-m applies to the deepest dir
+# only — the one that must be private.)
+# shellcheck disable=SC2174
+mkdir -p -m 700 "$HOME/.local/share/dictate"
+
+# 4. Install the LaunchAgent plist from the repo template, then restart the agent. launchd keeps
+#    the environment it was bootstrapped with, so a CHANGED plist needs bootout + bootstrap — a
+#    kickstart alone would keep running with the old settings (watchdog, idle-unload, log path).
+#    An unchanged plist on a loaded service just gets kickstart -k for the new binary.
 step "restart LaunchAgent ($service)"
+rendered="$(mktemp)"
+trap 'rm -f "$rendered"' EXIT
+sed "s|/Users/YOUR_USERNAME|$HOME|g" com.user.dictate.plist > "$rendered"
+plist_changed=0
+if [[ "$label" == "com.user.dictate" ]] && ! cmp -s "$rendered" "$plist"; then
+  mkdir -p "$(dirname "$plist")"
+  cp "$rendered" "$plist.new" && mv -f "$plist.new" "$plist"   # never a half-written plist
+  plist_changed=1
+  printf 'installed plist → %s\n' "$plist"
+fi
 if launchctl print "$service" >/dev/null 2>&1; then
-  launchctl kickstart -k "$service"
-  printf 'kickstarted %s\n' "$service"
+  if [[ $plist_changed -eq 1 ]]; then
+    launchctl bootout "$service" || true
+    launchctl bootstrap "gui/$(id -u)" "$plist"
+    printf 're-bootstrapped %s (plist changed)\n' "$service"
+  else
+    launchctl kickstart -k "$service"
+    printf 'kickstarted %s\n' "$service"
+  fi
 elif [[ -f "$plist" ]]; then
   launchctl bootstrap "gui/$(id -u)" "$plist"
   printf 'bootstrapped %s\n' "$service"
 else
   printf 'warning: %s not loaded and no plist at %s — skipping restart\n' "$service" "$plist" >&2
-  printf '  install it: sed "s|/Users/YOUR_USERNAME|$HOME|" com.user.dictate.plist > %s\n' "$plist" >&2
 fi
 
 # 5. Post-build verification (binary, signature, LaunchAgent, daemon ping, Accessibility).

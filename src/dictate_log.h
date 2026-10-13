@@ -4,12 +4,14 @@
 // retention rules stay unit-testable via make test.
 
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
+#include "dictate_text.h"   // utf8_sanitize — a log line must stay valid UTF-8
 
 namespace dlog {
 
@@ -42,6 +44,7 @@ inline Field integer_field(std::string name, long long value) {
 }
 
 inline Field number_field(std::string name, double value) {
+    if (!std::isfinite(value)) return {std::move(name), "null", false};   // JSON has no nan/inf
     std::ostringstream os;
     os << std::setprecision(15) << value;
     return {std::move(name), os.str(), false};
@@ -56,7 +59,8 @@ inline bool flag_enabled(const char *value) {
     return v == "1" || v == "true" || v == "yes" || v == "on";
 }
 
-inline std::string json_escape(const std::string &s) {
+inline std::string json_escape(const std::string &raw) {
+    const std::string s = utf8_sanitize(raw);   // invalid UTF-8 → U+FFFD, or jq/json.loads reject the line
     std::string out;
     out.reserve(s.size());
     static const char hex[] = "0123456789abcdef";
