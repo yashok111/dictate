@@ -220,14 +220,28 @@ NSMutableArray* transcribe_words(const PCM& pcm, const char* model, const char* 
         wp.initial_prompt = prompt.empty() ? nullptr : prompt.c_str();
         if (whisper_full(ctx.get(), wp, pcm.data() + begin, static_cast<int>(end - begin)))
             throw std::runtime_error("Ошибка распознавания речи");
-        transcriber::AsrWordCollector words(core * 1000 / sample_rate, core_end * 1000 / sample_rate);
+        // A small overlap at both seams (SEAM_SLACK_MS) so a word straddling one is kept by at
+        // least one window; the duplicate check below drops the second copy (F166).
+        const int64_t core_start_ms = int64_t(core * 1000 / sample_rate), core_end_ms = int64_t(core_end * 1000 / sample_rate);
+        transcriber::AsrWordCollector words(std::max<int64_t>(0, core_start_ms - transcriber::SEAM_SLACK_MS),
+                                            core_end_ms + transcriber::SEAM_SLACK_MS);
         for (int i = 0; i < whisper_full_n_segments(ctx.get()); ++i) {
             const int64_t a = int64_t(begin * 1000 / sample_rate) + whisper_full_get_segment_t0(ctx.get(), i) * 10;
             const int64_t b = std::min(int64_t(pcm.size() * 1000 / sample_rate),
                 int64_t(begin * 1000 / sample_rate) + whisper_full_get_segment_t1(ctx.get(), i) * 10);
             words.add(a, b, normalize_ws(whisper_full_get_segment_text(ctx.get(), i)));
         }
+        // Only the first words of this window can repeat the PREVIOUS window's last word — compare
+        // against that one, never against a word this window just added ("да да" stays).
+        NSDictionary* seam_prev = rows.lastObject;
+        int seam_checks = 3;
         for (const auto& result : words.finish()) {
+            if (seam_prev && seam_checks > 0) {
+                --seam_checks;
+                transcriber::AsrWord prev{[seam_prev[@"startMS"] longLongValue], [seam_prev[@"endMS"] longLongValue],
+                                          std::string([seam_prev[@"text"] UTF8String] ?: ""), false};
+                if (transcriber::duplicate_at_seam(prev, result)) { seam_checks = 0; continue; }
+            }
             NSString* word = [NSString stringWithUTF8String:result.text.c_str()];
             if (!word) throw std::runtime_error("Неверная кодировка результата");
             [rows addObject:@{@"startMS": @(result.start_ms), @"endMS": @(result.end_ms), @"text": word,
