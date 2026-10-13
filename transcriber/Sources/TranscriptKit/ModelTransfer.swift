@@ -24,6 +24,13 @@ public final class URLSessionModelTransfer: NSObject, ModelTransfer, URLSessionD
             guard task == nil else { continuation.finish(throwing: ModelError("Загрузка уже запущена.")); return }
             self.artifact = artifact; self.staging = stagingDirectory
             self.continuation = continuation
+            // A consumer that stops listening (its Task cancelled) without calling pause() must not
+            // leave the download running to completion in the background (F031). Only `.cancelled`
+            // acts: `.finished` comes from the delegate methods below, which hold `lock`.
+            continuation.onTermination = { [weak self] termination in
+                guard case .cancelled = termination else { return }
+                self?.abandon()
+            }
             let configuration = URLSessionConfiguration.ephemeral
             configuration.timeoutIntervalForRequest = 30
             configuration.timeoutIntervalForResource = 24 * 60 * 60
@@ -39,6 +46,12 @@ public final class URLSessionModelTransfer: NSObject, ModelTransfer, URLSessionD
             }
             task?.resume()
         }
+    }
+
+    private func abandon() {
+        lock.lock(); let current = task, session = self.session; continuation = nil; lock.unlock()
+        current?.cancel()
+        session?.invalidateAndCancel()
     }
 
     public func pause() async -> Data? {
@@ -83,7 +96,11 @@ public final class URLSessionModelTransfer: NSObject, ModelTransfer, URLSessionD
             let destination = staging.appendingPathComponent(UUID().uuidString + ".download")
             try FileManager.default.moveItem(at: location, to: destination)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
-            continuation?.yield(.downloaded(destination))
+            // Nobody left to own the file (the consumer went away): delete it now rather than leave
+            // a model-sized `.download` until the next launch's sweep (F031).
+            let delivered = continuation?.yield(.downloaded(destination))
+            if delivered == nil { try? FileManager.default.removeItem(at: destination) }
+            else if case .terminated? = delivered { try? FileManager.default.removeItem(at: destination) }
         } catch { continuation?.finish(throwing: error) }
     }
 

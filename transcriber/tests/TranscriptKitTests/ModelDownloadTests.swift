@@ -191,6 +191,9 @@ struct ModelDownloadTests {
                 if case .progress(let bytes, _) = event, bytes > 0 { resume = await first.pause(); break }
             }
         } catch {}
+        // The fixture serves Accept-Ranges and an ETag, so a pause after the first bytes MUST yield
+        // resume data; without this check a broken resume path passed by restarting from byte 0.
+        try modelCheck(resume != nil, "Pausing a range-capable download produced no resume data")
         let second = URLSessionModelTransfer()
         var received = false
         for try await event in second.start(artifact: artifact, resumeData: resume, stagingDirectory: root) {
@@ -201,6 +204,33 @@ struct ModelDownloadTests {
             }
         }
         try modelCheck(received, "Resume completed")
+    }
+
+    /// «Удалить загрузку» and relaunch (F177): restore() turns a download that was in flight into
+    /// a paused one, and discard(profileID:) removes every artifact's .resume and resets the state.
+    func testDiscardRemovesResumeAndRestorePauses() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let catalog = try tinyModelCatalog()
+        let store = try ModelStore(root: root, catalog: catalog)
+        let required = try catalog.requiredArtifacts(for: "quality")
+        for artifact in required {
+            try Data("resume".utf8).write(to: store.stagingDirectory.appendingPathComponent(artifact.id + ".resume"))
+        }
+        let saved = ModelDownloadSnapshot(profileID: "quality", phase: .downloading)
+        try JSONEncoder().encode(saved).write(to: store.stagingDirectory.appendingPathComponent("download-state.json"))
+        let downloader = ModelDownloader(catalog: catalog, store: store, transferFactory: { FixtureModelTransfer() })
+        await downloader.restore()
+        let restored = await downloader.snapshot().phase
+        try modelCheck(restored == .paused, "restore must turn a saved .downloading into .paused, got \(restored)")
+        try await downloader.discard(profileID: "quality")
+        for artifact in required {
+            let resume = store.stagingDirectory.appendingPathComponent(artifact.id + ".resume")
+            try modelCheck(!FileManager.default.fileExists(atPath: resume.path), "discard must remove \(artifact.id).resume")
+        }
+        let after = await downloader.snapshot().phase
+        try modelCheck(after == .absent, "discard must reset the state, got \(after)")
+        await downloader.shutdown()
     }
 
     func testInsufficientSpaceDoesNotStartTransfer() async throws {
