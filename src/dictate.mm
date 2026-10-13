@@ -951,8 +951,7 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     auto guard = _tapGuard;   // shared_ptr copy → the counter outlives the Recorder if a tap is still in flight at teardown
     __block AVAudioPCMBuffer *convOut = nil;   // reused across tap callbacks → no per-callback alloc on the realtime thread (gotcha #6)
 
-    [input installTapOnBus:0 bufferSize:4096 format:inFmt
-                     block:^(AVAudioPCMBuffer *buf, AVAudioTime *when) {
+    AVAudioNodeTapBlock tap = ^(AVAudioPCMBuffer *buf, AVAudioTime *when) {
         (void)when;
         guard->fetch_add(1);   // mark in-flight; seq_cst — pairs with -stop's _sessCell clear + guard load (gotcha #5, F089)
         StreamingSession *sess = sessCell->load();
@@ -984,7 +983,21 @@ static BOOL capture_err_is_recoverable(NSError *e) {
         }
         }   // @autoreleasepool
         guard->fetch_sub(1, std::memory_order_release);   // done touching `sess`
-    }];
+    };
+    // macOS 27 deprecates the void installTapOnBus:…block: (which raises an ObjC exception on a
+    // bad format) in favour of …error:block:, which reports the failure. Older SDKs lack the new
+    // selector, so keep the old call there and on older runtimes.
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 270000
+    if (@available(macOS 27.0, *)) {
+        if (![input installTapOnBus:0 bufferSize:4096 format:inFmt error:err block:tap]) return NO;
+    } else
+#endif
+    {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [input installTapOnBus:0 bufferSize:4096 format:inFmt block:tap];
+#pragma clang diagnostic pop
+    }
     _tapInstalled = YES;
     const double t1 = now_ms();
     [_engine prepare];
