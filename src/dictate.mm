@@ -93,9 +93,20 @@
 #define GGML_LIBEXEC "/opt/homebrew/opt/ggml/libexec"
 #endif
 
-// $DICTATE_SOCK overrides the socket so a test daemon can run on a throwaway path without
-// clashing with the installed daemon (default /tmp/dictate.sock).
-static const std::string SOCK_PATH_S = getenv("DICTATE_SOCK") ? getenv("DICTATE_SOCK") : "/tmp/dictate.sock";
+// The socket lives in the owner's 0700 directory ~/.local/share/dictate/, beside the take logs —
+// NOT in sticky, world-writable /tmp, where another local user could pre-create dictate.sock: the
+// owner's daemon cannot unlink a foreign file there (bind fails → dictation down), and a listening
+// squatter would receive the editor's accepted text (F131, F083). $DICTATE_SOCK overrides it so a
+// test daemon can run on a throwaway path without clashing with the installed daemon.
+static std::string sock_dir_path(void) {
+    const char *home = getenv("HOME");
+    return (home && *home) ? std::string(home) + "/.local/share/dictate" : std::string();
+}
+static std::string default_sock_path(void) {
+    std::string dir = sock_dir_path();
+    return dir.empty() ? std::string("/tmp/dictate.sock") : dir + "/dictate.sock";   // no HOME: last resort
+}
+static const std::string SOCK_PATH_S = getenv("DICTATE_SOCK") ? getenv("DICTATE_SOCK") : default_sock_path();
 static const char *SOCK_PATH  = SOCK_PATH_S.c_str();
 
 // VAD / segmentation tuning (FRAME, SPEECH_FACTOR, ABS_FLOOR, SPEECH_CONFIRM_FR,
@@ -299,6 +310,11 @@ static WhisperOut run_whisper_tok(whisper_context *ctx, const std::vector<float>
             out.tokens.push_back({tt ? tt : "", whisper_full_get_token_p(ctx, i, j)});
         }
     }
+    // Segments are concatenated first, so a character split across two segments of one call
+    // re-joins; whatever is still invalid becomes U+FFFD. Every consumer — the editor, the
+    // socket `stop`, the take log, NSString conversion — then sees valid UTF-8 (F055). A bad
+    // byte stays inside its word as U+FFFD, so the per-word confidence still aligns.
+    out.text = utf8_sanitize(out.text);
     return out;
 }
 
@@ -325,7 +341,9 @@ public:
         // pre-seed a small pool the worker recycles — closing a segment then swaps in a ready buffer
         // instead of allocating/regrowing cur_ on the tap thread (gotcha #6).
         cur_.reserve(SEG_SAMPLES);
-        preroll_.reserve((size_t)(PREROLL_FR + 1) * FRAME);   // +1 frame: the insert precedes the overflow trim
+        // Armed budget (preroll_overflow_armed) + 1 frame: the insert precedes the overflow trim, and
+        // a forced cut's carried tail is assigned into it on the tap thread (no realloc).
+        preroll_.reserve((size_t)(PREROLL_FR + CUT_WIN_FR + SILENCE_CLOSE_FR + 1) * FRAME);
         for (int i = 0; i < RECYCLE_SEED; i++) { std::vector<float> b; b.reserve(SEG_SAMPLES); recycle_.push_back(std::move(b)); }
         worker_ = std::thread([this]{ this->workerLoop(); });
     }
@@ -366,6 +384,10 @@ public:
         const double tailSec = (seg_.inSpeech && cur_.size() >= (size_t)FRAME) ? (double)cur_.size() / WHISPER_SAMPLE_RATE : 0.0;
         size_t queued; { std::lock_guard<std::mutex> lk(qmu_); queued = q_.size(); }
         if (seg_.inSpeech && cur_.size() >= (size_t)FRAME) enqueue(std::move(cur_));
+        // Stopped right after a forced cut, before the continuation was confirmed: the carried
+        // tail (preroll_'s first tailSamples_) is the end of the utterance — decode it too.
+        else if (seg_.contiguousReopen && tailSamples_ >= (size_t)FRAME)
+            enqueue(std::vector<float>(preroll_.begin(), preroll_.begin() + (std::ptrdiff_t)tailSamples_));
         cur_.clear(); seg_.inSpeech = false;
         { std::lock_guard<std::mutex> lk(qmu_); finishing_ = true; } qcv_.notify_all();
         if (worker_.joinable()) worker_.join();
@@ -427,28 +449,64 @@ private:
 
         if (!seg_.inSpeech) {
             // keep a rolling pre-roll (the noise-floor adapt + speech-run counting happen in
-            // seg_.observeIdle below; pre-roll insert/trim is independent of that scalar state)
+            // seg_.observeIdle below; pre-roll insert/trim is independent of that scalar state).
+            // While a forced-cut seam is armed the budget is wider: the carried tail and every
+            // frame until the continuation is confirmed must survive (F042).
             preroll_.insert(preroll_.end(), fr, fr+FRAME);
-            if (size_t over = preroll_overflow(preroll_.size()))
+            const bool armed = seg_.contiguousReopen;
+            if (size_t over = armed ? preroll_overflow_armed(preroll_.size()) : preroll_overflow(preroll_.size())) {
                 preroll_.erase(preroll_.begin(), preroll_.begin()+over);
+                tailSamples_ = over >= tailSamples_ ? 0 : tailSamples_ - over;   // trimmed from the front = the tail
+            }
 
             Segmenter::Onset onset = seg_.observeIdle(rms);
             if (onset != Segmenter::Onset::none) {
-                if (onset == Segmenter::Onset::cleared) cur_.clear();   // contiguous continuation of a >20 s
-                else                                    cur_ = preroll_;//   utterance forced shut by MAX_SEG: the
-                preroll_.clear();                                       //   audio is contiguous, so DON'T re-prepend
-                                                                        //   the pre-roll (already in the closed seg)
+                // fromPreroll: the ~300 ms before onset. cleared: a contiguous continuation of a
+                // >20 s utterance forced shut by MAX_SEG — preroll_ was reset at the cut, so it
+                // holds exactly the carried tail + every frame since: seeding from it neither drops
+                // the speech-confirmation frames (F042) nor duplicates audio at the seam.
+                cur_ = preroll_;
+                preroll_.clear();
+                tailSamples_ = 0; cutN_ = 0;
+            } else if (armed && !seg_.contiguousReopen && tailSamples_ >= (size_t)FRAME) {
+                // A full close of silence passed after the cut with no continuation: the carried
+                // tail was the end of the utterance → hand it to the worker on its own.
+                pushSegment(preroll_.data(), tailSamples_);
+                tailSamples_ = 0;
             }
         } else {
             cur_.insert(cur_.end(), fr, fr+FRAME);
+            pushCutRms(rms);
             bool tooLong = seg_exceeds_max(cur_.size());
             if (seg_.observeSpeech(rms, tooLong)) {   // closes the segment (silence or forced cut)
+                // A forced cut lands at an arbitrary frame, usually inside a word: cut at the
+                // quietest of the last CUT_WIN_FR frames instead and carry the frames after it into
+                // the pre-roll, which seeds the contiguous next segment (F107). A silence close
+                // carries nothing (the pre-roll was already emptied at onset).
+                size_t tail = tooLong ? (size_t)cut_tail_frames(cutRms_, cutN_) * FRAME : 0;
+                preroll_.assign(cur_.end() - (std::ptrdiff_t)tail, cur_.end());   // within reserve → no realloc
+                cur_.resize(cur_.size() - tail);
+                tailSamples_ = tail; cutN_ = 0;
                 rotateSegment();                      // hand cur_ to the worker, swap in a recycled buffer (alloc-free; gotcha #6)
-                // tooLong forced a cut mid-utterance (seg_ armed contiguousReopen): drop the
-                // pre-roll so the contiguous next segment can't duplicate audio at the seam.
-                if (tooLong) preroll_.clear();
             }
         }
+    }
+
+    // Rolling RMS of the open segment's last CUT_WIN_FR frames, oldest first (cut_tail_frames).
+    void pushCutRms(double rms) {
+        if (cutN_ < CUT_WIN_FR) { cutRms_[cutN_++] = rms; return; }
+        for (int i = 1; i < CUT_WIN_FR; i++) cutRms_[i - 1] = cutRms_[i];
+        cutRms_[CUT_WIN_FR - 1] = rms;
+    }
+
+    // Queue a copy of `n` samples as a segment from the realtime tap thread, reusing a recycled
+    // buffer (capacity SEG_SAMPLES) so steady state allocates nothing (gotcha #6).
+    void pushSegment(const float *p, size_t n) {
+        std::vector<float> b;
+        { std::lock_guard<std::mutex> lk(qmu_);
+          if (!recycle_.empty()) { b = std::move(recycle_.back()); recycle_.pop_back(); } }
+        b.assign(p, p + n);
+        enqueue(std::move(b));
     }
 
     void enqueue(std::vector<float> seg) {
@@ -509,6 +567,9 @@ private:
     std::vector<float> full_, pending_, cur_, preroll_;
     std::vector<std::vector<float>> recycle_;   // pool of pre-reserved segment buffers the worker returns and the tap reuses (guarded by qmu_; gotcha #6)
     Segmenter seg_;                      // pure energy-VAD scalar state machine (src/dictate_vad.h)
+    double cutRms_[CUT_WIN_FR] = {};     // RMS of the open segment's last frames (pushCutRms; tap thread only)
+    int    cutN_ = 0;                    // frames held in cutRms_
+    size_t tailSamples_ = 0;             // leading samples of preroll_ carried over a forced cut (tap thread only)
     std::atomic<bool> capped_{false};    // feed() hit MAX_TAKE_SEC and dropped audio (set on the tap thread, relaxed)
     std::atomic<size_t> nseg_{0};        // segments decoded so far (worker; read by finish() for its log line)
     std::queue<std::vector<float>> q_;
@@ -827,6 +888,16 @@ static BOOL capture_err_is_recoverable(NSError *e) {
         return NO;
     }
     _conv = [[AVAudioConverter alloc] initFromFormat:inFmt toFormat:_outFmt];
+    if (!_conv) {
+        // A format AVAudioConverter refuses (an exotic multichannel interface). A message to nil
+        // returns 0 == AVAudioConverterOutputStatus_HaveData, so the tap's drain loop below would
+        // spin forever on the realtime thread and -stop would wait on _tapGuard for good (F109).
+        if (err) *err = [NSError errorWithDomain:@"dictate" code:2
+                          userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:
+                              @"формат микрофона не поддерживается (%.0f Гц, %u кан.)",
+                              inFmt.sampleRate, (unsigned)inFmt.channelCount]}];
+        return NO;
+    }
     AVAudioFormat *outFmt = _outFmt; AVAudioConverter *conv = _conv; StreamingSession *sess = _sess;
     const double ratio = outFmt.sampleRate / inFmt.sampleRate;
     auto guard = _tapGuard;   // shared_ptr copy → the counter outlives the Recorder if a tap is still in flight at teardown
@@ -859,6 +930,7 @@ static BOOL capture_err_is_recoverable(NSError *e) {
                 sess->feed(convOut.floatChannelData[0], convOut.frameLength);
             }
             if (st!=AVAudioConverterOutputStatus_HaveData) break;   // InputRanDry / EndOfStream → done
+            if (convOut.frameLength==0) break;            // "HaveData" with nothing produced can't make progress (F109)
         }
         }   // @autoreleasepool
         guard->fetch_sub(1, std::memory_order_release);   // done touching `sess`
@@ -1238,7 +1310,8 @@ static bool ensure_model_loaded(void) {
 static DictateController *g_ctrl = nil;
 static NSRunningApplication *g_target_app = nil;   // app to paste into (frontmost when the take began)
 static std::atomic<bool> g_editor_open{false};     // a post-take editor window is up
-static void spawn_editor(NSString *transcript, NSString *conf);    // defined in the EDITOR section, below
+static int g_paste_pending = 0;   // main only: accepted editor texts whose paste + clipboard restore have not run yet
+static bool spawn_editor(NSString *transcript, NSString *conf);    // defined in the EDITOR section, below; false = not started
 
 // A mid-take device/route change whose capture rebuild failed (Recorder reconfigure): the mic is
 // dead, so stop the take cleanly (instead of dribbling to the 60 s cap) and tell the user. Main thread.
@@ -1321,12 +1394,14 @@ static bool ax_trusted(bool prompt) {
     NSDictionary *opts = @{(__bridge id)kAXTrustedCheckOptionPrompt: @(prompt)};
     return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
 }
+static const double PASTE_RESTORE_SEC = 1.5;   // synthetic ⌘V → prior clipboard restored (paste_text)
 static void paste_text(NSString *text) {                 // main thread
     static uint64_t pasteGen = 0;                        // main-only; a newer paste cancels this one's
     uint64_t myGen = ++pasteGen;                         //   pending clipboard restore (no stale clobber)
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
     NSString *orig = [pb stringForType:NSPasteboardTypeString] ?: @"";   // non-string content → restored as empty
     copy_to_clipboard(text);                             // text on the clipboard either way
+    const NSInteger ours = pb.changeCount;               // the restore below must not clobber a newer copy
     bool trusted = ax_trusted(false);
     slog("paste: %lu chars, ax_trusted=%d → %s\n",
          (unsigned long)text.length, trusted, trusted ? "synth ⌘V" : "clipboard-only (grant Accessibility)");
@@ -1342,8 +1417,14 @@ static void paste_text(NSString *text) {                 // main thread
     CGEventPost(kCGHIDEventTap, down);
     CGEventPost(kCGHIDEventTap, up);
     if (down) CFRelease(down); if (up) CFRelease(up); if (src) CFRelease(src);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4*NSEC_PER_SEC)),     // restore prior clipboard,
-                   dispatch_get_main_queue(), ^{ if (paste_gen_is_current(myGen, pasteGen)) copy_to_clipboard(orig); });  // if still latest (src/dictate_authgen.h)
+    // Restore the prior clipboard once the target has had time to READ it. 0.4 s was too short for
+    // a busy Electron/web/remote-desktop target, which then pasted the user's OLD clipboard and the
+    // dictation was lost from both places (F049). Skipped if anything else wrote the pasteboard since.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PASTE_RESTORE_SEC*NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+                       if (paste_gen_is_current(myGen, pasteGen) && pb.changeCount == ours)   // still latest (src/dictate_authgen.h)
+                           copy_to_clipboard(orig);
+                   });
 }
 
 // begin a take (idempotent). returns "" on success or an error string.
@@ -1814,7 +1895,18 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     // `conf` carries per-word confidence (serialized) for the uncertain-word highlight.
     g_editor_open.store(true);
     unregister_toggle();
-    spawn_editor(ns, conf);
+    if (!spawn_editor(ns, conf)) {
+        // pipe()/posix_spawn failed (fd exhaustion, the binary swapped mid-deploy, a bad editor log
+        // path): no reaper thread exists to recover, so undo the editor-open state here — otherwise
+        // ⌘⇧D stays unregistered and every later take is refused — and keep the words (F020, F009).
+        g_editor_open.store(false);
+        register_toggle();
+        log_editor_event("editor_spawn_failed", g_editor_take_id, ns);
+        g_editor_take_id.clear();
+        g_target_app = nil;
+        copy_to_clipboard(ns);
+        [self showError:@"редактор не запустился — текст в буфере обмена"];
+    }
 }
 - (void)finalizeSocketStop:(NSString *)ns {   // socket `stop` is a script/test path: clear state + clipboard, NO editor GUI
     g_finishing.store(false);
@@ -1827,15 +1919,29 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     log_editor_event("editor_accept", g_editor_take_id, text);
     g_editor_take_id.clear();
     NSRunningApplication *app = g_target_app; g_target_app = nil; // release the retained target once used
-    if (app) [app activateWithOptions:NSApplicationActivateAllWindows];   // refocus the original app…
     NSString *t = text ?: @"";
     // Trim trailing whitespace/newlines so an auto-paste can't end with a stray newline (which in
     // an Enter-to-send input could submit a line the user didn't intend). Interior text is verbatim.
     { NSCharacterSet *ws=[NSCharacterSet whitespaceAndNewlineCharacterSet]; NSUInteger e=t.length;
       while (e>0 && [ws characterIsMember:[t characterAtIndex:e-1]]) e--;
       if (e<t.length) t=[t substringToIndex:e]; }
+    if (!app || app.terminated) {
+        // The app the take started in is gone (quit/crashed while the editor was open): activating
+        // it does nothing, and a synthetic ⌘V would land in whatever is frontmost now (F096).
+        if (t.length) { copy_to_clipboard(t); [self showHint:@"приложение закрыто — текст в буфере обмена"]; }
+        return;
+    }
+    [app activateWithOptions:NSApplicationActivateAllWindows];   // refocus the original app…
+    // The text exists only in this block until paste_text puts it on the clipboard, and the old
+    // clipboard comes back PASTE_RESTORE_SEC later: hold off the deferred audio-poisoned restart
+    // (poisonTick) for that whole window, or its _exit drops the accepted words (F002, F053, F095).
+    g_paste_pending++;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.2*NSEC_PER_SEC)),  // …then paste once it's frontmost
-                   dispatch_get_main_queue(), ^{ @autoreleasepool { if (t.length) paste_text(t); } });
+                   dispatch_get_main_queue(), ^{ @autoreleasepool {
+                       if (t.length) paste_text(t);
+                       dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)((PASTE_RESTORE_SEC+0.1)*NSEC_PER_SEC)),
+                                      dispatch_get_main_queue(), ^{ g_paste_pending--; });
+                   } });
 }
 - (void)editorCancel {
     g_editor_open.store(false);
@@ -2082,6 +2188,7 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
 }
 - (void)poisonTick:(NSTimer *)t { (void)t;
     if (g_editor_open.load() || g_finishing.load()) return;      // a take is still being turned into text
+    if (g_paste_pending > 0) return;                             // …or its accepted text is still being pasted
     {   // try_lock, never lock: this runs on main, and blocking here on whatever holds g_mu is
         // precisely the wedge we are trying to get ahead of. Busy → look again in POISON_CHECK_SEC.
         std::unique_lock<std::mutex> lk(g_mu, std::try_to_lock);
@@ -2118,10 +2225,12 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     [self hideUI];
     restart_process_now(reason);
     // Reached only if the restart ABORTED (no replacement could be spawned — restart_process_now
-    // used to be _exit-only). We already tore the take down and daemon_stop_detach left
-    // g_finishing set: without this, every later start returns "busy" — which beginTakeError
-    // treats as a silent no-op — so the daemon would look healthy and never record again.
-    g_finishing.store(false);
+    // used to be _exit-only). If THIS call tore a take down, daemon_stop_detach set g_finishing and
+    // nobody else will clear it: without this, every later start returns "busy" — which
+    // beginTakeError treats as a silent no-op — so the daemon would look healthy and never record
+    // again. With no take, the flag (if set) belongs to an async finish still decoding on g_ctx:
+    // clearing it would let a second worker onto the same context (gotcha #5; F017, F112).
+    if (take) g_finishing.store(false);
     [self stopTimer]; unregister_esc();
     [self showError:@"перезапуск не удался — демон продолжает работать"];
 }
@@ -2434,6 +2543,9 @@ static void serve_client(int cl, bool degraded) {
                 // NB: don't whisper_free(g_ctx) here — an async finish (hotkey/timer stop) may still be
                 // decoding on it; _exit reclaims all memory + GPU state cleanly (and skips dtors, so the
                 // g_finishing flag set by daemon_stop_detach above needs no explicit clear).
+                // Take a live editor with us, as restart_process_now does: an orphan editor would
+                // later send `accept` to the next daemon, which has no target app (F021).
+                pid_t ed = g_editor_pid.load(); if (ed > 0) kill(ed, SIGTERM);
                 unlink(SOCK_PATH); _exit(0);
             });
             return;
@@ -2485,6 +2597,22 @@ static int run_daemon(const std::string &modelPath, bool replacing) {
     g_daemon_logs = true;       // per-segment decode + finish() timings go to /tmp/dictate.log
     umask(0077);                // daemon-created files (socket, editor log) → owner-only, not world-readable
     g_take_logger.prune();
+    if (SOCK_PATH_S.size() >= sizeof(sockaddr_un{}.sun_path)) {   // strncpy below would silently truncate it
+        slog("socket path too long (%zu bytes): %s\n", SOCK_PATH_S.size(), SOCK_PATH); return 1;
+    }
+    if (!getenv("DICTATE_SOCK")) {                    // the default lives in ~/.local/share/dictate (0700)
+        std::string dir = sock_dir_path();
+        if (!dir.empty()) {
+            std::string local = std::string(getenv("HOME")) + "/.local", share = local + "/share";
+            if (!mkdir_owner(local) || !mkdir_owner(share) || !mkdir_owner(dir)) {
+                slog("cannot create socket directory %s: %s\n", dir.c_str(), strerror(errno)); return 1;
+            }
+            struct stat ds;
+            if (stat(dir.c_str(), &ds) != 0 || !S_ISDIR(ds.st_mode) || ds.st_uid != geteuid()) {
+                slog("socket directory %s is not an owner-held directory — refusing\n", dir.c_str()); return 1;
+            }
+        }
+    }
     // single instance: if a daemon already answers, bow out. EXCEPT when we were spawned as a
     // replacement (`daemon --replace`): the outgoing daemon is still listening at that moment
     // BY DESIGN — it spawns us before dropping its socket, so a spawn failure costs it nothing —
@@ -2496,6 +2624,10 @@ static int run_daemon(const std::string &modelPath, bool replacing) {
             int c=socket(AF_UNIX,SOCK_STREAM,0); sockaddr_un a{}; a.sun_family=AF_UNIX;
             strncpy(a.sun_path,SOCK_PATH,sizeof(a.sun_path)-1);
             bool answered = (c>=0 && connect(c,(sockaddr*)&a,sizeof(a))==0);
+            if (answered && !peer_is_owner(c)) {      // another user's process at our path is not "a daemon"
+                slog("socket %s is held by another user — not bowing out\n", SOCK_PATH);
+                answered = false;
+            }
             if (answered) write_all(c,"ping\n",5);
             if (c>=0) close(c);
             if (!answered) break;                                   // nobody home → we bind below
@@ -2508,8 +2640,9 @@ static int run_daemon(const std::string &modelPath, bool replacing) {
     // Only remove the path if it is actually a socket — defense-in-depth so a redirected
     // $DICTATE_SOCK can't make the daemon unlink an arbitrary user file (lstat, so a symlink is
     // seen AS a symlink and never followed). A stale socket from a dead daemon is the normal case.
-    { struct stat st; if (lstat(SOCK_PATH,&st)==0 && !S_ISSOCK(st.st_mode)) {
-          slog("refusing to unlink non-socket %s\n", SOCK_PATH); return 1; } }
+    { struct stat st; if (lstat(SOCK_PATH,&st)==0 && (!S_ISSOCK(st.st_mode) || st.st_uid != geteuid())) {
+          slog("refusing to unlink %s %s\n", S_ISSOCK(st.st_mode) ? "another user's socket" : "non-socket", SOCK_PATH);
+          return 1; } }
     unlink(SOCK_PATH);
 
     int srv=socket(AF_UNIX,SOCK_STREAM,0);
@@ -2553,6 +2686,9 @@ static int connect_daemon(void) {
     int c=socket(AF_UNIX,SOCK_STREAM,0); if (c<0) return -1;
     sockaddr_un a{}; a.sun_family=AF_UNIX; strncpy(a.sun_path,SOCK_PATH,sizeof(a.sun_path)-1);
     if (connect(c,(sockaddr*)&a,sizeof(a))<0){ close(c); return -1; }
+    // The server authenticates every client; the client authenticates the server the same way,
+    // so an accepted transcript or a `stop` reply never goes to / comes from another user (F083).
+    if (!peer_is_owner(c)) { fprintf(stderr, "dictate: %s is held by another user — refusing\n", SOCK_PATH); close(c); return -1; }
     return c;
 }
 
@@ -2663,7 +2799,7 @@ static void edlog(NSString *fmt, ...) {
 @end
 @implementation EdCell @end
 
-static void        editor_send(const std::string &line);     // editor → daemon (defined below)
+static std::string editor_send(const std::string &line);     // editor → daemon (defined below); returns the reply
 static std::string editor_request(const std::string &line);  // editor → daemon request/reply (defined below)
 
 @interface EditorView : NSView
@@ -3075,11 +3211,14 @@ static std::string editor_request(const std::string &line);  // editor → daemo
 }
 @end
 
-// editor → daemon (one-shot): send a line to the daemon socket, wait for its ack, close.
-static void editor_send(const std::string &line) {
-    int c = connect_daemon(); if (c < 0) return;
+// editor → daemon (one-shot): send a line to the daemon socket, wait for its ack, close. Returns
+// the reply ("ok" on success; "" when the daemon was unreachable or closed without answering).
+static std::string editor_send(const std::string &line) {
+    int c = connect_daemon(); if (c < 0) return "";
     std::string l = line + "\n"; write_all(c, l.data(), l.size());
-    char b[64]; (void)read(c, b, sizeof(b)); close(c);
+    char b[64]; ssize_t r; while ((r = read(c, b, sizeof(b))) < 0 && errno == EINTR) {}
+    close(c);
+    return r > 0 ? std::string(b, (size_t)r) : std::string();
 }
 // editor → daemon (request/reply): send a line, read the full reply (e.g. corr-stop → transcript).
 static std::string editor_request(const std::string &line) {
@@ -3098,12 +3237,12 @@ static std::string editor_request(const std::string &line) {
 // keeps private (0600 take logs, 0700 wedge dir, edlog never prints words). `--conf` stays in argv:
 // digits and commas, nothing to leak. The write happens on the reaper thread — a transcript is a
 // few KB against a 64 KB pipe buffer, but the main queue must not be the one to find out otherwise.
-static void spawn_editor(NSString *transcript, NSString *conf) {
+static bool spawn_editor(NSString *transcript, NSString *conf) {
     std::string self = self_path();
     std::string t = transcript.UTF8String ?: "";
     std::string c = conf.UTF8String ?: "";   // serialized per-word confidence (comma-separated ints), may be empty
     int pfd[2];
-    if (pipe(pfd) != 0) { slog("spawn_editor: pipe failed (%s)\n", strerror(errno)); return; }
+    if (pipe(pfd) != 0) { slog("spawn_editor: pipe failed (%s)\n", strerror(errno)); return false; }
     fcntl(pfd[0], F_SETFD, FD_CLOEXEC); fcntl(pfd[1], F_SETFD, FD_CLOEXEC);   // only the dup2 below crosses
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, pfd[0], 0);                                   // read end → editor stdin
@@ -3116,7 +3255,7 @@ static void spawn_editor(NSString *transcript, NSString *conf) {
     posix_spawn_file_actions_destroy(&fa);
     close(pfd[0]);   // ours is done either way: the child holds its own copy (or never existed)
     slog("spawn_editor rc=%d pid=%d\n", rc, (int)pid);
-    if (rc != 0) { close(pfd[1]); return; }
+    if (rc != 0) { close(pfd[1]); return false; }
     {
         g_editor_pid.store(pid);   // so a restart can take the editor with it instead of orphaning it
         const int wfd = pfd[1];
@@ -3136,6 +3275,7 @@ static void spawn_editor(NSString *transcript, NSString *conf) {
             });
         }).detach();
     }
+    return true;
 }
 
 // NSApp.delegate is a weak reference, so the window/key setup MUST happen in
@@ -3177,7 +3317,26 @@ static void spawn_editor(NSString *transcript, NSString *conf) {
     _v.fromDaemon = _fromDaemon;
     BOOL fromD = _fromDaemon;
     _v.onAccept = ^(NSString *t){
-        if (fromD) editor_send(std::string("accept ") + (t.UTF8String ?: ""));   // daemon refocuses target + pastes
+        if (fromD) {
+            // The daemon refocuses the target and pastes — but only if it got the text: it may be
+            // mid-restart (no socket), degraded ("err busy"), or drop an oversize line. Retry once,
+            // then keep the words on the clipboard and say so instead of exiting silently (F025, F116).
+            std::string line = std::string("accept ") + (t.UTF8String ?: "");
+            std::string reply = editor_send(line);
+            if (reply.compare(0, 2, "ok") != 0) {
+                struct timespec ts{0, 300*1000*1000}; nanosleep(&ts, nullptr);
+                reply = editor_send(line);
+            }
+            if (reply.compare(0, 2, "ok") != 0) {
+                edlog(@"accept not delivered (reply '%s') → clipboard", reply.c_str());
+                copy_to_clipboard(t);
+                NSAlert *al = [NSAlert new];
+                al.messageText = @"Не удалось передать текст демону";
+                al.informativeText = @"Исправленный текст скопирован в буфер обмена — вставь его ⌘V.";
+                [al runModal];
+                exit(1);
+            }
+        }
         else { copy_to_clipboard(t); fprintf(stdout, "%s\n", t.UTF8String ?: ""); fflush(stdout); }
         exit(0);
     };

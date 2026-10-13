@@ -80,8 +80,8 @@ ffmpeg -i /tmp/t.aiff -ar 16000 -ac 1 -y /tmp/t.wav
 Exercise the **daemon** path without a mic via the `feedfile` debug command:
 
 ```sh
-printf 'feedfile /tmp/t.wav\n' | nc -U /tmp/dictate.sock   # → ok (take left open)
-printf 'stop\n'                | nc -U /tmp/dictate.sock   # → streamed transcript
+printf 'feedfile /tmp/t.wav\n' | nc -U ~/.local/share/dictate/dictate.sock   # → ok (take left open)
+printf 'stop\n'                | nc -U ~/.local/share/dictate/dictate.sock   # → streamed transcript
 ```
 
 ## CLI / protocol
@@ -117,7 +117,7 @@ job is to break that wedge — was never even read. Editor protocol (daemon ↔ 
 `corr-cancel`→`ok`, `accept <text>`→`ok` (refocus target + paste), `editor-cancel`→`ok`,
 `edit <text>`→`ok` (debug: open the editor on text, no mic). Standalone:
 `dictate editor "слова"` runs the editor alone (stubbed mini-take). Socket
-`/tmp/dictate.sock` (override `$DICTATE_SOCK` to run a test daemon off the live one) ·
+`~/.local/share/dictate/dictate.sock` (owner-only dir, NOT world-writable `/tmp`: both ends check the peer uid; override `$DICTATE_SOCK` to run a test daemon off the live one) ·
 logs `/tmp/dictate.log`, `/tmp/dictate-editor.log`.
 
 ## Architecture
@@ -225,7 +225,7 @@ tail -f /tmp/dictate.log                                                       #
 
 If you see two daemon processes, you have a stray (manual or pre-LaunchAgent
 auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -f
-'dictate daemon'; rm -f /tmp/dictate.sock; launchctl bootstrap gui/$(id -u) …`.
+'dictate daemon'; rm -f ~/.local/share/dictate/dictate.sock; launchctl bootstrap gui/$(id -u) …`.
 
 ## Config (env) & tuning
 

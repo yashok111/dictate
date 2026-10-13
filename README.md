@@ -38,7 +38,7 @@ dictate --file a.wav          one-shot, no daemon: stream a 16 kHz mono WAV
 dictate --file a.wav --once   one-shot, single-pass (A/B comparison)
 ```
 
-Socket: `/tmp/dictate.sock` · daemon log: `/tmp/dictate.log`.
+Socket: `~/.local/share/dictate/dictate.sock` (owner-only directory) · daemon log: `/tmp/dictate.log`.
 
 ## Build
 
