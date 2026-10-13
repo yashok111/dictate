@@ -102,7 +102,11 @@ inline bool dot_is_boundary(const std::string &s, size_t i) {
         if (cps < 2) {
             bool pronoun = (i-k==1 && s[k]=='I') ||
                            (i-k==2 && (unsigned char)s[k]==0xD1 && (unsigned char)s[k+1]==0x8F);   // я U+044F
-            bool word_start = (k==0 || s[k-1]==' ');
+            // a word start: string start, a space, or an opening mark («я. потом», "(I. then")
+            bool word_start = k==0 || s[k-1]==' ' || s[k-1]=='(' || s[k-1]=='[' || s[k-1]=='"' || s[k-1]=='\'' ||
+                              (k>=2 && (unsigned char)s[k-2]==0xC2 && (unsigned char)s[k-1]==0xAB) ||          // «
+                              (k>=3 && (unsigned char)s[k-3]==0xE2 && (unsigned char)s[k-2]==0x80 &&
+                               ((unsigned char)s[k-1]==0x9C || (unsigned char)s[k-1]==0x9E));                 // “ „
             if (!(pronoun && word_start)) return false;
         }
     }

@@ -160,6 +160,7 @@ TEST_CASE("normalize_text: «я» and I end a sentence; initials still do not (F
     CHECK(normalize_text("it was I. then") == "It was I. Then");
     CHECK(normalize_text("и т.д. конец") == "И т.д. конец");
     CHECK(normalize_text("в XV в. было") == "В XV в. было");
+    CHECK(normalize_text("«я. потом»") == "«Я. Потом»");                     // after an opening mark too
 }
 TEST_CASE("normalize_text: capitalizes past an opening quote, bracket or dialogue dash (F122)") {
     CHECK(normalize_text("Он ушёл. «привет, мир»") == "Он ушёл. «Привет, мир»");
