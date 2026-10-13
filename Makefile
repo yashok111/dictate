@@ -31,6 +31,9 @@ LDFLAGS  += -Wl,-rpath,$(WHISPER)/lib -Wl,-rpath,$(GGML)/lib
 
 BIN   := dictate
 SRC   := src/dictate.mm
+# dictate.mm #includes every pure-logic header; without them as prerequisites an edit to one
+# leaves ./dictate "up to date" and `make deploy` ships the old logic.
+HDRS  := $(wildcard src/dictate_*.h)
 # Embedded via -sectcreate so TCC has NSMicrophoneUsageDescription (gotcha #2). Kept in src/
 # (NOT next to the built binary): a loose Info.plist beside ./dictate makes codesign treat it
 # as a bundle (Format=bundle + _CodeSignature/), which breaks on `cp dictate ~/.local/bin/`.
@@ -46,9 +49,18 @@ SIGN_SHA1  ?= $(shell security find-certificate -c "$(SIGN_ID)" -Z \
               "$$HOME/Library/Keychains/login.keychain-db" 2>/dev/null \
               | awk '/SHA-1 hash:/ {print $$3; exit}')
 
-$(BIN): $(SRC) Makefile $(PLIST)
+# The default goal builds AND signs. Signing is its own step that runs on every `make`, not a
+# side effect of the link: a binary linked before the identity existed is re-signed as soon as
+# it does, instead of staying ad-hoc until the source changes. It is skipped when ./dictate
+# already carries the identity, so a no-op `make` stays a no-op.
+build: $(BIN) sign
+
+$(BIN): $(SRC) $(HDRS) Makefile $(PLIST)
 	$(CXX) $(CXXFLAGS) $(SRC) -o $(BIN) $(LDFLAGS) -sectcreate __TEXT __info_plist $(PLIST)
-	@SIGN_KEY="$(SIGN_SHA1)"; \
+
+sign: $(BIN)
+	@if codesign -dv $(BIN) 2>&1 | grep -q "^Authority=$(SIGN_ID)$$"; then exit 0; fi; \
+	  SIGN_KEY="$(SIGN_SHA1)"; \
 	  if [ -z "$$SIGN_KEY" ]; then SIGN_KEY="$(SIGN_ID)"; fi; \
 	  if codesign --force --identifier "$(SIGN_IDENT)" --sign "$$SIGN_KEY" $(BIN); then \
 	    echo "✓ signed $(BIN): $(SIGN_IDENT) / $(SIGN_ID) [$${SIGN_KEY}] (TCC-stable)"; \
@@ -57,10 +69,10 @@ $(BIN): $(SRC) Makefile $(PLIST)
 	    echo "  (TCC grants break on each rebuild; run scripts/make-codesign-cert.sh once)"; \
 	  fi
 
-run: $(BIN)
+run: build
 	./$(BIN)
 
-post-build-check: $(BIN)
+post-build-check: build
 	scripts/post-build-check.sh ./$(BIN) "$$HOME/.local/bin/$(BIN)"
 
 # One-shot deploy: build → unit-test → install to ~/.local/bin → restart the LaunchAgent →
@@ -71,10 +83,10 @@ deploy:
 # Sanitizer builds (skills: sanitizers, concurrency-debugging) — separate binaries so they
 # don't clobber ./dictate. TSan catches data races on the worker/cancel paths; ASan+UBSan
 # catch memory errors and UB. Exercise without a mic via:  ./dictate-tsan --file /tmp/t.wav
-tsan: $(SRC) Makefile
+tsan: $(SRC) $(HDRS) Makefile
 	$(CXX) $(CXXFLAGS) -fsanitize=thread -g $(SRC) -o $(BIN)-tsan $(LDFLAGS)
 
-asan: $(SRC) Makefile
+asan: $(SRC) $(HDRS) Makefile
 	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -g $(SRC) -o $(BIN)-asan $(LDFLAGS)
 
 # ── Unit tests (doctest; skill: cpp-testing) ─────────────────────────────────────
@@ -109,4 +121,4 @@ clean:
 	rm -f $(BIN) $(BIN)-tsan $(BIN)-asan $(TEST_BIN) tests/*.o tests/*.d
 	rm -rf $(BIN).dSYM $(BIN)-tsan.dSYM $(BIN)-asan.dSYM $(TEST_BIN).dSYM
 
-.PHONY: run post-build-check deploy clean tsan asan test
+.PHONY: build sign run post-build-check deploy clean tsan asan test
