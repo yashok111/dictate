@@ -1044,6 +1044,10 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     // after the take ended: rebuilding then would throw away the persistent engine for nothing (F047).
     if (_pinReconfig) { _pinReconfig = NO; if (_engine.isRunning || !_sess) return; }
     slog("audio configuration changed → rebuilding capture\n");
+    // Close the old tap's door FIRST (as -stop does): a late callback of the old engine then either
+    // sees null and leaves, or is counted and waited out below — never feeds the session
+    // concurrently with the new tap. -installTapAndStart: re-publishes the session.
+    _sessCell->store(nullptr);
     _tBuild = _tFmt = _tStart = 0;   // this is a fresh mic start; don't fold the original take's numbers in
     // Drop the ENGINE, not just the tap. The engine now outlives the take, so this is the one
     // moment its cached state is known to be wrong: the hardware format has changed (that is what
@@ -1491,6 +1495,7 @@ static const double PASTE_RESTORE_SEC = 1.5;   // synthetic ⌘V → prior clipb
 // dictation #1 as "the original" and the real clipboard was never restored (F051). nil = no restore
 // pending. Main thread only.
 static NSArray<NSPasteboardItem *> *g_clip_saved = nil;
+static NSInteger g_clip_ours = -1;   // pasteboard changeCount right after our own write (main only)
 static NSArray<NSPasteboardItem *> *snapshot_pasteboard(NSPasteboard *pb) {
     NSMutableArray<NSPasteboardItem *> *items = [NSMutableArray array];
     for (NSPasteboardItem *it in pb.pasteboardItems) {
@@ -1504,7 +1509,9 @@ static void paste_text(NSString *text) {                 // main thread
     static uint64_t pasteGen = 0;                        // main-only; a newer paste takes over this one's
     uint64_t myGen = ++pasteGen;                         //   pending clipboard restore (no stale clobber)
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
-    if (!g_clip_saved) g_clip_saved = snapshot_pasteboard(pb);   // only the first of overlapping pastes
+    // Only the first of overlapping pastes snapshots — unless something ELSE wrote the clipboard
+    // since our last write (the user copied between two pastes): that copy is the new original.
+    if (!g_clip_saved || pb.changeCount != g_clip_ours) g_clip_saved = snapshot_pasteboard(pb);
     copy_to_clipboard(text);                             // text on the clipboard either way
     bool trusted = ax_trusted(false);
     slog("paste: %lu chars, ax_trusted=%d → %s\n",
@@ -1517,6 +1524,7 @@ static void paste_text(NSString *text) {                 // main thread
     // clipboard-history managers (the nspasteboard.org convention).
     [pb setData:[NSData data] forType:@"org.nspasteboard.TransientType"];
     const NSInteger ours = pb.changeCount;               // the restore below must not clobber a newer copy
+    g_clip_ours = ours;
     CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
     CGEventRef down = CGEventCreateKeyboardEvent(src, (CGKeyCode)kVK_ANSI_V, true);
     CGEventRef up   = CGEventCreateKeyboardEvent(src, (CGKeyCode)kVK_ANSI_V, false);
