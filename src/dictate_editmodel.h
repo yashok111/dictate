@@ -33,17 +33,18 @@ inline int em_clamp_step(int pos, int dir, int maxPos) {
 //    token so the cursor can land on it and delete it; join re-glues with Russian spacing) ──
 
 // Decode the UTF-8 sequence at s[i], advancing i past it; returns the codepoint. On a
-// malformed lead/continuation byte it consumes ONE byte and returns it raw (never throws,
-// never reads past end) — so a truncated multibyte tail can't loop or overrun.
+// malformed lead/continuation byte it consumes ONE byte and returns U+FFFD (never throws,
+// never reads past end) — so a truncated multibyte tail can't loop or overrun, and a stray
+// 0xAB/0xBB byte is never mistaken for « or ». Callers keep the raw byte via the span.
 inline unsigned em_utf8_next(const std::string &s, std::size_t &i) {
     unsigned char c = (unsigned char)s[i];
     if (c < 0x80) { i += 1; return c; }
     int n = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 0;
-    if (n == 0 || i + (std::size_t)n > s.size()) { i += 1; return c; }   // bad lead / truncated
+    if (n == 0 || i + (std::size_t)n > s.size()) { i += 1; return 0xFFFD; }   // bad lead / truncated
     unsigned cp = (unsigned)(c & (0x7F >> n));
     for (int k = 1; k < n; k++) {
         unsigned char cc = (unsigned char)s[i + (std::size_t)k];
-        if ((cc & 0xC0) != 0x80) { i += 1; return c; }                   // bad continuation
+        if ((cc & 0xC0) != 0x80) { i += 1; return 0xFFFD; }              // bad continuation
         cp = (cp << 6) | (unsigned)(cc & 0x3F);
     }
     i += (std::size_t)n; return cp;
@@ -81,10 +82,22 @@ inline bool em_is_punct_token(const std::string &t) {
 // contiguous in `s`, so the span addresses exactly that word's characters.
 struct EmSpan { std::string text; std::size_t start; std::size_t len; };
 
+inline bool em_is_ws_cp(unsigned cp) {
+    return cp==' '||cp=='\t'||cp=='\n'||cp=='\r'||cp=='\f'||cp=='\v';
+}
+// A mark that stays INSIDE a word when it is glued between two word characters: a decimal
+// ("3,5", "3.14"), a time or port ("10:30", "host:80"), a domain or file ("example.com"), an
+// abbreviation ("т.е"), a query ("a?x=1"). em_join could not restore the original spacing
+// once such a mark became its own token ("10: 30", "example. com").
+inline bool em_is_inword_mark(unsigned cp) {
+    return cp=='.' || cp==',' || cp==':' || cp==';' || cp=='!' || cp=='?';
+}
+
 // Tokenizer with byte spans — split on ASCII whitespace AND isolate each punctuation mark
 // (em_is_punct_cp) into its own token; drop empties. Non-punct multibyte UTF-8 (Cyrillic, …)
-// and intra-word '-'/'’' pass through into the surrounding word intact. The single source of
-// word boundaries: em_tokenize is a thin text-only wrapper over this.
+// and intra-word '-'/'’' pass through into the surrounding word intact, and so does an
+// em_is_inword_mark glued between two word characters. The single source of word
+// boundaries: em_tokenize is a thin text-only wrapper over this.
 inline std::vector<EmSpan> em_tokenize_spans(const std::string &s) {
     std::vector<EmSpan> out; std::string cur; std::size_t curStart = 0;
     auto flush = [&]{ if (!cur.empty()) { out.push_back({cur, curStart, cur.size()}); cur.clear(); } };
@@ -92,8 +105,16 @@ inline std::vector<EmSpan> em_tokenize_spans(const std::string &s) {
     while (i < s.size()) {
         std::size_t start = i;
         unsigned cp = em_utf8_next(s, i);
-        if (cp==' '||cp=='\t'||cp=='\n'||cp=='\r'||cp=='\f'||cp=='\v') flush();
-        else if (em_is_punct_cp(cp)) { flush(); out.push_back({s.substr(start, i - start), start, i - start}); }
+        if (em_is_ws_cp(cp)) flush();
+        else if (em_is_punct_cp(cp)) {
+            bool inword = false;
+            if (!cur.empty() && em_is_inword_mark(cp) && i < s.size()) {
+                std::size_t peek = i; unsigned next = em_utf8_next(s, peek);
+                inword = !em_is_ws_cp(next) && !em_is_punct_cp(next);
+            }
+            if (inword) cur.append(s, start, i - start);
+            else { flush(); out.push_back({s.substr(start, i - start), start, i - start}); }
+        }
         else { if (cur.empty()) curStart = start; cur.append(s, start, i - start); }
     }
     flush();
@@ -205,11 +226,15 @@ inline bool em_ends_with_sentence_punct(const std::string &t) {
     return t.size() >= 3 && t.compare(t.size()-3, 3, "\xE2\x80\xA6") == 0;   // …
 }
 
-// First codepoint of `t` is a letter (ASCII or — crudely — any Cyrillic/multibyte lead).
+// First codepoint of `t` is a letter: ASCII A–Z/a–z, or a non-ASCII codepoint that is not a
+// punctuation mark (em_is_punct_cp), not in General Punctuation U+2000–206F (– — … “ ” ‘ ’),
+// not № U+2116 and not a malformed byte (U+FFFD). Crude on purpose beyond that.
 inline bool em_first_is_letter(const std::string &t) {
     if (t.empty()) return false;
-    unsigned char c0 = (unsigned char)t[0];
-    return (c0>='A'&&c0<='Z') || (c0>='a'&&c0<='z') || c0>=0x80;
+    std::size_t i = 0; unsigned cp = em_utf8_next(t, i);
+    if (cp < 0x80) return (cp>='A'&&cp<='Z') || (cp>='a'&&cp<='z');
+    if (em_is_punct_cp(cp) || (cp>=0x2000 && cp<=0x206F) || cp==0x2116 || cp==0xFFFD) return false;
+    return cp != 0x00AB && cp != 0x00BB && cp != 0x00A0;
 }
 // First codepoint of `t` is an UPPERCASE letter (ASCII A–Z or Cyrillic А–Я incl. Ё).
 inline bool em_first_is_upper(const std::string &t) {
@@ -228,6 +253,18 @@ inline void em_recase_first(std::string &t, bool upper) {
     if (t.empty()) return;
     if (upper) dictate_text_detail::upper_cp_at(t, 0);
     else       dictate_text_detail::lower_cp_at(t, 0);
+}
+// Any codepoint AFTER the first is an uppercase letter — an acronym or a mixed-case term
+// ("API", "NASA", "iOS", "McDonald"), whose case is its spelling and must not be re-cased.
+inline bool em_has_inner_upper(const std::string &t) {
+    std::size_t i = 0;
+    if (t.empty()) return false;
+    em_utf8_next(t, i);
+    while (i < t.size()) {
+        std::size_t st = i; em_utf8_next(t, i);
+        if (em_first_is_upper(t.substr(st, i - st))) return true;
+    }
+    return false;
 }
 
 // Lowercase a whole UTF-8 string (ASCII + Cyrillic) for case-insensitive phrase matching.
@@ -362,6 +399,8 @@ struct EditModel {
             // whitespace only), so a trailing sentence mark inside the token is a boundary too.
             if (em_ends_with_sentence_punct(t)) return true;
             if (t=="\xC2\xBB" /*»*/ || t==")" || t=="]" || t=="\xE2\x80\x9D" /*”*/ || t=="\"") continue;
+            // Opening marks between the sentence end and the slot («, (, [, {, “) — skip them too.
+            if (t=="\xC2\xAB" /*«*/ || t=="(" || t=="[" || t=="{" || t=="\xE2\x80\x9C" /*“*/) continue;
             return false;                       // a word (or non-closing punct) → mid-sentence
         }
         return true;                            // nothing before → sentence start
@@ -374,11 +413,19 @@ struct EditModel {
     //      at a gap, Capitalize only at a sentence start) — so a mid-sentence fix stays lowercase.
     void applyMiniTake(const std::string &raw) {
         std::string sym = em_spoken_punct(raw);
+        if (sym == "-" && !onWord()) { insertHyphen(); return; }
         if (!sym.empty()) { applyTokens({sym}); return; }
         std::vector<std::string> rw = em_tokenize(raw);
         if (rw.empty()) return;
-        if (rw.size() > 1 && em_is_sentence_punct(rw.back())) rw.pop_back();   // strip whisper's auto dot
-        if (em_first_is_letter(rw.front())) {
+        // A mini-take that is ONLY marks ('.', '…') is whisper hallucinating on a noise or on
+        // silence — a mark the user wanted arrives through em_spoken_punct («точка») above.
+        bool allPunct = true;
+        for (const std::string &t : rw) if (!em_is_punct_token(t)) { allPunct = false; break; }
+        if (allPunct) return;
+        // Strip only whisper's auto DOT. A '?', '!' or '…' after a dictated word is the user's
+        // own ("правда?") and stays.
+        if (rw.size() > 1 && rw.back() == ".") rw.pop_back();
+        if (em_first_is_letter(rw.front()) && !em_has_inner_upper(rw.front())) {
             int start = onWord() ? wordIndex() : gapIndex();
             bool upper = (onWord() && em_first_is_letter(words[wordIndex()]))
                        ? em_first_is_upper(words[wordIndex()])   // replace: inherit the old word's case
@@ -386,6 +433,31 @@ struct EditModel {
             em_recase_first(rw.front(), upper);
         }
         applyTokens(rw);
+    }
+
+    // Spoken «дефис» in a gap joins the neighbouring words into one hyphenated word
+    // ("кто" | "то" → "кто-то"), since a standalone '-' token is spaced on both sides by
+    // em_join. At an edge it attaches to the one neighbour; with no words it is inserted.
+    void insertHyphen() {
+        int gi = gapIndex(), n = (int)words.size();
+        bool left = gi > 0 && !em_is_punct_token(words[gi - 1]);
+        bool right = gi < n && !em_is_punct_token(words[gi]);
+        if (left && right) {
+            words[gi - 1] += "-" + words[gi];
+            words.erase(words.begin() + gi);
+            if (!conf.empty()) { conf[gi - 1] = EM_CONF_SURE; conf.erase(conf.begin() + gi); }
+            pos = 2 * (gi - 1) + 1;
+        } else if (left) {
+            words[gi - 1] += "-";
+            if (!conf.empty()) conf[gi - 1] = EM_CONF_SURE;
+            pos = 2 * (gi - 1) + 1;
+        } else if (right) {
+            words[gi] = "-" + words[gi];
+            if (!conf.empty()) conf[gi] = EM_CONF_SURE;
+            pos = 2 * gi + 1;
+        } else {
+            applyTokens({"-"});
+        }
     }
 
     // Erase token `idx` (caller guarantees 0 ≤ idx < size) and drop the cursor into the gap

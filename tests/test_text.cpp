@@ -94,7 +94,7 @@ TEST_CASE("normalize_text: abbreviation guard — single-letter token before a d
 TEST_CASE("normalize_text: collapses 3+ dots into an ellipsis") {
     CHECK(normalize_text("ну...") == "Ну…");
     CHECK(normalize_text("вот....") == "Вот…");
-    CHECK(normalize_text("ну...что") == "Ну… Что");      // ellipsis is a sentence end
+    CHECK(normalize_text("ну...что") == "Ну… что");      // … is a pause, not a sentence end (F123)
 }
 TEST_CASE("normalize_text: spaced hyphen/en-dash becomes em-dash") {
     CHECK(normalize_text("я - ты") == "Я — ты");
@@ -112,7 +112,7 @@ TEST_CASE("normalize_text: does not break mixed RU/EN") {
 
 TEST_CASE("normalize_text: leaves quotes untouched (no quote conversion)") {
     CHECK(normalize_text("он сказал \"привет\" мне") == "Он сказал \"привет\" мне"); // straight quotes kept
-    CHECK(normalize_text("«цитата» тут") == "«цитата» тут");                          // existing guillemets not mangled
+    CHECK(normalize_text("«цитата» тут") == "«Цитата» тут");                          // guillemets kept; the first letter past them is capitalized (F122)
 }
 TEST_CASE("normalize_text: consecutive sentence punctuation") {
     CHECK(normalize_text("привет!? что") == "Привет!? Что");
@@ -125,6 +125,59 @@ TEST_CASE("normalize_text: idempotent (a second pass changes nothing)") {
         "ну...что дальше",
         "я - ты, он - она",
         "сайт github.com тут",
+    };
+    for (auto s : samples) {
+        std::string once = normalize_text(s);
+        CHECK(normalize_text(once) == once);
+    }
+}
+
+// ── bug-hunt regressions (f90bf59 hunt, report F066/F142/F159/F067/F068/F069/F122/F123) ──
+TEST_CASE("normalize_text: times, scores and ports keep their colon glued (F066, F142)") {
+    CHECK(normalize_text("встреча в 12:30") == "Встреча в 12:30");
+    CHECK(normalize_text("встреча в 12:30 завтра") == "Встреча в 12:30 завтра");
+    CHECK(normalize_text("счёт 3:1") == "Счёт 3:1");
+    CHECK(normalize_text("localhost:3000") == "Localhost:3000");
+}
+TEST_CASE("normalize_text: URLs, queries and C++ scope stay intact (F066, F142, F067)") {
+    CHECK(normalize_text("открой https://example.com/a?x=1") == "Открой https://example.com/a?x=1");
+    CHECK(normalize_text("site.com/a?id=5") == "Site.com/a?id=5");
+    CHECK(normalize_text("тип std::vector тут") == "Тип std::vector тут");
+    CHECK(normalize_text("почта a@b.ru,ок") == "Почта a@b.ru,ок");   // code-like token: left alone
+}
+TEST_CASE("normalize_text: a closing quote is not split off its mark (F159)") {
+    CHECK(normalize_text("Он сказал \"Привет!\" и ушёл") == "Он сказал \"Привет!\" и ушёл");
+    CHECK(normalize_text("\xE2\x80\x9C\xD0\x94\xD0\xB0?\xE2\x80\x9D \xE2\x80\x94 спросил он")
+          == "\xE2\x80\x9C\xD0\x94\xD0\xB0?\xE2\x80\x9D \xE2\x80\x94 спросил он");     // “Да?” — спросил он
+    CHECK(normalize_text("сказал:\"привет\"") == "Сказал: \"привет\"");                     // after ':' it opens
+}
+TEST_CASE("normalize_text: a dot that starts a name keeps the space before it (F068)") {
+    CHECK(normalize_text("файл .env тут") == "Файл .env тут");
+    CHECK(normalize_text("нужен .NET") == "Нужен .NET");
+}
+TEST_CASE("normalize_text: «я» and I end a sentence; initials still do not (F069)") {
+    CHECK(normalize_text("это был я. потом ушёл") == "Это был я. Потом ушёл");
+    CHECK(normalize_text("it was I. then") == "It was I. Then");
+    CHECK(normalize_text("и т.д. конец") == "И т.д. конец");
+    CHECK(normalize_text("в XV в. было") == "В XV в. было");
+    CHECK(normalize_text("«я. потом»") == "«Я. Потом»");                     // after an opening mark too
+}
+TEST_CASE("normalize_text: capitalizes past an opening quote, bracket or dialogue dash (F122)") {
+    CHECK(normalize_text("Он ушёл. «привет, мир»") == "Он ушёл. «Привет, мир»");
+    CHECK(normalize_text("(привет) мир") == "(Привет) мир");
+    CHECK(normalize_text("Ну. — да") == "Ну. — Да");
+}
+TEST_CASE("normalize_text: no capital after a mid-sentence ellipsis (F123)") {
+    CHECK(normalize_text("Ну... не знаю") == "Ну… не знаю");
+    CHECK(normalize_text("Я думаю... может, завтра") == "Я думаю… может, завтра");
+}
+TEST_CASE("normalize_text: idempotent over the regression inputs") {
+    const char *samples[] = {
+        "встреча в 12:30, потом https://example.com/a?x=1",
+        "Он сказал \"Привет!\" и ушёл",
+        "файл .env тут. это был я. потом",
+        "Он ушёл. «привет, мир»",
+        "сказал:\"привет\"",
     };
     for (auto s : samples) {
         std::string once = normalize_text(s);

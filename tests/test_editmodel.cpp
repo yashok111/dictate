@@ -212,7 +212,7 @@ TEST_CASE("em_nearest_word_on_line: a tie keeps the first (strict <)") {
 TEST_CASE("em_tokenize: punctuation splits into its own token") {
     CHECK(em_tokenize("тест.")        == std::vector<std::string>{"тест","."});
     CHECK(em_tokenize("привет, мир")  == std::vector<std::string>{"привет",",","мир"});
-    CHECK(em_tokenize("a.b")          == std::vector<std::string>{"a",".","b"});
+    CHECK(em_tokenize("a.b")          == std::vector<std::string>{"a.b"});       // glued mark stays in the word (F060, F141)
     CHECK(em_tokenize("...")          == std::vector<std::string>{".",".","."});
     CHECK(em_tokenize("дела?!")       == std::vector<std::string>{"дела","?","!"});
     CHECK(em_tokenize("«тест»")       == std::vector<std::string>{"«","тест","»"});
@@ -596,4 +596,66 @@ TEST_CASE("applyMiniTake after a paste ending in sentence punctuation capitalize
     k.pos = 2; k.applyPaste("слово,"); k.pos = k.maxPos();
     k.applyMiniTake("Дальше.");
     CHECK(k.words.back() == "дальше");                               // mid-sentence after «слово,» → lowercase
+}
+
+// ── bug-hunt regressions (f90bf59 hunt, report F060/F141/F065/F061/F143/F158/F117/F157/F118) ──
+TEST_CASE("fromText().joined() round-trips glued marks unchanged (F060, F141)") {
+    const char *samples[] = {
+        "версия 3,5 в 10:30 на example.com т.е. так",
+        "github.com", "3.14", "v2.0", "12:30", "т.д.", "a.b", "host:8080",
+        "открой https://example.com/a?x=1", "Привет, мир!", "Это «тест», да?",
+    };
+    for (auto s : samples) CHECK(EditModel::fromText(s).joined() == s);
+}
+TEST_CASE("em_tokenize: a glued mark stays inside its word, a trailing one splits (F060)") {
+    CHECK(em_tokenize("т.е. так") == std::vector<std::string>{"т.е", ".", "так"});
+    CHECK(em_tokenize("в 10:30.") == std::vector<std::string>{"в", "10:30", "."});
+    CHECK(em_tokenize("ну...да")  == std::vector<std::string>{"ну", ".", ".", ".", "да"});   // a run of marks still splits
+}
+TEST_CASE("em_utf8_next: a malformed byte decodes to U+FFFD, never to « or » (F065)") {
+    std::string s = "\xAB"; std::size_t i = 0;
+    CHECK(em_utf8_next(s, i) == 0xFFFDu); CHECK(i == 1);
+    CHECK(em_tokenize("сл\xABово") == std::vector<std::string>{"сл\xABово"});   // not split as «
+}
+TEST_CASE("applyMiniTake: acronyms and mixed-case terms keep their case (F061)") {
+    EditModel m = EditModel::fromText("это слово тут"); m.pos = 3;
+    m.applyMiniTake("API.");
+    CHECK(m.words[1] == "API");
+    EditModel n = EditModel::fromText("Это слово тут"); n.pos = 1;   // replacing a Capitalized word
+    n.applyMiniTake("iOS.");
+    CHECK(n.words[0] == "iOS");
+}
+TEST_CASE("applyMiniTake: only whisper's dot is stripped; ? ! … stay (F143)") {
+    EditModel m = EditModel::fromText("это слово тут"); m.pos = 3;
+    m.applyMiniTake("Правда?");
+    CHECK(m.words == std::vector<std::string>{"это", "правда", "?", "тут"});
+}
+TEST_CASE("applyMiniTake: a mini-take of only marks changes nothing (F158)") {
+    EditModel m = EditModel::fromText("это слово тут"); m.pos = 3;
+    m.applyMiniTake(".");
+    CHECK(m.words == std::vector<std::string>{"это", "слово", "тут"});
+    m.applyMiniTake("...");
+    CHECK(m.words == std::vector<std::string>{"это", "слово", "тут"});
+}
+TEST_CASE("atSentenceStart skips opening marks after a sentence end (F117)") {
+    EditModel m; m.words = {"Он", "сказал", ".", "\xC2\xAB"}; m.pos = 8;   // gap after «
+    m.applyMiniTake("привет.");
+    CHECK(m.words == std::vector<std::string>{"Он", "сказал", ".", "\xC2\xAB", "Привет"});
+}
+TEST_CASE("em_first_is_letter: multibyte punctuation is not a letter (F157)") {
+    CHECK_FALSE(em_first_is_letter("\xC2\xAB"));            // «
+    CHECK_FALSE(em_first_is_letter("\xE2\x80\x94"));        // —
+    CHECK_FALSE(em_first_is_letter("\xE2\x80\xA6"));        // …
+    CHECK_FALSE(em_first_is_letter("\xE2\x84\x96"));        // №
+    CHECK(em_first_is_letter("ёж"));
+    EditModel m; m.words = {"Привет", ".", "\xC2\xAB", "Мир", "\xC2\xBB"}; m.pos = 5;   // on «
+    m.applyMiniTake("мир.");
+    CHECK(m.words[2] == "Мир");                                 // sentence start → Capital
+}
+TEST_CASE("applyMiniTake: spoken «дефис» in a gap joins the neighbours (F118)") {
+    EditModel m = EditModel::fromText("кто то пришёл"); m.pos = 2;   // gap between кто and то
+    m.applyMiniTake("Дефис.");
+    CHECK(m.words == std::vector<std::string>{"кто-то", "пришёл"});
+    CHECK(m.joined() == "кто-то пришёл");
+    CHECK(m.pos == 1);
 }

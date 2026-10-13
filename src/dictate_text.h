@@ -93,12 +93,22 @@ inline bool dot_is_boundary(const std::string &s, size_t i) {
     unsigned char prev = i>0 ? (unsigned char)s[i-1] : 0;
     if (is_ascii_digit(prev) && is_ascii_digit((unsigned char)s[j])) return false; // "3. 14"
     // Abbreviation guard: if the token immediately before the dot is a single letter
-    // (е.g. "т.", "и.", "г."), treat it as an abbreviation/initial, not a sentence end.
+    // (е.g. "т.", "г.", "в."), treat it as an abbreviation/initial, not a sentence end —
+    // except the one-letter pronouns «я» and "I", which end sentences ("это был я. потом").
     if (is_letterish(prev)) {
         size_t k = i;                            // count codepoints in the letter run ending at i-1
         int cps = 0;
         while (k>0 && is_letterish((unsigned char)s[k-1])) { if (!is_cont((unsigned char)s[k-1])) cps++; k--; if (cps>=2) break; }
-        if (cps < 2) return false;
+        if (cps < 2) {
+            bool pronoun = (i-k==1 && s[k]=='I') ||
+                           (i-k==2 && (unsigned char)s[k]==0xD1 && (unsigned char)s[k+1]==0x8F);   // я U+044F
+            // a word start: string start, a space, or an opening mark («я. потом», "(I. then")
+            bool word_start = k==0 || s[k-1]==' ' || s[k-1]=='(' || s[k-1]=='[' || s[k-1]=='"' || s[k-1]=='\'' ||
+                              (k>=2 && (unsigned char)s[k-2]==0xC2 && (unsigned char)s[k-1]==0xAB) ||          // «
+                              (k>=3 && (unsigned char)s[k-3]==0xE2 && (unsigned char)s[k-2]==0x80 &&
+                               ((unsigned char)s[k-1]==0x9C || (unsigned char)s[k-1]==0x9E));                 // “ „
+            if (!(pronoun && word_start)) return false;
+        }
     }
     return true;
 }
@@ -140,7 +150,11 @@ inline std::string trim_punct_spaces(const std::string &a) {
     for (size_t i=0; i<a.size();) {
         if (a[i]==' ') {
             size_t j=i; while (j<a.size() && a[j]==' ') j++;            // run of spaces
-            if (close_punct_len(a,j)>0) { i=j; continue; }             // space(s) before close punct → drop
+            // space(s) before close punct → drop; but a '.' that starts a name (".env", ".NET",
+            // ".5") is not punctuation — the space before it is a word boundary and stays.
+            bool dot_name = j+1<a.size() && a[j]=='.' && a[j+1]!=' ' && a[j+1]!='.' &&
+                            (is_letterish((unsigned char)a[j+1]) || is_ascii_digit((unsigned char)a[j+1]));
+            if (close_punct_len(a,j)>0 && !dot_name) { i=j; continue; }
             out += ' '; i=j; continue;                                  // otherwise keep one
         }
         if (int op = open_punct_len(a,i)) {                             // open punct → emit, then drop trailing spaces
@@ -153,9 +167,36 @@ inline std::string trim_punct_spaces(const std::string &a) {
     return out;
 }
 
+// Length of a closing QUOTE at s[j] that never takes a space before it after , ! ? ; …:
+// ASCII " and ', and the curly closers ” U+201D / ’ U+2019. (» is in close_punct_len.)
+inline int close_quote_len(const std::string &s, size_t j) {
+    if (j >= s.size()) return 0;
+    unsigned char c = (unsigned char)s[j];
+    if (c=='"' || c=='\'') return 1;
+    if (c==0xE2 && j+2<s.size() && (unsigned char)s[j+1]==0x80 &&
+        ((unsigned char)s[j+2]==0x9D || (unsigned char)s[j+2]==0x99)) return 3;
+    return 0;
+}
+
+// Is the whitespace-delimited token containing s[i] code-like — a URL, path, query, e-mail,
+// assignment or C++ scope ("https://x/y?z=1", "a@b.c", "std::vector")? Punctuation inside such
+// a token is part of it, so no space is ever inserted there.
+inline bool in_codeish_token(const std::string &s, size_t i) {
+    size_t b = i; while (b>0 && s[b-1]!=' ') b--;
+    size_t e = i; while (e<s.size() && s[e]!=' ') e++;
+    for (size_t k=b; k<e; k++) {
+        char c = s[k];
+        if (c=='/' || c=='=' || c=='@' || c=='&' || c=='\\') return true;
+        if (c==':' && k+1<e && s[k+1]==':') return true;
+    }
+    return false;
+}
+
 // Pass: ensure a single space AFTER clause/exclamatory punctuation when it is glued to the
 // next word. Applies to , ; : ! ? and … — NOT to '.' (a glued period is almost always a
-// domain/file/version/abbreviation, so we never split it). Comma keeps decimals intact.
+// domain/file/version/abbreviation, so we never split it). Never splits a digit pair
+// ("3,5", "12:30", "3:1"), a code-like token (URLs, paths, queries, "std::x"), or a closing
+// quote off the mark it follows (`"Привет!"`).
 inline std::string space_after_punct(const std::string &a) {
     std::string out; out.reserve(a.size()+8);
     for (size_t i=0; i<a.size();) {
@@ -167,8 +208,11 @@ inline std::string space_after_punct(const std::string &a) {
             out.append(a, i, plen);
             size_t k=i+plen;
             if (k<a.size() && a[k]!=' ' && close_punct_len(a,k)==0) {
-                bool decimal = (c==',') && i>0 && is_ascii_digit((unsigned char)a[i-1]) && is_ascii_digit((unsigned char)a[k]);
-                if (!decimal) out += ' ';
+                bool digits = (i>0 && is_ascii_digit((unsigned char)a[i-1]) && is_ascii_digit((unsigned char)a[k])) ||
+                              (c==':' && is_ascii_digit((unsigned char)a[k]));          // a port: "localhost:3000"
+                // A quote right after , ! ? ; … closes the quotation; after ':' it opens one.
+                bool closing_quote = c!=':' && close_quote_len(a,k)>0;
+                if (!digits && !closing_quote && !in_codeish_token(a,i)) out += ' ';
             }
             i+=plen; continue;
         }
@@ -177,18 +221,39 @@ inline std::string space_after_punct(const std::string &a) {
     return out;
 }
 
+// Skip opening marks before a sentence's first letter: « ( [ " ' “ „ and a dash that opens a
+// line of dialogue ("— да"), with the spaces after them. Returns the index of the first byte
+// that is not one of them.
+inline size_t skip_openers(const std::string &a, size_t j) {
+    for (;;) {
+        if (j >= a.size()) return j;
+        unsigned char c = (unsigned char)a[j];
+        size_t n = 0;
+        if (int op = open_punct_len(a, j)) n = (size_t)op;
+        else if (c=='"' || c=='\'') n = 1;
+        else if (c==0xE2 && j+2<a.size() && (unsigned char)a[j+1]==0x80 &&
+                 ((unsigned char)a[j+2]==0x9C || (unsigned char)a[j+2]==0x9E ||          // “ „
+                  (unsigned char)a[j+2]==0x94)) n = 3;                                     // —
+        if (!n) return j;
+        j += n; while (j<a.size() && a[j]==' ') j++;
+    }
+}
+
 // Pass: capitalize the first letter of the string and the first letter after each
-// sentence-ending punctuation (. ! ? …). Uses dot_is_boundary for the '.' case.
+// sentence-ending punctuation (. ! ?), skipping opening quotes/brackets/a dialogue dash.
+// '!' and '?' end a sentence only when a space follows (a glued one is a query string or a
+// "!?" run); '.' uses dot_is_boundary. '…' is NOT an ender: it is usually a mid-sentence
+// trailing-off ("Ну… не знаю"), and whisper already capitalizes a real new sentence.
 inline std::string capitalize(std::string a) {
-    if (!a.empty() && is_letterish((unsigned char)a[0])) upper_cp_at(a, 0);
+    { size_t j = skip_openers(a, 0); if (j<a.size() && is_letterish((unsigned char)a[j])) upper_cp_at(a, j); }
     for (size_t i=0; i<a.size();) {
         unsigned char c = (unsigned char)a[i];
         bool ender=false; size_t after=i+1;
-        if (c=='!'||c=='?') ender=true;
+        if (c=='!'||c=='?') ender = (i+1<a.size() && a[i+1]==' ');
         else if (c=='.') ender = dot_is_boundary(a, i);
-        else if (c==0xE2 && i+2<a.size() && (unsigned char)a[i+1]==0x80 && (unsigned char)a[i+2]==0xA6) { ender=true; after=i+3; } // …
         if (ender) {
             size_t j=after; while (j<a.size() && a[j]==' ') j++;
+            j = skip_openers(a, j);
             if (j<a.size()) upper_cp_at(a, j);
             i=after; continue;
         }
