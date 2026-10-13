@@ -61,6 +61,6 @@ touching `StreamingSession`, `Recorder`, the built-in-mic pin, HAL recovery, or 
   `wd_reason_is_wedge` reason, so it takes no `sample` snapshot (nothing is stuck). Every successful
   mic start logs its own timings — `capture live: … (engine N ms, fmt N ms, start N ms)`, plus a
   warning past `MIC_START_SLOW_MS` — so a mic start creeping toward `DICTATE_TAKESTART_SEC` is
-  visible in `/tmp/dictate.log` before it costs a restart.
+  visible in the daemon log (`~/.local/share/dictate/dictate.log`) before it costs a restart.
 - **whisper's built-in Silero VAD** is enabled in `make_params` on top of all
   that — it trims silence *inside* each segment (see gotcha #3).

@@ -105,7 +105,7 @@ and rebuilds the engine — without physically unplugging anything; works both i
 The take-start deadline has its own e2e hook for the same reason (nothing else hangs the mic
 start on demand): `DICTATE_DEBUG_TAKESTART_STALL=<sec>` (with `DICTATE_DEBUG`) stalls inside the
 armed window, on the main queue, under `g_mu` — start a take and the daemon restarts with reason
-`take-start` and leaves a `/tmp/dictate-wedge-*.txt` naming `daemon_start`.
+`take-start` and leaves a `~/.local/share/dictate/wedge/wedge-*.txt` naming `daemon_start`.
 `DICTATE_DEBUG_POISON=1` (with `DICTATE_DEBUG`) is the same kind of hook for the deferred
 `audio-poisoned` restart: every successful mic start reports a fake `kAudioHardwareIllegalOperationError`,
 so a take + cancel is enough to watch the daemon wait out the take and then restart while idle.
@@ -113,12 +113,18 @@ Each connection is served on **its own thread** (`socket_accept_loop`, capped at
 `SOCK_MAX_INFLIGHT`): most verbs `dispatch_sync` to the main queue, so serving inline meant one
 client blocked on a wedged main thread starved the accept loop and `restart` — the verb whose
 job is to break that wedge — was never even read. Editor protocol (daemon ↔ the
-`dictate editor` process): `corr-start`→`ok` (mini-take mic on), `corr-stop`→transcript,
+`dictate editor` process): `corr-start`→`ok` (mini-take mic on), `corr-stop`→`<takeId>\t<text>`
+(the mini-take's id, a TAB, its raw transcript; `\t` alone when nothing was heard),
 `corr-cancel`→`ok`, `accept <text>`→`ok` (refocus target + paste), `editor-cancel`→`ok`,
-`edit <text>`→`ok` (debug: open the editor on text, no mic). Standalone:
+`correction-apply <id>\t<replace|insert>\t<hex raw>\t<hex applied>\t<hex target>`→`ok` / `err malformed`
+(logging only: records one applied voice correction in the NDJSON take log; the three texts are
+hex-encoded so a TAB or newline in them cannot break the line), `edit <text>`→`ok` (debug: open the
+editor on text, no mic). Client/diagnostic: `axcheck`→`trusted`/`untrusted` (Accessibility, used by
+`scripts/post-build-check.sh`). Standalone:
 `dictate editor "слова"` runs the editor alone (stubbed mini-take). Socket
 `~/.local/share/dictate/dictate.sock` (owner-only dir, NOT world-writable `/tmp`: both ends check the peer uid; override `$DICTATE_SOCK` to run a test daemon off the live one) ·
-logs `/tmp/dictate.log`, `/tmp/dictate-editor.log`.
+logs `~/.local/share/dictate/dictate.log`, `~/.local/share/dictate/dictate-editor.log` (same owner-only
+dir; the LaunchAgent plist points launchd there too).
 
 ## Architecture
 
@@ -131,7 +137,7 @@ logs `/tmp/dictate.log`, `/tmp/dictate-editor.log`.
   marshal there via GCD. `stop`'s blocking `finish()` runs **off-main** so the run
   loop never freezes.
 - **Client** (`client_cmd` / `ensure_daemon`): `start` auto-spawns the daemon
-  (fork+setsid+exec, logging to `/tmp/dictate.log`) if none answers, then polls
+  (fork+setsid+exec, logging to `~/.local/share/dictate/dictate.log`) if none answers, then polls
   ~6 s for it to come up (covers the model-load window).
 - **StreamingSession**: energy-VAD segments the 16 kHz mono stream at pauses; **one worker
   thread** runs `whisper_full` per closed segment and appends text in order — that's the
@@ -220,7 +226,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.dictate.plist  
 launchctl bootout   gui/$(id -u)/com.user.dictate                              # stop + disable
 launchctl kickstart -k gui/$(id -u)/com.user.dictate                           # restart (pick up a new build)
 launchctl print gui/$(id -u)/com.user.dictate | grep -E 'state|pid'            # status
-tail -f /tmp/dictate.log                                                       # logs
+tail -f ~/.local/share/dictate/dictate.log                                     # logs
 ```
 
 If you see two daemon processes, you have a stray (manual or pre-LaunchAgent
@@ -260,6 +266,8 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
   itself**, because `finish()` is shared with the editor mini-take (`corr-stop`), where a
   single-word voice correction must stay verbatim (sentence-capitalizing a one-word replacement
   would be wrong). The standalone `--file` path is left raw (it's the A/B reference).
+- `DICTATE_NO_CLIPBOARD=1` — `--file` prints the transcript to stdout only, without copying it to the
+  clipboard (`scripts/bench-wer.py` sets it so a batch run leaves the clipboard alone).
 - `WHISPER_THREADS=N` overrides the CPU-thread count. Default = performance-core
   count (`hw.perflevel0.physicalcpu`), not all logical cores: the workload is
   GPU-bound so thread count barely matters, and this keeps whisper off the E-cores.

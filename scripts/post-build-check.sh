@@ -4,6 +4,7 @@ set -euo pipefail
 repo_bin="${1:-./dictate}"
 installed_bin="${2:-$HOME/.local/bin/dictate}"
 label="${DICTATE_LAUNCHD_LABEL:-com.user.dictate}"
+sign_id="${SIGN_ID:-dictate-codesign}"   # the Makefile's signing identity (TCC grants are keyed to it)
 service="gui/$(id -u)/$label"
 
 fail=0
@@ -26,8 +27,13 @@ check_signature() {
     note "run: scripts/make-codesign-cert.sh && make"
   elif [[ "$ident" != "com.user.dictate" ]]; then
     bad "$name has wrong signing identifier: ${ident:-<none>}"
+  elif ! printf '%s\n' "$sig" | grep -qx "Authority=$sign_id"; then
+    # The identifier string is free text; the TCC grant follows the CERTIFICATE. A binary signed
+    # by any other identity with the same identifier would otherwise pass and lose the grants.
+    bad "$name is not signed by the '$sign_id' certificate"
+    note "run: make  (re-signs with $sign_id)"
   else
-    ok "$name is signed as com.user.dictate"
+    ok "$name is signed as com.user.dictate by $sign_id"
   fi
 }
 

@@ -108,6 +108,17 @@ static std::string default_sock_path(void) {
 }
 static const std::string SOCK_PATH_S = getenv("DICTATE_SOCK") ? getenv("DICTATE_SOCK") : default_sock_path();
 static const char *SOCK_PATH  = SOCK_PATH_S.c_str();
+// The daemon's and the editor's stdout/stderr logs live in the same owner-only directory: a fixed
+// /tmp path let another local user pre-create or symlink it (F087, F024). Computed once at startup
+// because the restart path that opens one must not allocate.
+static std::string data_file_path(const char *name, const char *noHome) {
+    std::string dir = sock_dir_path();
+    return dir.empty() ? std::string(noHome) : dir + "/" + name;
+}
+static const std::string LOG_PATH_S        = data_file_path("dictate.log",        "/tmp/dictate.log");
+static const std::string EDITOR_LOG_PATH_S = data_file_path("dictate-editor.log", "/tmp/dictate-editor.log");
+static const char *LOG_PATH        = LOG_PATH_S.c_str();
+static const char *EDITOR_LOG_PATH = EDITOR_LOG_PATH_S.c_str();
 
 // VAD / segmentation tuning (FRAME, SPEECH_FACTOR, ABS_FLOOR, SPEECH_CONFIRM_FR,
 // SILENCE_CLOSE_FR, PREROLL_FR, MAX_SEG_FR) + the pure energy-VAD state machine moved to
@@ -484,7 +495,7 @@ private:
                 // quietest of the last CUT_WIN_FR frames instead and carry the frames after it into
                 // the pre-roll, which seeds the contiguous next segment (F107). A silence close
                 // carries nothing (the pre-roll was already emptied at onset).
-                size_t tail = tooLong ? (size_t)cut_tail_frames(cutRms_, cutN_) * FRAME : 0;
+                size_t tail = seg_.contiguousReopen ? (size_t)cut_tail_frames(cutRms_, cutN_) * FRAME : 0;   // a forced cut armed the seam
                 preroll_.assign(cur_.end() - (std::ptrdiff_t)tail, cur_.end());   // within reserve → no realloc
                 cur_.resize(cur_.size() - tail);
                 tailSamples_ = tail; cutN_ = 0;
@@ -1081,6 +1092,16 @@ static bool mkdir_owner(const std::string &path) {
     if (mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) return false;
     chmod(path.c_str(), 0700);
     return true;
+}
+// ~/.local/share/dictate (socket, logs) exists, owner-held, 0700. True when there is no HOME
+// (the /tmp fallbacks are then in use) — false only when the directory cannot be made safe.
+static bool ensure_data_dir(void) {
+    std::string dir = sock_dir_path();
+    if (dir.empty()) return true;
+    std::string local = std::string(getenv("HOME")) + "/.local", share = local + "/share";
+    if (!mkdir_owner(local) || !mkdir_owner(share) || !mkdir_owner(dir)) return false;
+    struct stat ds;
+    return stat(dir.c_str(), &ds) == 0 && S_ISDIR(ds.st_mode) && ds.st_uid == geteuid();
 }
 
 static std::string log_dir_path(void) {
@@ -1681,7 +1702,7 @@ static bool spawn_replacement_daemon(void) {
     std::string self = self_path();
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_addopen(&fa, 0, "/dev/null",      O_RDONLY,                             0);
-    posix_spawn_file_actions_addopen(&fa, 1, "/tmp/dictate.log", O_CREAT|O_WRONLY|O_APPEND|O_NOFOLLOW, 0600);
+    posix_spawn_file_actions_addopen(&fa, 1, LOG_PATH, O_CREAT|O_WRONLY|O_APPEND|O_NOFOLLOW, 0600);
     posix_spawn_file_actions_adddup2(&fa, 1, 2);
     posix_spawnattr_t at; posix_spawnattr_init(&at);
     posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSID);
@@ -2171,7 +2192,7 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
 }
 - (void)menuToggle:(id)sender  { (void)sender; [self toggle]; }
 - (void)menuOpenLog:(id)sender { (void)sender;
-    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:@"/tmp/dictate.log"]]; }
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:@(LOG_PATH)]]; }
 - (void)menuRestart:(id)sender { (void)sender;
     [self showHint:@"⟳ перезапуск…"];                                    // the banner is the only ACK the user gets
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(0.4*NSEC_PER_SEC)),
@@ -2597,24 +2618,17 @@ static void socket_accept_loop(int srv) {
 
 static int run_daemon(const std::string &modelPath, bool replacing) {
     signal(SIGPIPE, SIG_IGN);   // a client that disconnects mid-reply must not kill the daemon
-    g_daemon_logs = true;       // per-segment decode + finish() timings go to /tmp/dictate.log
+    g_daemon_logs = true;       // per-segment decode + finish() timings go to the daemon log (LOG_PATH)
     umask(0077);                // daemon-created files (socket, editor log) → owner-only, not world-readable
     g_take_logger.prune();
     if (SOCK_PATH_S.size() >= sizeof(sockaddr_un{}.sun_path)) {   // strncpy below would silently truncate it
         slog("socket path too long (%zu bytes): %s\n", SOCK_PATH_S.size(), SOCK_PATH); return 1;
     }
-    if (!getenv("DICTATE_SOCK")) {                    // the default lives in ~/.local/share/dictate (0700)
-        std::string dir = sock_dir_path();
-        if (!dir.empty()) {
-            std::string local = std::string(getenv("HOME")) + "/.local", share = local + "/share";
-            if (!mkdir_owner(local) || !mkdir_owner(share) || !mkdir_owner(dir)) {
-                slog("cannot create socket directory %s: %s\n", dir.c_str(), strerror(errno)); return 1;
-            }
-            struct stat ds;
-            if (stat(dir.c_str(), &ds) != 0 || !S_ISDIR(ds.st_mode) || ds.st_uid != geteuid()) {
-                slog("socket directory %s is not an owner-held directory — refusing\n", dir.c_str()); return 1;
-            }
-        }
+    // ~/.local/share/dictate (0700) holds the default socket and the logs. Without it the default
+    // socket cannot be bound safely; with $DICTATE_SOCK only the logs need it, so carry on.
+    if (!ensure_data_dir()) {
+        slog("cannot make %s an owner-only directory: %s\n", sock_dir_path().c_str(), strerror(errno));
+        if (!getenv("DICTATE_SOCK")) return 1;
     }
     // single instance: if a daemon already answers, bow out. EXCEPT when we were spawned as a
     // replacement (`daemon --replace`): the outgoing daemon is still listening at that moment
@@ -2701,14 +2715,15 @@ static std::string self_path(void) {
     return std::string(buf);
 }
 
-// spawn `dictate daemon`, detached, logging to /tmp/dictate.log, and wait for it.
+// spawn `dictate daemon`, detached, logging to LOG_PATH, and wait for it.
 static int ensure_daemon(void) {
     int c=connect_daemon(); if (c>=0){ close(c); return 0; }
     pid_t pid=fork();
     if (pid<0) return -1;
     if (pid==0) {
         setsid();
-        int log=open("/tmp/dictate.log",O_CREAT|O_WRONLY|O_APPEND|O_NOFOLLOW,0600);
+        (void)ensure_data_dir();   // first run: the log directory may not exist yet
+        int log=open(LOG_PATH,O_CREAT|O_WRONLY|O_APPEND|O_NOFOLLOW,0600);
         if (log>=0){ dup2(log,1); dup2(log,2); close(log); }
         int devnull=open("/dev/null",O_RDONLY); if(devnull>=0){ dup2(devnull,0); close(devnull); }
         std::string self=self_path();
@@ -2779,7 +2794,7 @@ static void edlog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap]; va_end(ap);
     NSString *l = [NSString stringWithFormat:@"[ed %8.0f] %@\n", now_ms(), m];
-    fputs(l.UTF8String ?: "", stderr); fflush(stderr);   // daemon redirects the editor's stderr → /tmp/dictate-editor.log
+    fputs(l.UTF8String ?: "", stderr); fflush(stderr);   // daemon redirects the editor's stderr → EDITOR_LOG_PATH
 }
 
 // NSPanel (not NSWindow): with NSWindowStyleMaskNonactivatingPanel it can become KEY and receive
@@ -3249,7 +3264,7 @@ static bool spawn_editor(NSString *transcript, NSString *conf) {
     fcntl(pfd[0], F_SETFD, FD_CLOEXEC); fcntl(pfd[1], F_SETFD, FD_CLOEXEC);   // only the dup2 below crosses
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, pfd[0], 0);                                   // read end → editor stdin
-    posix_spawn_file_actions_addopen(&fa, 1, "/tmp/dictate-editor.log",  O_CREAT|O_WRONLY|O_APPEND|O_NOFOLLOW, 0600);
+    posix_spawn_file_actions_addopen(&fa, 1, EDITOR_LOG_PATH,  O_CREAT|O_WRONLY|O_APPEND|O_NOFOLLOW, 0600);
     posix_spawn_file_actions_adddup2(&fa, 1, 2);
     char *argv[] = { (char*)"dictate", (char*)"editor", (char*)"--from-daemon", (char*)"--stdin",
                      (char*)"--conf", (char*)c.c_str(), nullptr };
@@ -3498,7 +3513,13 @@ int main(int argc, char **argv) {
         }
         double ms=now_ms()-tt;
         fprintf(stderr,"✓ %.2fs audio → %.0f ms (×%.1f realtime)%s\n", secs, ms, ms>0?secs*1000.0/ms:0, once?" [single-pass]":" [streaming]");
-        if (!text.empty()){ NSString *ns=[NSString stringWithUTF8String:text.c_str()]; if(ns) copy_to_clipboard(ns); printf("%s\n",text.c_str()); }
+        if (!text.empty()){
+            // DICTATE_NO_CLIPBOARD=1: stdout only — a batch run (scripts/bench-wer.py) must not
+            // overwrite the user's clipboard twice per clip (F124).
+            const char *nc = getenv("DICTATE_NO_CLIPBOARD");
+            if (!(nc && !strcmp(nc, "1"))) { NSString *ns=[NSString stringWithUTF8String:text.c_str()]; if(ns) copy_to_clipboard(ns); }
+            printf("%s\n",text.c_str());
+        }
         else fprintf(stderr,"🎙 empty\n");
         return 0;   // ctx freed by its unique_ptr
     }

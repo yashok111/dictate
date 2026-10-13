@@ -167,13 +167,14 @@ install_set() {
   local -a skills=("$@")
   echo
   echo "=== $repo (${#skills[@]} skills) -> agents: ${AGENTS[*]} ==="
-  # -y skips prompts; repeated -a targets both local agents. --skill matches
+  # -y skips prompts; ONE -a followed by the space-separated agents targets both — a repeated
+  # -a silently installs only the last agent (nothing for Claude Code). --skill matches
   # each SKILL.md `name:` field (spaces ok).
   # SUPPLY CHAIN: `npx -y -p skills` fetches+runs the `skills` package unpinned, and the
   # repos above are third-party. This runs arbitrary code as you — only run it for sources
   # you trust. To harden, pin the package (e.g. `-p skills@X.Y.Z`) and the repos to a commit.
   run npx -y -p skills skills add "$repo" -y \
-    -a "${AGENTS[0]}" -a "${AGENTS[1]}" --skill "${skills[@]}"
+    -a "${AGENTS[@]}" --skill "${skills[@]}"
 }
 
 cd "$(dirname "$0")/.."  # cwd -> repo root (local agent skill directories)
