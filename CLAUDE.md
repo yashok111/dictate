@@ -101,7 +101,10 @@ via the main queue, force-restarted from the socket thread after 2 s if main is 
 force-restart e2e — **gated on `DICTATE_DEBUG`**, otherwise `err unknown`),
 `reconfig`→`ok` (debug, same gate: run the route-change path — `Recorder -reconfigure`, which drops
 and rebuilds the engine — without physically unplugging anything; works both idle and mid-take),
-`quit`→`bye`.
+`quit`→`bye` (waits up to ~4 s for a take still being finalized, so its text reaches the editor/log;
+forced from the socket thread after 6 s if the main queue is wedged — like `restart`).
+A command is executed only as a complete newline-terminated line. `accept` with no editor open →
+`err no editor`; `start` while the editor is open → `err busy`.
 The take-start deadline has its own e2e hook for the same reason (nothing else hangs the mic
 start on demand): `DICTATE_DEBUG_TAKESTART_STALL=<sec>` (with `DICTATE_DEBUG`) stalls inside the
 armed window, on the main queue, under `g_mu` — start a take and the daemon restarts with reason
@@ -229,6 +232,10 @@ launchctl print gui/$(id -u)/com.user.dictate | grep -E 'state|pid'            #
 tail -f ~/.local/share/dictate/dictate.log                                     # logs
 ```
 
+A daemon holds an flock on `<socket>.lock` for its whole life, so a second one started at the same
+moment bows out (a `--replace` successor waits for its predecessor). The daemon counts as
+launchd-managed only when `XPC_SERVICE_NAME` equals the label (`$DICTATE_LAUNCHD_LABEL`, default
+`com.user.dictate`); otherwise a restart spawns its own successor.
 If you see two daemon processes, you have a stray (manual or pre-LaunchAgent
 auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -f
 'dictate daemon'; rm -f ~/.local/share/dictate/dictate.sock; launchctl bootstrap gui/$(id -u) …`.

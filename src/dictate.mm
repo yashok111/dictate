@@ -61,6 +61,7 @@
 #include <mach-o/dyld.h>
 #include <spawn.h>           // posix_spawn — spawn the editor safely from the multithreaded daemon
 #include <crt_externs.h>     // _NSGetEnviron — environment for posix_spawn
+#include <sys/file.h>        // flock — the single-instance lock beside the socket
 #include <sys/wait.h>        // waitpid — reap the editor child + recover if it dies
 #include <sys/time.h>        // struct timeval — SO_RCVTIMEO on accepted client sockets
 #include <sys/uio.h>         // writev — stamp + message in ONE write, so log lines can't interleave
@@ -130,6 +131,7 @@ static const int    MAX_TAKE_SEC      = 120;     // hard cap on ONE take's buffe
 // Daemon spawn / liveness polling — named to avoid magic numbers (ES.45).
 static const int    DAEMON_POLL_TRIES = 300;          // ~6 s total (covers the model-load window)
 static const long   DAEMON_POLL_NS    = 20*1000*1000; // 20 ms between client connect attempts
+static const int    DAEMON_READY_SEC  = 20;               // a bound daemon gets this long to load its model and answer
 
 static double now_ms(void) { return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1.0e6; }
 // Sleep-EXCLUDING monotonic clock, for the main-thread watchdog only. CLOCK_MONOTONIC keeps
@@ -425,7 +427,10 @@ public:
         joined = normalize_ws(joined);
 
         // Fallback: VAD heard nothing but audio came in → one straight pass (carry confidence too).
-        if (joined.empty() && full_.size() >= (size_t)WHISPER_SAMPLE_RATE/5) {
+        // Only when NO segment was decoded: segments that decoded to nothing (a cough, noise that
+        // whisper's own VAD suppressed) are an answer, and re-running over up to 120 s cost seconds
+        // of stop latency and resurrected the hallucination the segment pass had suppressed (F044).
+        if (joined.empty() && decoded_.load() == 0 && full_.size() >= (size_t)WHISPER_SAMPLE_RATE/5) {
             WhisperOut wt = run_whisper_tok(ctx_, full_, lang_.c_str(), nthreads_);
             joined = normalize_ws(wt.text);
             conf_ = conf::words_confidence(wt.tokens);
@@ -558,6 +563,7 @@ private:
             if (canceled_) continue;
             const double t0 = now_ms();
             WhisperOut wt = run_whisper_tok(ctx_, seg, lang_.c_str(), nthreads_);
+            decoded_.fetch_add(1);
             // Per-segment decode time: the only number that says whether the worker keeps up with
             // speech (a segment decoding slower than it was spoken means finish() will wait), and
             // the input for tuning MAX_SEG_FR / SILENCE_CLOSE_FR.
@@ -586,6 +592,7 @@ private:
     size_t tailSamples_ = 0;             // leading samples of preroll_ carried over a forced cut (tap thread only)
     std::atomic<bool> capped_{false};    // feed() hit MAX_TAKE_SEC and dropped audio (set on the tap thread, relaxed)
     std::atomic<size_t> nseg_{0};        // segments decoded so far (worker; read by finish() for its log line)
+    std::atomic<size_t> decoded_{0};     // segments the worker ran whisper on, logging or not (finish()'s fallback gate)
     std::queue<std::vector<float>> q_;
     mutable std::mutex qmu_, tmu_;
     std::condition_variable qcv_;
@@ -600,7 +607,7 @@ private:
 };
 
 // ── microphone capture → 16 kHz mono → StreamingSession::feed ────────────────
-static void on_capture_lost(void);   // mid-take capture rebuild failed → stop the take + notify (defined after DictateController)
+static void on_capture_lost(StreamingSession *lost);   // mid-take capture rebuild failed → stop THAT take + notify (defined after DictateController)
 static void on_audio_poisoned(const char *what);   // CoreAudio told us the process audio state is degraded (defined after DictateController)
 
 // ONE Recorder for the life of the daemon, and one AVAudioEngine inside it (rebuilt only on a
@@ -682,6 +689,16 @@ static AudioDeviceID find_builtin_input_device(void) {
 }
 // Human-readable name of a HAL device (kAudioObjectPropertyName), "" if it can't be read. One
 // synchronous coreaudiod round-trip — call it once per engine start and cache, never per frame.
+// The device's current nominal sample rate, or 0 when it can't be read. A cheap HAL property read —
+// unlike -inputFormatForBus:, which is the ADR-0024 wedge site and is therefore cached per engine.
+static double hal_nominal_rate(AudioDeviceID dev) {
+    if (dev == kAudioObjectUnknown) return 0;
+    AudioObjectPropertyAddress a = { kAudioDevicePropertyNominalSampleRate,
+                                     kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    Float64 rate = 0; UInt32 size = sizeof(rate);
+    if (AudioObjectGetPropertyData(dev, &a, 0, nullptr, &size, &rate) != noErr) return 0;
+    return rate;
+}
 static NSString *hal_device_name(AudioDeviceID dev) {
     if (dev == kAudioObjectUnknown) return @"";
     CFStringRef name = nullptr; UInt32 sz = sizeof(name);
@@ -762,6 +779,11 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     NSString         *_devName;        // name of the device the STARTED engine reads from (banner «Вход: …»); nil until then
     double            _tBuild, _tFmt, _tStart;   // per-step mic-start timings, ms (logged on success)
     std::shared_ptr<std::atomic<int>> _tapGuard;   // in-flight tap-callback count; -stop waits it to 0
+    // The session the tap feeds, read by the tap block AFTER it counted itself in _tapGuard and
+    // cleared by -stop BEFORE it waits on the guard (both seq_cst): a callback that had entered the
+    // block but not yet counted itself either sees null and leaves, or is counted and waited for —
+    // never feeds a session -stop's caller is about to free (F089).
+    std::shared_ptr<std::atomic<StreamingSession *>> _sessCell;
 }
 - (instancetype)init {
     if ((self=[super init])) {
@@ -769,6 +791,7 @@ static BOOL capture_err_is_recoverable(NSError *e) {
                                                    sampleRate:WHISPER_SAMPLE_RATE
                                                      channels:1 interleaved:NO];
         _tapGuard = std::make_shared<std::atomic<int>>(0);
+        _sessCell = std::make_shared<std::atomic<StreamingSession *>>(nullptr);
         _pinnedDev = kAudioObjectUnknown;
     }
     return self;
@@ -790,6 +813,15 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     else if (_engineSuspect) {   // last take could not reach the built-in mic — retry from scratch
         slog("capture: last engine was not on the built-in mic → rebuilding before this take\n");
         [self dropEngine]; _pinnedDev = kAudioObjectUnknown; [self buildEngine];
+    } else if (_inFmt) {
+        // The engine sat stopped since the last take, and a rate change on a stopped engine may post
+        // no configuration-change notification: installing a tap with the stale cached format would
+        // raise and take the daemon down. Compare against the device's nominal rate (cheap) (F048).
+        double rate = hal_nominal_rate(_pinnedDev);
+        if (rate > 0 && std::fabs(rate - _inFmt.sampleRate) > 0.5) {
+            slog("capture: input rate changed while idle (%.0f → %.0f Hz) → rebuilding\n", _inFmt.sampleRate, rate);
+            [self dropEngine]; [self buildEngine];
+        }
     }
     if ([self startWithHALRecovery:err]) return YES;
     // The Recorder outlives the take now, so a failed start has to clean up after itself — the
@@ -912,7 +944,9 @@ static BOOL capture_err_is_recoverable(NSError *e) {
                               inFmt.sampleRate, (unsigned)inFmt.channelCount]}];
         return NO;
     }
-    AVAudioFormat *outFmt = _outFmt; AVAudioConverter *conv = _conv; StreamingSession *sess = _sess;
+    AVAudioFormat *outFmt = _outFmt; AVAudioConverter *conv = _conv;
+    auto sessCell = _sessCell;     // shared_ptr copy, like the guard: outlives the Recorder if needed
+    sessCell->store(_sess);
     const double ratio = outFmt.sampleRate / inFmt.sampleRate;
     auto guard = _tapGuard;   // shared_ptr copy → the counter outlives the Recorder if a tap is still in flight at teardown
     __block AVAudioPCMBuffer *convOut = nil;   // reused across tap callbacks → no per-callback alloc on the realtime thread (gotcha #6)
@@ -920,7 +954,9 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     [input installTapOnBus:0 bufferSize:4096 format:inFmt
                      block:^(AVAudioPCMBuffer *buf, AVAudioTime *when) {
         (void)when;
-        guard->fetch_add(1, std::memory_order_relaxed);   // mark in-flight; ordering is carried by the fetch_sub(release)/-stop load(acquire) pair (gotcha #5)
+        guard->fetch_add(1);   // mark in-flight; seq_cst — pairs with -stop's _sessCell clear + guard load (gotcha #5, F089)
+        StreamingSession *sess = sessCell->load();
+        if (!sess) { guard->fetch_sub(1, std::memory_order_release); return; }   // the take ended: -stop is in or past its wait
         @autoreleasepool {   // drain the converter's transient autoreleased objects each callback (the realtime audio thread has no draining pool)
         // Feed the whole input buffer once, then DRAIN the converter: a sample-rate
         // conversion may not consume all input in one convertToBuffer: call, so loop
@@ -941,7 +977,7 @@ static BOOL capture_err_is_recoverable(NSError *e) {
             if (st==AVAudioConverterOutputStatus_Error) break;
             if (convOut.frameLength>0) {
                 sess->live.store(true);                   // capture confirmed live
-                sess->feed(convOut.floatChannelData[0], convOut.frameLength);
+                sess->feed(convOut.floatChannelData[0], convOut.frameLength);   // sess: read from sessCell above
             }
             if (st!=AVAudioConverterOutputStatus_HaveData) break;   // InputRanDry / EndOfStream → done
             if (convOut.frameLength==0) break;            // "HaveData" with nothing produced can't make progress (F109)
@@ -1004,7 +1040,9 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     // STOPS the engine on a genuine configuration change and does not on our pre-start
     // -setDeviceID:, so -isRunning is the discriminator. Disarm either way: one notification is
     // all the pin can produce.
-    if (_pinReconfig) { _pinReconfig = NO; if (_engine.isRunning) return; }
+    // With no take in flight (_sess nil) the flag can only be our own pin's notification arriving
+    // after the take ended: rebuilding then would throw away the persistent engine for nothing (F047).
+    if (_pinReconfig) { _pinReconfig = NO; if (_engine.isRunning || !_sess) return; }
     slog("audio configuration changed → rebuilding capture\n");
     _tBuild = _tFmt = _tStart = 0;   // this is a fresh mic start; don't fold the original take's numbers in
     // Drop the ENGINE, not just the tap. The engine now outlives the take, so this is the one
@@ -1015,19 +1053,24 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     [self dropEngine];
     _pinnedDev = kAudioObjectUnknown;   // the device list moved under us → don't reuse the id
     if (!_sess) return;                 // no take in flight: the next -startFeeding: builds a fresh engine
+    // The new tap feeds the SAME session: wait out a callback of the old engine still inside its
+    // block, or the two IO threads would call feed() concurrently (F001). Same bounded spin as -stop.
+    while (_tapGuard->load(std::memory_order_acquire) != 0) { struct timespec ts{0, 100000}; nanosleep(&ts, nullptr); }
     [self buildEngine];
     NSError *err=nil;
     if (![self startWithHALRecovery:&err]) {   // a route change can also leave the HAL client stale
         slog("⚠ capture rebuild failed: %s\n", err.localizedDescription.UTF8String ?: "?");
         // The mic is dead; don't let the take silently dribble to the 60 s cap. Stop it + notify —
         // DEFERRED so we don't reentrantly [r stop] this very Recorder from inside its own method.
-        dispatch_async(dispatch_get_main_queue(), ^{ on_capture_lost(); });
+        StreamingSession *lost = _sess;   // the take that lost its mic — a later one must not be cancelled for it (F090)
+        dispatch_async(dispatch_get_main_queue(), ^{ on_capture_lost(lost); });
     }
 }
 // End the TAKE, keep the engine. Stopping capture no longer throws the AVAudioEngine away —
 // rebuilding it per take is what put -inputNode on every ⌘⇧D (see -startFeeding:). The tap must
 // still come off: it holds `_sess`, which dies with the take.
 - (void)stop {
+    _sessCell->store(nullptr);   // seq_cst, BEFORE the guard wait below (see _sessCell)
     if (_engine) {
         if (_tapInstalled) { [_engine.inputNode removeTapOnBus:0]; _tapInstalled=NO; }
         [_engine stop];
@@ -1037,7 +1080,7 @@ static BOOL capture_err_is_recoverable(NSError *e) {
     // session finish()/cancel() is about to read/free (UAF). The tap body is sub-ms → bounded spin.
     // Unconditional — recovery may already have dropped the engine, and the wait is what makes -stop
     // a barrier. (Nothing in flight ⇒ the counter is 0 ⇒ no spin at all.)
-    while (_tapGuard->load(std::memory_order_acquire) != 0) { struct timespec ts{0, 100000}; nanosleep(&ts, nullptr); }
+    while (_tapGuard->load() != 0) { struct timespec ts{0, 100000}; nanosleep(&ts, nullptr); }   // seq_cst: pairs with _sessCell
     _sess=nil;
 }
 // Debug-only: drive -reconfigure without an actual device change. That path drops and rebuilds
@@ -1088,8 +1131,15 @@ static std::string log_day_filename(void) {
     return local_time_string("%Y-%m-%d.ndjson");
 }
 
+// Create `path` 0700 if it is missing. An EXISTING directory is left exactly as the user set it:
+// ~/.local and ~/.local/share are not ours, and chmod-ing them to 0700 on every log event broke
+// whatever shared them (F080, F110).
 static bool mkdir_owner(const std::string &path) {
-    if (mkdir(path.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    return mkdir(path.c_str(), 0700) == 0 || errno == EEXIST;
+}
+// The same, for a directory that IS ours (…/dictate, …/logs, …/wedge): force it private.
+static bool mkdir_private(const std::string &path) {
+    if (!mkdir_owner(path)) return false;
     chmod(path.c_str(), 0700);
     return true;
 }
@@ -1099,7 +1149,7 @@ static bool ensure_data_dir(void) {
     std::string dir = sock_dir_path();
     if (dir.empty()) return true;
     std::string local = std::string(getenv("HOME")) + "/.local", share = local + "/share";
-    if (!mkdir_owner(local) || !mkdir_owner(share) || !mkdir_owner(dir)) return false;
+    if (!mkdir_owner(local) || !mkdir_owner(share) || !mkdir_private(dir)) return false;
     struct stat ds;
     return stat(dir.c_str(), &ds) == 0 && S_ISDIR(ds.st_mode) && ds.st_uid == geteuid();
 }
@@ -1112,7 +1162,7 @@ static std::string log_dir_path(void) {
     std::string share = local + "/share";
     std::string dictate = share + "/dictate";
     std::string logs = dictate + "/logs";
-    if (!mkdir_owner(local) || !mkdir_owner(share) || !mkdir_owner(dictate) || !mkdir_owner(logs))
+    if (!mkdir_owner(local) || !mkdir_owner(share) || !mkdir_private(dictate) || !mkdir_private(logs))
         return "";
     return logs;
 }
@@ -1129,12 +1179,23 @@ public:
     void event(const TakeMeta &meta, const char *name, std::vector<dlog::Field> fields) {
         if (!enabled()) return;
         if (meta.id.empty() || !name || !*name) return;
+        // The daemon runs for weeks under KeepAlive, and prune() used to run only at startup: take
+        // logs (dictated text) outlived the documented 7 days. Prune whenever a new day's file
+        // begins — after this event's write, outside mu_, which prune() takes itself (F016).
+        bool newDay = false;
+        write_event(meta, name, std::move(fields), &newDay);
+        if (newDay) prune();
+    }
+
+    void write_event(const TakeMeta &meta, const char *name, std::vector<dlog::Field> fields, bool *newDay) {
         std::lock_guard<std::mutex> lk(mu_);
         std::string dir = log_dir_path();
         if (dir.empty()) return;
         dlog::Event e{log_timestamp(), meta.id, meta.kind, name, std::move(fields)};
         std::string line = dlog::serialize_event(e);
-        std::string path = dir + "/" + log_day_filename();
+        std::string day = log_day_filename();
+        if (day != lastDay_) { *newDay = !lastDay_.empty(); lastDay_ = day; }
+        std::string path = dir + "/" + day;
         int fd = open(path.c_str(), O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC|O_NOFOLLOW, 0600);
         if (fd < 0) return;
         chmod(path.c_str(), 0600);
@@ -1185,6 +1246,7 @@ private:
     }
 
     std::mutex mu_;
+    std::string lastDay_;   // file name of the day the last event went to (under mu_)
 };
 
 static TakeLogger g_take_logger;
@@ -1339,7 +1401,10 @@ static bool spawn_editor(NSString *transcript, NSString *conf);    // defined in
 
 // A mid-take device/route change whose capture rebuild failed (Recorder reconfigure): the mic is
 // dead, so stop the take cleanly (instead of dribbling to the 60 s cap) and tell the user. Main thread.
-static void on_capture_lost(void) {
+static void on_capture_lost(StreamingSession *lost) {
+    // Deferred to the main queue: by now the user may have stopped that take and started another
+    // (or a mini-take); cancel only if the take that lost its mic is still the current one (F090).
+    { std::lock_guard<std::mutex> lk(g_mu); if (!g_sess || g_sess.get() != lost) return; }
     [g_ctrl cancelWithReason:"capture_lost"];
     [g_ctrl showHint:@"⚠ устройство ввода изменилось — запись прервана"];
 }
@@ -1419,17 +1484,39 @@ static bool ax_trusted(bool prompt) {
     return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
 }
 static const double PASTE_RESTORE_SEC = 1.5;   // synthetic ⌘V → prior clipboard restored (paste_text)
+// The user's clipboard as it was before the FIRST of a run of overlapping pastes — every item with
+// every type it carried. A string-only snapshot replaced a copied image/file/rich text with "" (F050)
+// and dropped the org.nspasteboard.ConcealedType marker, so a password came back as plain text a
+// clipboard-history manager would record (F129); a second paste inside the restore window captured
+// dictation #1 as "the original" and the real clipboard was never restored (F051). nil = no restore
+// pending. Main thread only.
+static NSArray<NSPasteboardItem *> *g_clip_saved = nil;
+static NSArray<NSPasteboardItem *> *snapshot_pasteboard(NSPasteboard *pb) {
+    NSMutableArray<NSPasteboardItem *> *items = [NSMutableArray array];
+    for (NSPasteboardItem *it in pb.pasteboardItems) {
+        NSPasteboardItem *copy = [NSPasteboardItem new];
+        for (NSPasteboardType t in it.types) { NSData *d = [it dataForType:t]; if (d) [copy setData:d forType:t]; }
+        [items addObject:copy];
+    }
+    return items;
+}
 static void paste_text(NSString *text) {                 // main thread
-    static uint64_t pasteGen = 0;                        // main-only; a newer paste cancels this one's
+    static uint64_t pasteGen = 0;                        // main-only; a newer paste takes over this one's
     uint64_t myGen = ++pasteGen;                         //   pending clipboard restore (no stale clobber)
     NSPasteboard *pb = [NSPasteboard generalPasteboard];
-    NSString *orig = [pb stringForType:NSPasteboardTypeString] ?: @"";   // non-string content → restored as empty
+    if (!g_clip_saved) g_clip_saved = snapshot_pasteboard(pb);   // only the first of overlapping pastes
     copy_to_clipboard(text);                             // text on the clipboard either way
-    const NSInteger ours = pb.changeCount;               // the restore below must not clobber a newer copy
     bool trusted = ax_trusted(false);
     slog("paste: %lu chars, ax_trusted=%d → %s\n",
          (unsigned long)text.length, trusted, trusted ? "synth ⌘V" : "clipboard-only (grant Accessibility)");
-    if (!trusted) { [g_ctrl showHint:@"готово — вставь ⌘V"]; return; }   // degrade, no synthetic key
+    if (!trusted) {                                      // degrade, no synthetic key: the text STAYS on the
+        g_clip_saved = nil;                              //   clipboard for the user's own ⌘V — no restore
+        [g_ctrl showHint:@"готово — вставь ⌘V"]; return;
+    }
+    // Only a transport for the synthetic ⌘V, gone again in PASTE_RESTORE_SEC: keep it out of
+    // clipboard-history managers (the nspasteboard.org convention).
+    [pb setData:[NSData data] forType:@"org.nspasteboard.TransientType"];
+    const NSInteger ours = pb.changeCount;               // the restore below must not clobber a newer copy
     CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
     CGEventRef down = CGEventCreateKeyboardEvent(src, (CGKeyCode)kVK_ANSI_V, true);
     CGEventRef up   = CGEventCreateKeyboardEvent(src, (CGKeyCode)kVK_ANSI_V, false);
@@ -1446,8 +1533,11 @@ static void paste_text(NSString *text) {                 // main thread
     // dictation was lost from both places (F049). Skipped if anything else wrote the pasteboard since.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PASTE_RESTORE_SEC*NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-                       if (paste_gen_is_current(myGen, pasteGen) && pb.changeCount == ours)   // still latest (src/dictate_authgen.h)
-                           copy_to_clipboard(orig);
+                       if (!paste_gen_is_current(myGen, pasteGen)) return;   // a newer paste owns the restore (src/dictate_authgen.h)
+                       NSArray<NSPasteboardItem *> *saved = g_clip_saved; g_clip_saved = nil;
+                       if (pb.changeCount != ours) return;                    // the user (or an app) copied since
+                       [pb clearContents];
+                       if (saved.count) [pb writeObjects:saved];
                    });
 }
 
@@ -1595,6 +1685,7 @@ static std::string self_path(void);   // defined with the client helpers, below
 // teardown would then unlink ITS fresh socket — sampling first keeps that clock from starting,
 // and the wait is kept under 5 s anyway so the invariant survives a reorder.
 // DICTATE_WEDGE_SAMPLE=0 turns the whole thing off.
+static const size_t WEDGE_KEEP        = 20;  // wedge-*.txt reports kept (newest first) — see wedge_sample_init
 static const int WEDGE_SAMPLE_SEC      = 1;   // how long `sample` watches the process — a wedged
                                               // stack does not move, 1 s of it is the whole story
 static const int WEDGE_SAMPLE_WAIT_SEC = 4;   // hard cap on how long WE wait for it to finish
@@ -1653,11 +1744,26 @@ static void wedge_sample_init(void) {
     const char *home = getenv("HOME");
     if (!home || !*home) { slog("wedge-sample: no $HOME — disabled\n"); return; }
     char dir[400];
-    snprintf(dir, sizeof dir, "%s/.local/share/dictate", home);
-    mkdir(dir, 0700);                                    // parents may already exist (take logs)
     snprintf(dir, sizeof dir, "%s/.local/share/dictate/wedge", home);
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+    // The whole chain: on a fresh account with take logging off, ~/.local/share may not exist yet,
+    // and a single mkdir left forensics disabled (F054).
+    if (!ensure_data_dir() || !mkdir_private(dir)) {
         slog("wedge-sample: cannot create %s (%s) — disabled\n", dir, strerror(errno)); return;
+    }
+    // Keep the newest WEDGE_KEEP reports: a daemon that wedges repeatedly adds one per restart,
+    // and nothing else ever removes them (F018).
+    if (DIR *dp = opendir(dir)) {
+        std::vector<std::pair<time_t, std::string>> reports;
+        while (dirent *ent = readdir(dp)) {
+            std::string name = ent->d_name;
+            if (name.rfind("wedge-", 0) != 0 || name.size() < 5 || name.compare(name.size() - 4, 4, ".txt") != 0) continue;
+            std::string path = std::string(dir) + "/" + name;
+            struct stat st{};
+            if (lstat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) reports.push_back({st.st_mtime, path});
+        }
+        closedir(dp);
+        std::sort(reports.begin(), reports.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        for (size_t i = WEDGE_KEEP; i < reports.size(); i++) unlink(reports[i].second.c_str());
     }
     g_sample_req = dispatch_semaphore_create(0);
     if (!g_sample_req) { slog("wedge-sample: no semaphore — disabled\n"); return; }
@@ -1687,9 +1793,37 @@ static void request_wedge_sample(const char *reason) {
 // loser is the launchd job, KeepAlive would respawn-and-bow-out every ~10 s forever. (Caveat: a
 // daemon started by hand FROM another launchd job would inherit that job's label and be
 // misclassified as managed — it then relies on the ⟳/`restart`/watchdog caller to notice.)
+// Under the LaunchAgent, launchd sets XPC_SERVICE_NAME to the job LABEL. Any non-"0" value is not
+// enough: apps launched from the Dock and the shells inside Terminal/iTerm carry one too, so a daemon
+// auto-spawned from a terminal was taken for launchd-managed, spawned no successor on a restart and
+// was simply gone (F094).
 static bool launchd_managed(void) {
     const char *x = getenv("XPC_SERVICE_NAME");
-    return x && *x && strcmp(x, "0") != 0;
+    const char *label = getenv("DICTATE_LAUNCHD_LABEL");
+    return x && strcmp(x, (label && *label) ? label : "com.user.dictate") == 0;
+}
+
+// Everything spawn_replacement_daemon needs, prepared at startup: it runs on the restart path,
+// possibly while a wedged thread holds the malloc lock, and self_path() + the file-action /
+// attribute inits all allocated there (F004). posix_spawn itself is libc's and may still allocate.
+static char g_self_path[4096];
+static posix_spawn_file_actions_t g_repl_fa;
+static posix_spawnattr_t g_repl_at;
+static bool g_repl_ready = false;
+static void replacement_spawn_init(void) {
+    std::string self = self_path();
+    if (self.size() >= sizeof g_self_path) return;
+    memcpy(g_self_path, self.c_str(), self.size() + 1);
+    if (posix_spawn_file_actions_init(&g_repl_fa) != 0) return;
+    posix_spawn_file_actions_addopen(&g_repl_fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&g_repl_fa, 1, LOG_PATH, O_CREAT|O_WRONLY|O_APPEND|O_NOFOLLOW, 0600);
+    posix_spawn_file_actions_adddup2(&g_repl_fa, 1, 2);
+    if (posix_spawnattr_init(&g_repl_at) != 0) { posix_spawn_file_actions_destroy(&g_repl_fa); return; }
+    // CLOEXEC_DEFAULT: only the fds the file actions set up are inherited. FD_CLOEXEC on an
+    // accepted client fd is set a moment AFTER accept(); a spawn in that window used to inherit
+    // the connection and keep the client waiting for an EOF that never came (F092).
+    posix_spawnattr_setflags(&g_repl_at, POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT);
+    g_repl_ready = true;
 }
 
 // Spawn a detached replacement daemon — only for a manually started daemon (no launchd to respawn
@@ -1699,18 +1833,11 @@ static bool launchd_managed(void) {
 // means it starts while we are still listening. `--replace` tells it to skip the single-instance
 // bow-out and instead wait for our socket to go away — see run_daemon.
 static bool spawn_replacement_daemon(void) {
-    std::string self = self_path();
-    posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null",      O_RDONLY,                             0);
-    posix_spawn_file_actions_addopen(&fa, 1, LOG_PATH, O_CREAT|O_WRONLY|O_APPEND|O_NOFOLLOW, 0600);
-    posix_spawn_file_actions_adddup2(&fa, 1, 2);
-    posix_spawnattr_t at; posix_spawnattr_init(&at);
-    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETSID);
+    if (!g_repl_ready) { raw_log("restart: replacement spawn was never prepared\n"); return false; }
     char *argv[] = { (char*)"dictate", (char*)"daemon", (char*)"--replace", nullptr };
     pid_t pid = 0;
-    int rc = posix_spawn(&pid, self.c_str(), &fa, &at, argv, *_NSGetEnviron());
-    if (rc != 0) rc = posix_spawn(&pid, self.c_str(), &fa, &at, argv, *_NSGetEnviron());   // one retry (transient ENOMEM/EAGAIN)
-    posix_spawn_file_actions_destroy(&fa); posix_spawnattr_destroy(&at);
+    int rc = posix_spawn(&pid, g_self_path, &g_repl_fa, &g_repl_at, argv, *_NSGetEnviron());
+    if (rc != 0) rc = posix_spawn(&pid, g_self_path, &g_repl_fa, &g_repl_at, argv, *_NSGetEnviron());   // one retry (transient ENOMEM/EAGAIN)
     char msg[160];
     if (rc == 0) snprintf(msg, sizeof msg, "restart: spawned replacement pid=%d\n", (int)pid);
     else         snprintf(msg, sizeof msg, "restart: posix_spawn FAILED (%s)\n", strerror(rc));
@@ -1725,6 +1852,7 @@ static std::atomic<unsigned long long> g_restart_gen{0}; // bumped when a restar
                                                          // armed deadline/force threads stand down
 static std::atomic<bool> g_torn_down{false};       // socket already dropped by whoever got here first
 static std::atomic<pid_t> g_editor_pid{0};         // live `dictate editor` child, so a restart doesn't orphan it
+static uint64_t g_editor_gen = 0;                  // main only: bumped per spawned editor (its reaper checks it)
 // Aborted restarts hold the AUTOMATIC triggers off for a bit (src/dictate_watchdog.h,
 // wd_in_backoff): main is still wedged when a restart aborts, so without this both watchers
 // would retry on their next round — a spawn-failure hot loop, one `sample` per round.
@@ -1742,8 +1870,12 @@ static void restart_process_now(const char *reason) {
         // Another path is already restarting; it normally _exits within milliseconds. Do NOT just
         // return: the winner is often the GRACEFUL main-queue path, which can itself block (it
         // takes g_mu and joins the whisper worker) — and a stuck restart is exactly what the
-        // watchdog/force paths exist to break. So wait a beat, then go anyway.
+        // watchdog/force paths exist to break. So wait a beat, then go anyway — unless that
+        // restart ABORTED meanwhile (it bumps g_restart_gen): the user has been told it failed,
+        // and restarting behind their back now is what the stand-down exists to prevent (F154).
+        const unsigned long long gen0 = g_restart_gen.load();
         struct timespec ts{RESTART_GRACE_SEC,0}; nanosleep(&ts,nullptr);
+        if (g_restart_gen.load() != gen0) { raw_log("restart: the in-flight restart aborted — standing down\n"); return; }
         raw_log("restart: the in-flight restart stalled — forcing\n");
     }
     char msg[128]; snprintf(msg, sizeof msg, "restart (%s): relaunching the daemon\n", reason);
@@ -1797,6 +1929,24 @@ static void restart_process_now(const char *reason) {
     _exit(0);
 }
 
+// `quit`: lock-free like restart_process_now, so the socket thread's force path can call it with
+// main wedged. Takes a live editor with it (F021) and drops the socket exactly once.
+static const int QUIT_FINISH_WAIT_TICKS = 40;   // ×100 ms a quit waits for an in-flight finalize
+static const int QUIT_FORCE_SEC         = 6;    // the socket thread forces the exit after this
+static void quit_now(void) {
+    pid_t ed = g_editor_pid.load(); if (ed > 0) kill(ed, SIGTERM);
+    if (!g_torn_down.exchange(true)) unlink(SOCK_PATH);
+    _exit(0);
+}
+static void quit_when_idle(int ticks) {   // main queue; polls, never blocks the run loop
+    if (g_finishing.load() && ticks > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100*NSEC_PER_MSEC)), dispatch_get_main_queue(),
+                       ^{ quit_when_idle(ticks - 1); });
+        return;
+    }
+    quit_now();
+}
+
 // debug: feed already-loaded PCM as if it were recorded (no mic), leaving the take open so
 // a subsequent `stop` returns the streamed transcript. MUST run on the main queue, like
 // every other recording transition — the caller reads the WAV first (off-lock, off-main),
@@ -1845,13 +1995,20 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     NSTimer     *_idle;        // idle-unload poll: frees the resident model after DICTATE_IDLE_UNLOAD_SEC (gotcha #7)
     NSTimer     *_beat;        // 1 Hz main-thread heartbeat for the watchdog (src/dictate_watchdog.h)
     NSTimer     *_poison;      // armed only once CoreAudio has gone bad: waits for an idle moment to restart
+    int          _poisonAborts; // poison restarts that could not spawn a successor (capped — see poisonTick)
 }
 
 // ── recording lifecycle (all on main) ──
 - (std::string)beginTakeError {
+    // The open editor owns the previous take's paste target: a new main take (socket `start`, the
+    // menubar) would overwrite it and spawn a SECOND editor whose pid nobody tracks (F006, F149).
+    if (g_editor_open.load()) return "busy";
     { std::lock_guard<std::mutex> lk(g_mu); if (g_sess) return ""; }   // already recording → idempotent (don't reset banner/timer)
+    // The paste target is the app in front at the PRESS, read before the blocking mic start (up to
+    // ~1.5 s, longer on a model reload) during which the user may already have switched apps (F091).
+    NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
     std::string e = daemon_start("main");
-    if (e.empty()) { g_target_app = [[NSWorkspace sharedWorkspace] frontmostApplication];   // paste target, before the editor steals focus
+    if (e.empty()) { g_target_app = front;   // paste target, before the editor steals focus
                      [self showWarmup]; register_esc(); [self startTimer]; }
     else if (e != "busy") [self showError:@(e.c_str())];   // "busy" = a finalize is in flight → silent no-op
     return e;
@@ -1909,6 +2066,13 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
 - (void)stopFinishedWithText:(NSString *)ns conf:(NSString *)conf takeId:(NSString *)takeId {
     g_finishing.store(false);              // finalize done → a new take may start
     [self hideUI];
+    if (!ns.length) {
+        // Silence, or everything filtered out: say so — a banner that just vanished looked like a
+        // crash or a lost take (F056).
+        g_target_app = nil;                // F097
+        [self showHint:@"ничего не распознано"];
+        return;
+    }
     g_editor_take_id = takeId.UTF8String ?: "";
     [self openEditorWithText:ns conf:conf];
 }
@@ -1978,7 +2142,12 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     if (app) [app activateWithOptions:NSApplicationActivateAllWindows];
 }
 - (void)cancel { [self cancelWithReason:"user"]; }
-- (void)cancelWithReason:(const char *)reason { unregister_esc(); [self stopTimer]; daemon_cancel(reason); [self hideUI]; }
+- (void)cancelWithReason:(const char *)reason {
+    unregister_esc(); [self stopTimer]; daemon_cancel(reason); [self hideUI];
+    // The take that set g_target_app is gone; a later editor opened without a new take (the `edit`
+    // verb, a stop after `feedfile`) must not paste into it. An open editor still needs its own (F097).
+    if (!g_editor_open.load()) g_target_app = nil;
+}
 - (void)toggle {
     if (g_editor_open.load()) return;                            // editor owns ⌘⇧D while open (hotkey unregistered)
     bool rec; { std::lock_guard<std::mutex> lk(g_mu); rec = (bool)g_sess; }
@@ -2091,6 +2260,7 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     if (++_warmTicks > 100) {                          // ~10 s with no audio → show an error instead of a stuck «Запуск…»
         [t invalidate]; if (_warm==t) _warm=nil;
         unregister_esc(); [self stopTimer]; daemon_cancel("no_audio_timeout");
+        if (!g_editor_open.load()) g_target_app = nil;   // this take is over; don't keep its target (F097)
         [self showError:@"микрофон не запустился"];
     }
 }
@@ -2173,8 +2343,12 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     NSMenuItem *state = [[NSMenuItem alloc] initWithTitle:[self stateSummary] action:nil keyEquivalent:@""];
     state.enabled = NO; [m addItem:state];
     [m addItem:[NSMenuItem separatorItem]];
-    bool rec; { std::unique_lock<std::mutex> lk(g_mu, std::try_to_lock); rec = lk.owns_lock() && g_sess; }
-    NSMenuItem *tog = [[NSMenuItem alloc] initWithTitle:(rec ? @"⏹  Остановить запись" : @"🎙  Начать диктовку  (⌘⇧D)")
+    // try_lock, never lock (main). A busy g_mu means "unknown", not "not recording": a stop in
+    // flight then read «Начать», and clicking it stopped the take instead (F114).
+    bool known = false, rec = false;
+    { std::unique_lock<std::mutex> lk(g_mu, std::try_to_lock); known = lk.owns_lock(); rec = known && g_sess; }
+    NSString *togTitle = !known ? @"⏯  Начать / остановить  (⌘⇧D)" : rec ? @"⏹  Остановить запись" : @"🎙  Начать диктовку  (⌘⇧D)";
+    NSMenuItem *tog = [[NSMenuItem alloc] initWithTitle:togTitle
                                                  action:@selector(menuToggle:) keyEquivalent:@""];
     tog.target = self;
     // `toggle` is a no-op while the editor is open (it owns ⌘⇧D), so don't offer a dead item.
@@ -2210,7 +2384,14 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     // and a restart that only happens when no menu is open is a restart that can be starved.
     [[NSRunLoop currentRunLoop] addTimer:_poison forMode:NSRunLoopCommonModes];
 }
+static const int POISON_MAX_ABORTS = 3;   // aborted poison restarts before the poll gives up
 - (void)poisonTick:(NSTimer *)t { (void)t;
+    // A successor that cannot be spawned now will not be spawned in 30 s either: without a cap
+    // this retried forever, flashing «перезапуск не удался» on an idle Mac every 30 s (F019).
+    if (_poisonAborts >= POISON_MAX_ABORTS) {
+        slog("audio-poisoned: %d restarts aborted — giving up; use ⟳ / `dictate restart`\n", _poisonAborts);
+        [_poison invalidate]; _poison = nil; return;
+    }
     if (g_editor_open.load() || g_finishing.load()) return;      // a take is still being turned into text
     if (g_paste_pending > 0) return;                             // …or its accepted text is still being pasted
     {   // try_lock, never lock: this runs on main, and blocking here on whatever holds g_mu is
@@ -2256,7 +2437,10 @@ static const double BANNER_SUB_PT    = 14;    // dim subtitle  (e.g. «⌘⇧D �
     // clearing it would let a second worker onto the same context (gotcha #5; F017, F112).
     if (take) g_finishing.store(false);
     [self stopTimer]; unregister_esc();
-    [self showError:@"перезапуск не удался — демон продолжает работать"];
+    const bool poison = reason && !strcmp(reason, "audio-poisoned");
+    if (poison) _poisonAborts++;
+    // The unattended poison retry tells the user once, not on every attempt (F019).
+    if (!poison || _poisonAborts == 1) [self showError:@"перезапуск не удался — демон продолжает работать"];
 }
 - (void)startTimer {
     _secs = 0; [_tick invalidate];
@@ -2418,17 +2602,19 @@ static void serve_client(int cl, bool degraded) {
         setsockopt(cl, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof(rcvto));
         // Read one newline-terminated command. A single read can be short or fragmented, so
         // loop until the newline arrives; cap the line so a client can't OOM the daemon.
-        std::string data; char buf[4096]; bool got=false;
+        std::string data; char buf[4096]; bool got=false, line=false;
         for (;;) {
             ssize_t r=read(cl,buf,sizeof(buf));
             if (r>0) { got=true; data.append(buf,(size_t)r);
-                       if (data.find('\n')!=std::string::npos) break;
+                       if (data.find('\n')!=std::string::npos) { line=true; break; }
                        if (data.size() > ((size_t)1<<20)) { close(cl); return; }   // runaway line (>1 MB) → drop
                        continue; }
             if (r<0 && errno==EINTR) continue;
             break;   // EOF or error
         }
-        if (!got){ close(cl); return; }
+        // A command is only a COMPLETE line: a peer that stalled past the timeout (or hung up)
+        // mid-line used to have its truncated text executed — half an `accept` pasted (F058).
+        if (!got || !line){ close(cl); return; }
         Command parsed = parse_command(first_line(data));   // pure verb/arg split (src/dictate_proto.h)
         const std::string &cmd = parsed.cmd, &arg = parsed.arg;
 
@@ -2470,8 +2656,11 @@ static void serve_client(int cl, bool degraded) {
         else if (cmd=="cancel") { dispatch_sync(dispatch_get_main_queue(), ^{ [g_ctrl cancel]; }); write_all(cl,"ok\n",3); }
         else if (cmd=="accept") {        // from the editor process: paste the (possibly edited) text into the target app
             NSString *t = [NSString stringWithUTF8String:arg.c_str()] ?: @"";
-            dispatch_async(dispatch_get_main_queue(), ^{ [g_ctrl editorAccept:t]; });
-            write_all(cl,"ok\n",3);
+            // Only for an editor that is actually open: a stray or repeated `accept` used to paste
+            // into whatever app was frontmost (F146).
+            __block bool open = false;
+            dispatch_sync(dispatch_get_main_queue(), ^{ open = g_editor_open.load(); if (open) [g_ctrl editorAccept:t]; });
+            if (open) write_all(cl,"ok\n",3); else write_all(cl,"err no editor\n",14);
         }
         else if (cmd=="editor-cancel") { dispatch_async(dispatch_get_main_queue(), ^{ [g_ctrl editorCancel]; }); write_all(cl,"ok\n",3); }
         else if (cmd=="corr-start") {     // editor mini-take: start the mic (no banner — the editor shows the state)
@@ -2524,6 +2713,7 @@ static void serve_client(int cl, bool degraded) {
         else if (cmd=="feedfile"){
             std::vector<float> audio; uint32_t rate=0; __block std::string e;
             if (!load_wav_pcm16(arg.c_str(), audio, &rate)) e="wav read failed";   // read off-main, off-lock
+            else if (rate != WHISPER_SAMPLE_RATE) e="wav must be 16000 Hz mono (got " + std::to_string(rate) + " Hz)";   // F045: no silent time-stretch
             else dispatch_sync(dispatch_get_main_queue(), ^{ e = daemon_feed_audio(audio); });
             std::string m=e.empty()?"ok\n":("err "+e+"\n"); write_all(cl,m.data(),m.size());
         }
@@ -2559,19 +2749,19 @@ static void serve_client(int cl, bool degraded) {
         else if (cmd=="quit") {
             write_all(cl,"bye\n",4); close(cl);
             dispatch_async(dispatch_get_main_queue(), ^{
-                DetachedTake take = daemon_stop_detach();   // release the mic if recording
-                if (take) {
-                    log_take_cancel(take.meta, take.session->seconds(), "quit");
-                    take.session->cancel();
-                }
-                // NB: don't whisper_free(g_ctx) here — an async finish (hotkey/timer stop) may still be
-                // decoding on it; _exit reclaims all memory + GPU state cleanly (and skips dtors, so the
-                // g_finishing flag set by daemon_stop_detach above needs no explicit clear).
-                // Take a live editor with us, as restart_process_now does: an orphan editor would
-                // later send `accept` to the next daemon, which has no target app (F021).
-                pid_t ed = g_editor_pid.load(); if (ed > 0) kill(ed, SIGTERM);
-                unlink(SOCK_PATH); _exit(0);
+                // Release the mic and log the take; the session's worker join runs off-main
+                // (daemon_cancel), not on the run loop for a whole decode (F093). Then let a
+                // finalize still in flight — a hotkey/timer stop, or this cancel — finish first,
+                // polling WITHOUT blocking main (the finalize itself hops to main to open the
+                // editor), so its text is logged and reaches the editor/clipboard (F098).
+                daemon_cancel("quit");
+                quit_when_idle(QUIT_FINISH_WAIT_TICKS);
             });
+            // Force path, as `restart` has: if main is wedged the block above never runs and the
+            // daemon would keep the mic and socket while the client was told "bye" (F008, F150).
+            struct timespec ts{QUIT_FORCE_SEC,0}; nanosleep(&ts,nullptr);
+            raw_log("quit: main queue did not finish the quit — forcing\n");
+            quit_now();
             return;
         }
         else write_all(cl,"err unknown\n",12);
@@ -2612,7 +2802,10 @@ static void socket_accept_loop(int srv) {
         // the one told «err busy» (and the CLI would then report a false success).
         bool degraded = g_inflight.load() >= SOCK_MAX_INFLIGHT;
         g_inflight.fetch_add(1);
-        std::thread([cl, degraded]{ serve_client(cl, degraded); g_inflight.fetch_sub(1); }).detach();
+        // Thread creation can fail (EAGAIN under resource exhaustion): an uncaught system_error on
+        // this background thread is std::terminate — the daemon dies mid-take (F169).
+        try { std::thread([cl, degraded]{ serve_client(cl, degraded); g_inflight.fetch_sub(1); }).detach(); }
+        catch (...) { write_all(cl,"err busy\n",9); close(cl); g_inflight.fetch_sub(1); }
     }
 }
 
@@ -2629,6 +2822,20 @@ static int run_daemon(const std::string &modelPath, bool replacing) {
     if (!ensure_data_dir()) {
         slog("cannot make %s an owner-only directory: %s\n", sock_dir_path().c_str(), strerror(errno));
         if (!getenv("DICTATE_SOCK")) return 1;
+    }
+    // Single instance, for real: the probe below and the unlink+bind after it are not atomic, so two
+    // daemons starting together (launchd at login + a client's ensure_daemon) could both pass and the
+    // second would orphan the first — mic, hotkey and model still held, but unreachable (F007, F022).
+    // An flock beside the socket, held for the process lifetime (the kernel drops it at exit), closes
+    // that. A `--replace` successor waits for its predecessor, which exits right after spawning it.
+    {
+        std::string lockPath = SOCK_PATH_S + ".lock";
+        int lockfd = open(lockPath.c_str(), O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW, 0600);
+        if (lockfd < 0) { slog("cannot open %s: %s\n", lockPath.c_str(), strerror(errno)); return 1; }
+        if (flock(lockfd, replacing ? LOCK_EX : (LOCK_EX|LOCK_NB)) != 0) {
+            slog("daemon already running (%s is held)\n", lockPath.c_str()); close(lockfd); return 0;
+        }
+        // lockfd stays open for the life of the process — that IS the lock.
     }
     // single instance: if a daemon already answers, bow out. EXCEPT when we were spawned as a
     // replacement (`daemon --replace`): the outgoing daemon is still listening at that moment
@@ -2674,7 +2881,7 @@ static int run_daemon(const std::string &modelPath, bool replacing) {
     slog("⏳ loading model: %s\n", modelPath.c_str());
     double t0=now_ms();
     load_backends_and_model(modelPath);
-    if (!g_ctx){ slog("✖ model load failed\n"); return 1; }
+    if (!g_ctx){ slog("✖ model load failed\n"); unlink(SOCK_PATH); return 1; }   // F023: no dead socket node left behind
     slog("✓ model resident (%.0f ms). listening on %s\n", now_ms()-t0, SOCK_PATH);
 
     // Become a Cocoa accessory agent: the main thread runs the AppKit run loop (needed
@@ -2692,6 +2899,7 @@ static int run_daemon(const std::string &modelPath, bool replacing) {
         [g_ctrl setupIdleTimer];   // arm idle-unload if DICTATE_IDLE_UNLOAD_SEC is set (gotcha #7)
         [g_ctrl setupWatchdog];    // arm the main-thread watchdog (DICTATE_WATCHDOG_SEC=0 disables)
         wedge_sample_init();       // park the forensics helper NOW, while allocating is still safe
+        replacement_spawn_init();  // …and the replacement-daemon spawn, for the same reason
         std::thread([srv]{ socket_accept_loop(srv); }).detach();
         [NSApp run];
     }
@@ -2732,7 +2940,15 @@ static int ensure_daemon(void) {
     }
     for (int i=0;i<DAEMON_POLL_TRIES;i++){                    // wait out the model-load window
         int d=connect_daemon();
-        if (d>=0){ write_all(d,"ping\n",5); char b[8]; read(d,b,sizeof(b)); close(d); return 0; }
+        if (d>=0){
+            // The daemon binds BEFORE loading the model and only accepts after it, so this ping
+            // waits out the load — bounded now: a load hung on a stalled volume hung `start` with
+            // it, forever (F099). And only a real "pong" counts as up.
+            struct timeval tv{DAEMON_READY_SEC,0}; setsockopt(d,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+            write_all(d,"ping\n",5); char b[8]; ssize_t r=read(d,b,sizeof(b)); close(d);
+            if (r>=4 && !memcmp(b,"pong",4)) return 0;
+            if (r<0 && (errno==EAGAIN||errno==EWOULDBLOCK)) return -1;   // the load did not finish in time
+        }
         struct timespec ts{0,DAEMON_POLL_NS}; nanosleep(&ts,nullptr);
     }
     return -1;
@@ -2756,16 +2972,19 @@ static int client_cmd(const std::string &cmd, bool printReply, int timeoutSec = 
               if(r<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) timedOut=true;
               break; }
     close(c);
-    // An empty reply is a failure for the bounded verbs (`restart`): the daemon either timed out on
-    // us or dropped the connection without answering. Only `stop` may legitimately return nothing
-    // (an empty transcript), and it passes timeoutSec == 0.
-    if (timeoutSec > 0 && reply.empty()) {
-        fprintf(stderr, timedOut ? "демон не отвечает (%d с) — main-поток завис\n"
-                                 : "демон закрыл соединение без ответа\n", timeoutSec);
+    // An empty reply is a failure for every verb but `stop` (an empty transcript is a real answer):
+    // the daemon timed out on us, or died / dropped the connection without answering — and a daemon
+    // that exited on a missing model made `start` and `ping` report success (F115).
+    if (reply.empty() && cmd != "stop") {
+        if (timedOut) fprintf(stderr, "демон не отвечает (%d с) — main-поток завис\n", timeoutSec);
+        else          fprintf(stderr, "демон закрыл соединение без ответа\n");
         return 1;
     }
     if (printReply){ fputs(reply.c_str(),stdout); if(!reply.empty()&&reply.back()!='\n') fputc('\n',stdout); }
-    if (reply.rfind("err ",0)==0) return 1;
+    // A `stop` reply is a raw transcript, which may itself begin with the word "err " (F059): for
+    // it only the daemon's own whole-line refusals count as errors.
+    if (reply.rfind("err ",0)==0 &&
+        (cmd != "stop" || reply == "err busy\n" || reply == "err overloaded\n")) return 1;
     return 0;
 }
 
@@ -2814,6 +3033,7 @@ static void edlog(NSString *fmt, ...) {
 @property(nonatomic) int   wordIndex;
 @property(nonatomic) NSRect rect;
 @property(nonatomic) int   line;
+@property(nonatomic) BOOL  clipped;   // wider than a whole line: drawn middle-truncated (start and end visible)
 @end
 @implementation EdCell @end
 
@@ -2827,6 +3047,7 @@ static std::string editor_request(const std::string &line);  // editor → daemo
 @property(nonatomic, copy) void (^onAccept)(NSString *);
 @property(nonatomic, copy) void (^onCancel)(void);
 - (instancetype)initWithFrame:(NSRect)f transcript:(NSString *)t conf:(NSString *)conf;
+- (NSString *)joinedText;
 @end
 @implementation EditorView {
     NSMutableArray<EdCell *> *_cells; int _lineCount; CGFloat _lineH;
@@ -2905,9 +3126,17 @@ static std::string editor_request(const std::string &line);  // editor → daemo
         }
         if (_pos == 2 * N) [cells addObject:caret()];
     }
+    // Words are measured in the SEMIBOLD the cursor word is drawn in: measured in the body font, a
+    // long hot word overran its highlight box and the wrap width (F119). Uniform for every word, so
+    // the layout still never reflows as the cursor moves.
+    NSFont *wf = [self wordFont];
     for (EdCell *c in cells) {
-        NSFont *f = c.isCaret ? [self caretFont] : bf;
-        c.rect = NSMakeRect(0, 0, ceil([c.text sizeWithAttributes:@{NSFontAttributeName:f}].width), textH);
+        NSFont *f = c.isCaret ? [self caretFont] : wf;
+        CGFloat w = ceil([c.text sizeWithAttributes:@{NSFontAttributeName:f}].width);
+        // A token wider than a whole line (a long pasted URL or path) never wraps: cap it and draw it
+        // middle-truncated, so its start AND end stay visible instead of running off the panel (F120).
+        c.clipped = w > bodyW; if (c.clipped) w = bodyW;
+        c.rect = NSMakeRect(0, 0, w, textH);
     }
     // Inter-word gap wide enough that the cursor word's rounded highlight box (overhangs ED_HL_PAD on
     // each side) keeps a visible gap to its neighbours instead of overlapping them. Uniform (not just
@@ -2951,7 +3180,12 @@ static std::string editor_request(const std::string &line);  // editor → daemo
     NSEventModifierFlags m = e.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
     edlog(@"keyDown keyCode=%u cmd=%d shift=%d", (unsigned)e.keyCode,
           (int)((m & NSEventModifierFlagCommand) != 0), (int)((m & NSEventModifierFlagShift) != 0));
-    if (_decoding || _starting) return;               // window static while the daemon warms the mic / transcribes
+    // A held key auto-repeats: a held Space started a mini-take and the next repeat stopped it a
+    // few ms later; Enter/Esc repeats are no better (F121).
+    if (e.isARepeat && (e.keyCode == 49 || e.keyCode == 36 || e.keyCode == 53)) return;
+    // Window static while the daemon warms the mic / transcribes — but Esc still leaves: a stalled
+    // daemon used to trap the user in «расшифровка…» with no way out (F026, F063).
+    if (_decoding || _starting) { if (e.keyCode == 53 && _onCancel) _onCancel(); return; }
     if (_recording) {
         switch (e.keyCode) {
             case 49: [self stopTakeApply]; return;   // space — stop & apply
@@ -3105,6 +3339,16 @@ static std::string editor_request(const std::string &line);  // editor → daemo
         _decoding = YES; [self setNeedsDisplay:YES];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             std::string r = editor_request("corr-stop");
+            // A real reply is "<takeId>\t<text>". No tab means a refusal ("err busy" from a degraded
+            // daemon) or a lost reply — that must not be inserted into the text as words (F062).
+            if (r.find('\t') == std::string::npos || r.rfind("err ", 0) == 0) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self->_decoding = NO;
+                    edlog(@"corr-stop failed (%lu-byte reply) — nothing applied", (unsigned long)r.size());
+                    [self setNeedsDisplay:YES];
+                });
+                return;
+            }
             size_t tab = r.find('\t');
             std::string correctionId = tab == std::string::npos ? "" : r.substr(0, tab);
             std::string correctionText = tab == std::string::npos ? r : r.substr(tab + 1);
@@ -3203,7 +3447,14 @@ static std::string editor_request(const std::string &line);  // editor → daemo
             NSColor *fg = hot ? (_recording ? [NSColor whiteColor] : [NSColor blackColor])
                         : uncertain ? ed_conf_color()
                         : [NSColor colorWithWhite:0.93 alpha:1];
-            [c.text drawAtPoint:c.rect.origin withAttributes:@{NSForegroundColorAttributeName:fg, NSFontAttributeName:(hot ? [self wordFont] : [self bodyFont])}];
+            NSDictionary *attrs = @{NSForegroundColorAttributeName:fg, NSFontAttributeName:(hot ? [self wordFont] : [self bodyFont])};
+            if (c.clipped) {
+                NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new]; ps.lineBreakMode = NSLineBreakByTruncatingMiddle;
+                NSMutableDictionary *ta = [attrs mutableCopy]; ta[NSParagraphStyleAttributeName] = ps;
+                [c.text drawInRect:c.rect withAttributes:ta];
+            } else {
+                [c.text drawAtPoint:c.rect.origin withAttributes:attrs];
+            }
         }
     }
     [NSGraphicsContext restoreGraphicsState];
@@ -3231,8 +3482,18 @@ static std::string editor_request(const std::string &line);  // editor → daemo
 
 // editor → daemon (one-shot): send a line to the daemon socket, wait for its ack, close. Returns
 // the reply ("ok" on success; "" when the daemon was unreachable or closed without answering).
+// Both editor → daemon calls are bounded: a daemon wedged on its main queue (corr-start/corr-stop
+// dispatch_sync there) otherwise blocked the editor forever (F026, F063). corr-stop includes a
+// whole decode, hence the generous receive bound.
+static const int EDITOR_RPC_SEC = 30;
+static void editor_rpc_timeouts(int c) {
+    struct timeval rto{EDITOR_RPC_SEC, 0}, sto{5, 0};
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof rto);
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &sto, sizeof sto);
+}
 static std::string editor_send(const std::string &line) {
     int c = connect_daemon(); if (c < 0) return "";
+    editor_rpc_timeouts(c);
     std::string l = line + "\n"; write_all(c, l.data(), l.size());
     char b[64]; ssize_t r; while ((r = read(c, b, sizeof(b))) < 0 && errno == EINTR) {}
     close(c);
@@ -3241,6 +3502,7 @@ static std::string editor_send(const std::string &line) {
 // editor → daemon (request/reply): send a line, read the full reply (e.g. corr-stop → transcript).
 static std::string editor_request(const std::string &line) {
     int c = connect_daemon(); if (c < 0) return "";
+    editor_rpc_timeouts(c);
     std::string l = line + "\n"; write_all(c, l.data(), l.size());
     std::string reply; char b[4096];
     for (;;){ ssize_t r=read(c,b,sizeof(b)); if(r>0){ reply.append(b,(size_t)r); continue; } if(r<0&&errno==EINTR) continue; break; }
@@ -3269,17 +3531,21 @@ static bool spawn_editor(NSString *transcript, NSString *conf) {
     char *argv[] = { (char*)"dictate", (char*)"editor", (char*)"--from-daemon", (char*)"--stdin",
                      (char*)"--conf", (char*)c.c_str(), nullptr };
     pid_t pid = 0;
-    int rc = posix_spawn(&pid, self.c_str(), &fa, nullptr, argv, *_NSGetEnviron());
+    posix_spawnattr_t at; posix_spawnattr_init(&at);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_CLOEXEC_DEFAULT);   // only stdin/out/err cross (F092)
+    int rc = posix_spawn(&pid, self.c_str(), &fa, &at, argv, *_NSGetEnviron());
+    posix_spawnattr_destroy(&at);
     posix_spawn_file_actions_destroy(&fa);
     close(pfd[0]);   // ours is done either way: the child holds its own copy (or never existed)
     slog("spawn_editor rc=%d pid=%d\n", rc, (int)pid);
     if (rc != 0) { close(pfd[1]); return false; }
     {
         g_editor_pid.store(pid);   // so a restart can take the editor with it instead of orphaning it
+        const uint64_t gen = ++g_editor_gen;   // spawn_editor runs on main
         const int wfd = pfd[1];
         // Reap the child AND recover if it dies WITHOUT sending accept/editor-cancel (crash, ⌘Q):
         // otherwise g_editor_open stays true and ⌘⇧D stays unregistered → daemon wedged.
-        std::thread([pid, wfd, t]{
+        std::thread([pid, wfd, t, gen]{
             write_all(wfd, t.data(), t.size()); close(wfd);   // EOF is the editor's end-of-transcript
             int st; while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
             pid_t mine = pid;                                // the lambda capture is const; CAS needs an lvalue
@@ -3289,7 +3555,9 @@ static bool spawn_editor(NSString *transcript, NSString *conf) {
             // would have to be a same-uid process that reused the pid within microseconds; the
             // airtight version is a DISPATCH_SOURCE_TYPE_PROC/PROC_EXIT source instead of waitpid.
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (g_editor_open.load()) { slog("editor exited without accept/cancel → recover\n"); [g_ctrl editorCancel]; }
+                // Only for THIS editor: a reaper delayed past a newer editor's spawn must not cancel
+                // that one while it is on screen (F005).
+                if (g_editor_open.load() && g_editor_gen == gen) { slog("editor exited without accept/cancel → recover\n"); [g_ctrl editorCancel]; }
             });
         }).detach();
     }
@@ -3307,6 +3575,7 @@ static bool spawn_editor(NSString *transcript, NSString *conf) {
 @implementation EditorApp {
     KeyWindow  *_win;
     EditorView *_v;
+    dispatch_source_t _term;   // SIGTERM from the daemon (restart / quit) → save the text first
 }
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     (void)n;
@@ -3359,6 +3628,26 @@ static bool spawn_editor(NSString *transcript, NSString *conf) {
         exit(0);
     };
     _v.onCancel = ^{ if (fromD) editor_send("editor-cancel"); exit(0); };
+    if (fromD) {
+        // Every daemon restart — the involuntary watchdog / take-start ones too — and `quit` SIGTERM
+        // this editor so it is not orphaned. Before exiting, put the text being edited on the
+        // clipboard: the hand edits were otherwise lost for good (F147). The handler runs on main
+        // (the view is main-only); a backstop on another queue exits anyway if main is stuck.
+        signal(SIGTERM, SIG_IGN);
+        _term = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0));
+        EditorView *view = _v;
+        dispatch_source_set_event_handler(_term, ^{
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *text = [view joinedText];
+                if (text.length) copy_to_clipboard(text);
+                edlog(@"SIGTERM (daemon restart/quit) → %lu chars to the clipboard", (unsigned long)text.length);
+                exit(0);
+            });
+            struct timespec ts{2, 0}; nanosleep(&ts, nullptr);
+            _exit(0);
+        });
+        dispatch_resume(_term);
+    }
     // Show WITHOUT activating the app. A non-activating panel becomes key and receives keyDown while
     // the app stays inactive — so there's no app activation and therefore no Space switch. (Earlier
     // attempts failed because the Regular-app activation itself switched Spaces; reordering it before
