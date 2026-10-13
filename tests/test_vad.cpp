@@ -196,3 +196,10 @@ TEST_CASE("Segmenter: cap and pause on the same frame do not arm the contiguous 
     CHECK(t.observeSpeech(0.5, true));             // cap mid-speech → armed
     CHECK(t.contiguousReopen);
 }
+
+TEST_CASE("Segmenter: after the floor rises, speech twice the noise level is still speech (bug-hunt F043 review)") {
+    Segmenter s;
+    for (int i = 0; i < 400; i++) s.observeIdle(0.020);    // steady 0.020 for ~12 s
+    CHECK_FALSE(s.isVoiced(0.020));                          // the steady noise is silence now
+    CHECK(s.isVoiced(0.045));                                // speech over it re-arms
+}

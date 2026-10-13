@@ -84,7 +84,11 @@ struct Segmenter {
         if (blocksN < MINSTAT_BLOCKS) return;
         double m = blockMins[0];
         for (int i = 1; i < MINSTAT_BLOCKS; i++) m = std::min(m, blockMins[i]);
-        if (isVoiced(m)) noise = m;   // the quietest frame of ~6 s is still "speech" → the room got louder
+        // The quietest frame of ~6 s is still "speech" → the room got louder. Set the floor to HALF
+        // that level, not to it: the threshold becomes 1.75×m, so the steady noise reads as silence
+        // while speech at twice the noise still reads as speech. Setting it to m (threshold 3.5×m)
+        // could put ordinary speech in a noisy room below the threshold for good.
+        if (isVoiced(m)) noise = m / 2;
     }
 
     bool isVoiced(double rms) const { return rms > std::max(ABS_FLOOR, noise * SPEECH_FACTOR); }

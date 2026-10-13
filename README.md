@@ -70,7 +70,7 @@ shasum -a 256 ggml-large-v3-turbo-q5_0.bin ggml-silero-v6.2.0.bin
 
 The Silero VAD model is what keeps silence from hallucinating text: when
 `~/.config/whisper/ggml-silero-v6.2.0.bin` (or the older `ggml-silero-v5.1.2.bin`) is missing,
-the daemon runs WITHOUT VAD. `$WHISPER_VAD_MODEL` points at another file; `WHISPER_VAD=0`
+the daemon runs without whisper's Silero VAD (its own energy VAD still segments). `$WHISPER_VAD_MODEL` points at another file; `WHISPER_VAD=0`
 disables it on purpose.
 
 ### Tests

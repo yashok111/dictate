@@ -68,7 +68,7 @@ sed "s|/Users/YOUR_USERNAME|$HOME|g" com.user.dictate.plist > "$rendered"
 plist_changed=0
 if [[ "$label" == "com.user.dictate" ]] && ! cmp -s "$rendered" "$plist"; then
   mkdir -p "$(dirname "$plist")"
-  cp "$rendered" "$plist"
+  cp "$rendered" "$plist.new" && mv -f "$plist.new" "$plist"   # never a half-written plist
   plist_changed=1
   printf 'installed plist → %s\n' "$plist"
 fi
