@@ -22,8 +22,11 @@ the editor supersedes live-preview-during-take.)
   ↑/↓ jump to the nearest word a line up/down (the view owns its own wrapped layout, so
   the same geometry drives drawing + line nav). ⌘V/⌃V pastes the clipboard text at the cursor —
   insert at a gap, replace on a word — via `EditModel::applyPaste`, which splits on whitespace
-  ONLY (`em_split_ws`): a pasted URL/path must stay one token, since `em_tokenize` would isolate
-  every `.`/`:` and `em_join` would then space them apart. Undoable. ⏎ or ⌘⇧D accept, Esc cancels, ⌘Z/⌃Z
+  ONLY (`em_split_ws`): a pasted URL/path must stay one token (whitespace is the only boundary
+  a paste can trust). `em_tokenize` keeps a `.` `,` `:` `;` `!` `?` glued between two word
+  characters inside its word (`3,5`, `10:30`, `example.com`, `т.е`), so an unedited transcript
+  round-trips through `em_join` byte-for-byte; only a mark with a space or another mark beside it
+  becomes its own token. Undoable. ⏎ or ⌘⇧D accept, Esc cancels, ⌘Z/⌃Z
   undo and ⌘⇧Z/⌃⇧Z redo the last content edit (a mini-take splice or a delete — NOT
   navigation; restores words+cursor+confidence exactly). The two-stack `EditHistory`
   (pure in `src/dictate_editmodel.h`, unit-tested) holds pre-edit snapshots: each edit
@@ -58,13 +61,17 @@ the editor supersedes live-preview-during-take.)
   transcribes a single dictated word as a standalone sentence — Capital + trailing period
   («слово» → "Слово.") — which is wrong for a one-word correction. So the mini-take result
   is cleaned before splicing (NOT via `normalize_text`, which is take-boundary-only and would
-  over-capitalize): (a) drop the spurious trailing sentence dot; (b) re-case the first letter
-  to context — on a word **replace** it inherits the replaced word's case (keeps proper nouns /
-  sentence starts capital, mid-sentence fixes lowercase), at a **gap** insert it Capitalizes
-  only at a sentence start (`atSentenceStart`); (c) **spoken punctuation**: if the whole
+  over-capitalize): (a) drop the spurious trailing DOT — only a `.`; a `?` `!` `…` after the
+  word is the user's own and stays — and ignore a mini-take that is nothing but marks (whisper
+  hallucinating `.` on a noise); (b) re-case the first letter to context — on a word **replace**
+  it inherits the replaced word's case (keeps proper nouns / sentence starts capital,
+  mid-sentence fixes lowercase), at a **gap** insert it Capitalizes only at a sentence start
+  (`atSentenceStart`, which looks past opening marks like `«`); an acronym or mixed-case term
+  (`API`, `iOS`) is never re-cased; (c) **spoken punctuation**: if the whole
   utterance names a mark (`em_spoken_punct` — «знак вопроса»→`?`, «точка»→`.`, «запятая»→`,`,
   «тире»→`—`, «открыть скобку»→`(`, «закрыть кавычки»→`»`, …) it inserts that symbol instead
-  of the literal words. All pure + unit-tested. The plain `applyResult` (stub / text-only
+  of the literal words; «дефис» in a gap joins the two neighbouring words (`кто`|`то` →
+  `кто-то`) rather than inserting a spaced `-`. All pure + unit-tested. The plain `applyResult` (stub / text-only
   path) stays verbatim — only the voice path runs the cleanup.
 - **Accept → paste**: the daemon saves the frontmost app at take start (`g_target_app`,
   `NSWorkspace`); on `accept <text>` it re-activates that app (`activateWithOptions:`
