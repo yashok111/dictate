@@ -30,6 +30,29 @@ inline std::size_t preroll_overflow(std::size_t prerollSamples) {
     return prerollSamples > maxpre ? prerollSamples - maxpre : 0;
 }
 
+// Forced-cut placement (F107). A segment that hits MAX_SEG_FR mid-utterance is cut at the
+// QUIETEST of its last CUT_WIN_FR frames instead of at the cap itself — the cap lands at an
+// arbitrary frame, usually inside a word, and the two halves then decode as two garbled words.
+constexpr int CUT_WIN_FR = 15;   // ~450 ms searched back from the cap
+
+// Given the RMS of the last `n` frames of the segment (n ≤ CUT_WIN_FR), oldest first, return
+// how many TRAILING frames to carry into the next segment: the frames after the quietest one
+// (ties → the latest quietest, so the carried tail is the shortest). 0 when n ≤ 0.
+inline int cut_tail_frames(const double *rms, int n) {
+    if (n <= 0) return 0;
+    int best = n - 1;
+    for (int i = n - 2; i >= 0; i--) if (rms[i] < rms[best]) best = i;
+    return n - 1 - best;
+}
+
+// Pre-roll budget while a forced-cut seam is armed (Segmenter::contiguousReopen): the carried
+// tail plus every frame until the continuation is confirmed — up to a full close of silence —
+// must survive, because the continuation segment is seeded from all of it (F042).
+inline std::size_t preroll_overflow_armed(std::size_t prerollSamples) {
+    std::size_t maxpre = (std::size_t)(PREROLL_FR + CUT_WIN_FR + SILENCE_CLOSE_FR) * FRAME;
+    return prerollSamples > maxpre ? prerollSamples - maxpre : 0;
+}
+
 // The scalar energy-VAD segmenter. One instance per take, driven once per 30 ms frame on
 // the (single) audio thread. The caller owns the audio buffers and reacts to the decisions
 // returned here. Mirrors the original processFrame state machine exactly.
@@ -46,7 +69,8 @@ struct Segmenter {
     enum class Onset {
         none,         // still idle this frame
         fromPreroll,  // speech began → seed the open segment from the pre-roll buffer
-        cleared,      // speech began as a contiguous continuation of a >20 s utterance → start empty
+        cleared,      // speech began as a contiguous continuation of a >20 s utterance → seed from the
+                      // pre-roll too: since the cut it holds only the carried tail + post-cut frames
     };
 
     // Drive while NOT in speech. Adapts the noise floor on silence, counts the speech run,

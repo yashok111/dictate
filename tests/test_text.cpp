@@ -184,3 +184,20 @@ TEST_CASE("normalize_text: idempotent over the regression inputs") {
         CHECK(normalize_text(once) == once);
     }
 }
+
+// ── utf8_sanitize (bug-hunt F055) ──
+TEST_CASE("utf8_sanitize: valid UTF-8 is unchanged") {
+    CHECK(utf8_sanitize("Привет, мир — ёж 😀 ok") == "Привет, мир — ёж 😀 ok");
+    CHECK(utf8_sanitize("").empty());
+}
+TEST_CASE("utf8_sanitize: a truncated multibyte tail becomes U+FFFD") {
+    std::string s = "слово \xD0";                        // half of a Cyrillic letter at the end
+    CHECK(utf8_sanitize(s) == "слово \xEF\xBF\xBD");
+    CHECK(utf8_sanitize("a\xF0\x9F\x98") == "a\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD");   // 3 orphan bytes
+}
+TEST_CASE("utf8_sanitize: stray continuation, overlong and surrogate bytes are replaced") {
+    CHECK(utf8_sanitize("x\xABy") == "x\xEF\xBF\xBDy");
+    CHECK(utf8_sanitize("\xC0\xAF") == "\xEF\xBF\xBD\xEF\xBF\xBD");        // overlong '/'
+    CHECK(utf8_sanitize("\xED\xA0\x80") == "\xEF\xBF\xBD\xEF\xBF\xBD\xEF\xBF\xBD");   // U+D800
+}
+

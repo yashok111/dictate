@@ -18,6 +18,37 @@ inline std::string normalize_ws(const std::string &s) {
     return out;
 }
 
+// Replace every invalid UTF-8 sequence (bad lead, missing/stray continuation, overlong,
+// surrogate, > U+10FFFF, truncated tail) with U+FFFD, one per offending byte. whisper's
+// byte-level BPE can end a segment inside a multibyte character, and +[NSString
+// stringWithUTF8String:] returns nil for the WHOLE string on one bad byte — which dropped a
+// finished take silently (F055). Valid input is returned unchanged.
+inline std::string utf8_sanitize(const std::string &s) {
+    std::string out; out.reserve(s.size());
+    std::size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = (unsigned char)s[i];
+        int n = 0; unsigned char lo = 0x80, hi = 0xBF;           // allowed range of the 2nd byte
+        if (c < 0x80) n = 1;
+        else if (c >= 0xC2 && c <= 0xDF) n = 2;
+        else if (c == 0xE0) { n = 3; lo = 0xA0; }                // no overlongs
+        else if (c >= 0xE1 && c <= 0xEC) n = 3;
+        else if (c == 0xED) { n = 3; hi = 0x9F; }                // no surrogates
+        else if (c >= 0xEE && c <= 0xEF) n = 3;
+        else if (c == 0xF0) { n = 4; lo = 0x90; }
+        else if (c >= 0xF1 && c <= 0xF3) n = 4;
+        else if (c == 0xF4) { n = 4; hi = 0x8F; }                // ≤ U+10FFFF
+        bool ok = n > 0 && i + (std::size_t)n <= s.size();
+        for (int k = 1; ok && k < n; k++) {
+            unsigned char cc = (unsigned char)s[i + (std::size_t)k];
+            ok = (k == 1) ? (cc >= lo && cc <= hi) : ((cc & 0xC0) == 0x80);
+        }
+        if (ok) { out.append(s, i, (std::size_t)n); i += (std::size_t)n; }
+        else    { out += "\xEF\xBF\xBD"; i += 1; }
+    }
+    return out;
+}
+
 namespace dictate_text_detail {
 
 inline bool is_ascii_digit(unsigned char c) { return c>='0' && c<='9'; }
