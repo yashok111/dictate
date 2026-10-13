@@ -27,8 +27,11 @@ public final class LibraryStore {
                 NSLocalizedDescriptionKey: "Выберите обычный аудио- или видеофайл."
             ])
         }
+        // An extensionless source is stored as plain "source", not "source." (F165); the media
+        // stack identifies the container by its content.
+        let ext = source.pathExtension
         var record = Recording(title: title ?? source.deletingPathExtension().lastPathComponent,
-                               sourceName: "source.\(source.pathExtension)")
+                               sourceName: ext.isEmpty ? "source" : "source.\(ext)")
         record.meetingContext = context
         let folder = directory(record.id)
         let destination = try self.source(record)
@@ -69,12 +72,23 @@ public final class LibraryStore {
         for dir in try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
             guard let id = UUID(uuidString: dir.lastPathComponent) else { continue }
             let file = dir.appendingPathComponent("recording.json")
-            guard manager.fileExists(atPath: file.path) else { continue }
+            guard manager.fileExists(atPath: file.path) else {
+                // An import interrupted by a quit or crash leaves a record folder with a partial
+                // media copy and no recording.json: never listed, never cleaned (F035). Move such a
+                // folder to the Trash once it is clearly not an import still in progress.
+                if let modified = (try? manager.attributesOfItem(atPath: dir.path))?[.modificationDate] as? Date,
+                   Date().timeIntervalSince(modified) > 600 {
+                    try? manager.trashItem(at: dir, resultingItemURL: nil)
+                }
+                continue
+            }
             do {
                 var record = try JSONDecoder().decode(Recording.self, from: Data(contentsOf: file))
                 guard record.id == id else { throw TranscriptError.invalidDocument }
                 try validate(record)
-                if record.state == .processing { record.state = .interrupted; try save(record) }
+                // A failed state save (read-only or full volume) must not hide a valid record: it
+                // is listed as interrupted either way, and the save is retried on its next change (F136).
+                if record.state == .processing { record.state = .interrupted; try? save(record) }
                 if [.interrupted, .cancelled, .failed, .ready].contains(record.state) {
                     for attempt in try manager.contentsOfDirectory(at:dir,includingPropertiesForKeys:nil)
                         where UUID(uuidString:attempt.lastPathComponent) != nil {

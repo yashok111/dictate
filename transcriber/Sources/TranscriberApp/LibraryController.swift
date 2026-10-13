@@ -94,6 +94,7 @@ final class LibraryController: ObservableObject {
             if source.data.contains(.critical), let id = self.active {
                 self.cancel(id, waitingForMemory: true)
             }
+            if !self.pressure { self.startNext() }   // memory freed: queued records may fit now (F034)
         }
         source.resume(); pressureSource = source
         if let models = self.models {
@@ -268,16 +269,17 @@ final class LibraryController: ObservableObject {
               FileManager.default.fileExists(atPath: helper.path),
               FileManager.default.fileExists(atPath: config.diarizationModelDirectory) else {
             transition(record.id) { $0.state = .failed; $0.error = "Набор моделей не установлен. Соберите приложение с моделями." }
+            startNext()   // the head left .queued: evaluate the rest of the queue too (F034)
             return
         }
         let candidates = config.profiles.filter { $0.isEligible(for: preference) }
         let installed = candidates.map { FileManager.default.fileExists(atPath: $0.path) }
         guard installed.contains(true) else {
-            transition(record.id) { $0.state = .failed; $0.error = "Модель выбранного режима не установлена." }; return
+            transition(record.id) { $0.state = .failed; $0.error = "Модель выбранного режима не установлена." }; startNext(); return
         }
         guard let choice = MemoryPolicy.choose(candidates, installed: installed,
             headroom: MemoryPolicy.headroom(), pressure: pressure) else {
-            transition(record.id) { $0.state = .waitingForMemory }; return
+            transition(record.id) { $0.state = .waitingForMemory }; startNext(); return
         }
         let profile = candidates[choice]
         launch(record, store: store, config: config, helper: helper, profile: profile)
@@ -286,14 +288,14 @@ final class LibraryController: ObservableObject {
     private func startManaged(_ record: Recording, store: LibraryStore, models: ModelsController) {
         guard models.prepared else { waitingForModels = true; return }
         guard let config, let helper = helperURL, FileManager.default.fileExists(atPath: helper.path) else {
-            transition(record.id) { $0.state = .failed; $0.error = "Повреждена установка приложения. Установите Transcriber заново." }; return
+            transition(record.id) { $0.state = .failed; $0.error = "Повреждена установка приложения. Установите Transcriber заново." }; startNext(); return
         }
         let candidates = config.profiles.filter { $0.isEligible(for: preference) }
         let installed = candidates.map { models.readyProfileIDs.contains($0.id) }
         guard installed.contains(true) else { waitingForModels = true; return }
         waitingForModels = false
         guard let choice = MemoryPolicy.choose(candidates, installed: installed, headroom: MemoryPolicy.headroom(), pressure: pressure) else {
-            transition(record.id) { $0.state = .waitingForMemory }; return
+            transition(record.id) { $0.state = .waitingForMemory }; startNext(); return
         }
         let profile = candidates[choice], token = UUID(), selectedPreference = preference
         admission = token
@@ -378,15 +380,21 @@ final class LibraryController: ObservableObject {
             modelLease = nil
             Task {
                 await models.store.release(lease.id)
-                models.inUse.remove(lease.profile.id)
+                // A job admitted meanwhile on the same profile holds it again: removing the id now
+                // would show that model as free while it transcribes (F014).
+                if modelLease?.profile.id != lease.profile.id { models.inUse.remove(lease.profile.id) }
                 startNext()
             }
         } else { startNext() }
     }
 
     func rename(_ id: UUID, speaker: String, name: String) {
-        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        editTranscript(id) { if $0.speakers[speaker] != nil { $0.speakers[speaker] = name } }
+        // Store what is shown: no padding, and no newline that would split an exported
+        // "[00:01:02] name: text" line (F172).
+        let clean = name.components(separatedBy: .newlines).joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        editTranscript(id) { if $0.speakers[speaker] != nil { $0.speakers[speaker] = clean } }
     }
     func assign(_ id: UUID, segment: String, speaker: Int?) {
         assign(id, segments: [segment], speaker: speaker, merge: false)

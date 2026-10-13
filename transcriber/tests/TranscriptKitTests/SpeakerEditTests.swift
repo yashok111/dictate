@@ -19,7 +19,7 @@ struct SpeakerEditTests {
             Segment(startMS: 6000, endMS: 7000, speaker: 0, text: "Позже", overlap: false)
         ], speakers: ["0":"Один", "1":"Два"], model: "test")
         try store.save(record)
-        let controller = LibraryController(libraryRoot: root, resources: nil)
+        let controller = LibraryController(libraryRoot: root, resources: nil, defaults: isolatedTestDefaults())
         let original = record.transcript!
         let selected = Set(original.segments[1...2].map(\.id))
         controller.assign(record.id, segments: selected, speaker: 0, merge: true)
