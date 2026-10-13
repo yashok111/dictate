@@ -64,7 +64,9 @@ def main():
         check=True,
     )
     if digest(partial) != expected:
-        raise RuntimeError("SHA-256 mismatch; remove the partial download and retry")
+        # A corrupt prefix would be resumed forever: start the next run from zero.
+        partial.unlink(missing_ok=True)
+        raise RuntimeError("SHA-256 mismatch; the partial download was removed — run again")
     partial.replace(destination)
     print(f"Verified {model}: {destination}")
 

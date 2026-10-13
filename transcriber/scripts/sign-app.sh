@@ -21,7 +21,8 @@ developer-id)
 	exit 2
 	;;
 esac
-python3 - "$app" "$identity" "${options[@]}" <<'PY'
+# ${options[@]+...}: macOS /bin/bash 3.2 under `set -u` aborts on an empty "${options[@]}".
+python3 - "$app" "$identity" ${options[@]+"${options[@]}"} <<'PY'
 import subprocess
 import sys
 from pathlib import Path

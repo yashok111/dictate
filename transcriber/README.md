@@ -130,12 +130,11 @@ for exact output comparisons: independently decoding AAC can produce small diffe
 
 ## Use
 
-On macOS 26 and later, actions, playback controls and search use native Liquid
-Glass. Transcript text retains a solid reading surface. Older systems use native
-bordered controls and material backgrounds; custom surfaces respect Reduce
-Transparency, while native controls follow the system accessibility settings.
-Short transitions soften transcript appearance, progress updates
-and file-drop feedback. Play/pause symbols transition on macOS 14+. These custom
+The app requires macOS 26 in both build modes. Actions, playback controls and search
+use native Liquid Glass. Transcript text retains a solid reading surface; custom surfaces
+respect Reduce Transparency, while native controls follow the system accessibility
+settings. Short transitions soften transcript appearance, progress updates
+and file-drop feedback. Play/pause symbols transition. These custom
 animations respect Reduce Motion; search results and recording selection update
 immediately.
 Appearance follows macOS. With no recording selected, the welcome screen shows
@@ -292,10 +291,13 @@ make -C transcriber test
 bash transcriber/scripts/test-model-downloads.sh
 python3 -m unittest discover -s transcriber/tests -p 'test_bundle_runtime.py'
 python3 -m unittest discover -s transcriber/tests -p 'test_release_scripts.py'
+python3 -m unittest discover -s transcriber/tests -p 'test_prepared_pipeline.py'   # also run by `make -C transcriber test`
+python3 -m unittest discover -s transcriber/tests -p 'test_bench_diarization.py'   # needs the dev-only pyannote.metrics env; skipped otherwise
 ```
 
-The first command runs the existing portable C++ suite plus model-admission and
-speaker-attribution cases. Swift tests cover the C ABI, transcript validation,
+The first command runs Dictate's portable C++ suite, which also covers the platform-free
+`transcriber/core` word-timing logic (zero-width words, window seams). The transcriber's
+native, model-admission and speaker-attribution cases run under `make -C transcriber test`. Swift tests cover the C ABI, transcript validation,
 exports, persistence, preview cancellation, repeating without overwriting edits,
 stale-attempt rejection, failed state saves, shutdown, corrupt-record isolation,
 and import ownership/cleanup. Native tests cover cache invalidation/corruption,

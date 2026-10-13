@@ -37,6 +37,14 @@ fi
 bash scripts/sign-app.sh "$app" --mode adhoc
 destination=build/Transcriber.app
 if [[ $mode == release ]]; then destination=build/release/Transcriber.app; fi
+# Move the new app next to the destination first, then swap: if anything fails between the two
+# moves, the previous app is put back instead of being deleted with the staging directory.
+mkdir -p "$(dirname "$destination")"
+mv "$app" "$destination.new"
 if [[ -e $destination ]]; then mv "$destination" "$staging/previous.app"; fi
-mv "$app" "$destination"
+if ! mv "$destination.new" "$destination"; then
+	[[ -e $staging/previous.app ]] && mv "$staging/previous.app" "$destination"
+	echo "Could not install $destination; the previous build is kept" >&2
+	exit 1
+fi
 printf 'Built: %s/%s\n' "$PWD" "$destination"
