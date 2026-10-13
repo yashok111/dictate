@@ -220,8 +220,9 @@ mic readiness, and pastes via a synthetic ⌘V. Earlier versions drove the UI fr
 Whisper's raw output is tidied before it reaches the editor / clipboard / paste: the first
 letter of each sentence is capitalized, stray spaces around punctuation are fixed, `...`
 becomes `…`, and a spaced hyphen becomes an em-dash (` — `). It is deliberately
-**conservative** — it leaves mixed RU/EN, domains (`github.com`), file names, version
-numbers, and decimals (`3,14`) untouched. Set `DICTATE_NORMALIZE=0` to disable it and get
+**conservative** — it leaves mixed RU/EN, domains (`github.com`), file names (`.env`), version
+numbers, decimals (`3,14`), times and ports (`12:30`, `localhost:3000`), URLs and code
+(`https://x/y?z=1`, `std::vector`) and closing quotes (`"Привет!"`) untouched. Set `DICTATE_NORMALIZE=0` to disable it and get
 the raw whisper text (useful for an A/B). The transform itself is pure logic in
 `src/dictate_text.h` (`normalize_text`) and is covered by `make test`.
 

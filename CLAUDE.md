@@ -253,7 +253,8 @@ auto-spawn). Clean: `launchctl bootout gui/$(id -u)/com.user.dictate; pkill -9 -
 - `DICTATE_NORMALIZE=0` disables post-normalization of the final transcript (default ON).
   The normalizer (`normalize_text`, `src/dictate_text.h`) capitalizes sentence starts, fixes
   punctuation spacing, and applies light typography (`...`→`…`, ` - `→` — `) — conservative
-  by design (leaves mixed RU/EN, domains, file names, versions, decimals alone). It is applied
+  by design (leaves mixed RU/EN, domains, file names, versions, decimals, times/scores/ports
+  `12:30`, URLs and code-like tokens, and closing quotes alone; `…` is not a sentence end). It is applied
   via `finalize_transcript()` ONLY at the two final take boundaries (the hotkey/timer worker
   after `raw->finish()`, and the socket `stop` after `s->finish()`) — **never inside `finish()`
   itself**, because `finish()` is shared with the editor mini-take (`corr-stop`), where a
