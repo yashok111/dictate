@@ -34,6 +34,14 @@ public actor ModelStore {
     private var leases: [UUID: String] = [:]
     private var installing: Set<String> = []
     private var reconciling = false
+    /// Bundle id → the (path, size, mtime, inode) of every file when it last verified. A full
+    /// SHA-256 of the bundle on every installedArtifactIDs() — each acquire, each download
+    /// progress refresh — stalled the actor; a stat of the files is enough to know nothing
+    /// changed (the same reasoning as ModelReceipt) (F013, F126).
+    private var verifiedBundles: [String: [String]] = [:]
+    /// "<artifact>#<leaf>" → "size|mtime|inode" of a staged leaf when it last verified: after each
+    /// leaf, installBundleLeaf re-checks every leaf, which re-hashed the whole bundle per leaf (F126).
+    private var verifiedLeaves: [String: String] = [:]
 
     public init(root: URL, catalog: ModelCatalog,
                 availableSpace: @escaping @Sendable (URL) throws -> Int64 = { try ModelStore.freeSpace($0) }) throws {
@@ -51,8 +59,14 @@ public actor ModelStore {
             try Self.privateDirectory(stagingDirectory)
             // With the root lock held and before the store escapes its initializer,
             // no live transfer can own these leftovers from a previous process.
+            let currentBundles = Set(catalog.artifacts.filter { $0.bundleFiles != nil }
+                .map { "bundle-" + $0.id + "-" + $0.installedSHA256 })
             for item in try FileManager.default.contentsOfDirectory(at: stagingDirectory, includingPropertiesForKeys: nil) {
-                if item.pathExtension == "download" || UUID(uuidString: item.lastPathComponent) != nil {
+                let name = item.lastPathComponent
+                // A bundle staging directory of a SHA the catalog no longer lists can never be
+                // published or resumed (F032).
+                let staleBundle = name.hasPrefix("bundle-") && !currentBundles.contains(name)
+                if item.pathExtension == "download" || UUID(uuidString: name) != nil || staleBundle {
                     try FileManager.default.removeItem(at: item)
                 }
             }
@@ -106,6 +120,28 @@ public actor ModelStore {
     private func bundleDirectory(_ artifact: ModelArtifact) -> URL {
         stagingDirectory.appendingPathComponent("bundle-" + artifact.id + "-" + artifact.installedSHA256)
     }
+    /// Drop a bundle's partially downloaded leaves (a discarded download).
+    public func removeBundleStaging(artifactID: String) {
+        guard let artifact = catalog.artifacts.first(where: { $0.id == artifactID }), artifact.bundleFiles != nil else { return }
+        try? FileManager.default.removeItem(at: bundleDirectory(artifact))
+    }
+    private func bundleStamp(_ directory: URL, artifact: ModelArtifact) -> [String]? {
+        guard let files = artifact.bundleFiles else { return nil }
+        // Every entry actually present, not only the listed files: verifyBundle rejects an extra
+        // file, so a file added after verification must invalidate the cache (F013 review).
+        guard let entries = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) else { return nil }
+        let base = directory.standardizedFileURL.pathComponents.count
+        var stamp = (entries.compactMap { $0 as? URL }.map {
+            "entry:" + $0.standardizedFileURL.pathComponents.dropFirst(base).joined(separator: "/")
+        }).sorted()
+        for file in files {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: directory.appendingPathComponent(file.path).path),
+                  let size = attributes[.size] as? NSNumber, let modified = attributes[.modificationDate] as? Date,
+                  let inode = attributes[.systemFileNumber] as? NSNumber else { return nil }
+            stamp.append("\(file.path)|\(size)|\(modified.timeIntervalSince1970)|\(inode)")
+        }
+        return stamp
+    }
     private func verifyBundle(_ directory: URL, artifact: ModelArtifact) throws {
         guard let files = artifact.bundleFiles,
               try FileManager.default.attributesOfItem(atPath: directory.path)[.type] as? FileAttributeType == .typeDirectory else {
@@ -143,8 +179,18 @@ public actor ModelStore {
             parent.appendPathComponent(String(component))
             guard (try? FileManager.default.attributesOfItem(atPath: parent.path)[.type] as? FileAttributeType) == .typeDirectory else { return false }
         }
-        do { try ModelFileInstaller.verify(root.appendingPathComponent(file.path), bytes:file.bytes, digest:file.sha256); return true }
-        catch { return false }
+        let target = root.appendingPathComponent(file.path), cacheKey = "\(artifactID)#\(index)"
+        let stamp = (try? FileManager.default.attributesOfItem(atPath: target.path)).flatMap { attributes -> String? in
+            guard let size = attributes[.size] as? NSNumber, let modified = attributes[.modificationDate] as? Date,
+                  let inode = attributes[.systemFileNumber] as? NSNumber else { return nil }
+            return "\(size)|\(modified.timeIntervalSince1970)|\(inode)"
+        }
+        if let stamp, verifiedLeaves[cacheKey] == stamp { return true }
+        do {
+            try ModelFileInstaller.verify(target, bytes:file.bytes, digest:file.sha256)
+            verifiedLeaves[cacheKey] = stamp
+            return true
+        } catch { verifiedLeaves.removeValue(forKey: cacheKey); return false }
     }
     public func installBundleLeaf(stagedDownload: URL, artifactID: String, index: Int) throws {
         guard !reconciling, let artifact = catalog.artifacts.first(where: { $0.id == artifactID }),
@@ -187,7 +233,13 @@ public actor ModelStore {
     public func installedArtifactIDs() -> Set<String> {
         let bundles = catalog.artifacts.filter { artifact in
             guard artifact.bundleFiles != nil, let url = artifactURL(artifact.id) else { return false }
-            do { try verifyBundle(url, artifact:artifact); return true } catch { return false }
+            let stamp = bundleStamp(url, artifact: artifact)
+            if let stamp, verifiedBundles[artifact.id] == stamp { return true }
+            do {
+                try verifyBundle(url, artifact:artifact)
+                verifiedBundles[artifact.id] = stamp
+                return true
+            } catch { verifiedBundles.removeValue(forKey: artifact.id); return false }
         }.map(\.id)
         return Set(bundles).union(receipts.keys.filter { id in
             guard let url = artifactURL(id), let receipt = receipts[id] else { return false }
@@ -215,6 +267,24 @@ public actor ModelStore {
             receipts[artifact.id] = current
         }
         try saveReceipts()
+        removeSupersededInstalls()
+    }
+
+    /// `<id>-<sha>` directories of a catalog artifact whose installed SHA is no longer the current
+    /// one: nothing refers to them after a catalog update, so each kept a model's worth of disk
+    /// forever (F104, F102). Only directories named for a KNOWN artifact id are touched.
+    private func removeSupersededInstalls() {
+        guard let entries = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
+        let current = Set(catalog.artifacts.map { "\($0.id)-\($0.installedSHA256)" })
+        let hex = CharacterSet(charactersIn: "0123456789abcdef")
+        for entry in entries {
+            let name = entry.lastPathComponent
+            guard !current.contains(name), name.count > 65 else { continue }
+            let sha = String(name.suffix(64)), id = String(name.dropLast(65))
+            guard name.dropLast(64).hasSuffix("-"), sha.unicodeScalars.allSatisfy(hex.contains),
+                  catalog.artifacts.contains(where: { $0.id == id }) else { continue }
+            try? FileManager.default.removeItem(at: entry)
+        }
     }
 
     public func install(stagedDownload: URL, artifactID: String) async throws {
@@ -273,7 +343,9 @@ public actor ModelStore {
         for artifact in artifacts where !retained.contains(artifact.id) {
             guard let url = artifactURL(artifact.id) else { continue }
             if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+            rmdir(url.deletingLastPathComponent().path)   // the `<id>-<sha>` parent, only if now empty (F102)
             receipts.removeValue(forKey: artifact.id)
+            verifiedBundles.removeValue(forKey: artifact.id)
         }
         try saveReceipts()
     }

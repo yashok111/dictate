@@ -1,4 +1,7 @@
 #pragma once
+#include <cctype>
+#include <string>
+#include <vector>
 #include "policy.h"
 
 namespace transcriber {
@@ -23,6 +26,9 @@ public:
             if (pending_.empty()) pending_start_ = start;
             else pending_ += " ";
             pending_ += text;
+            // A zero-width word has no timing of its own: whatever it is merged into is not
+            // reliably timed either (its start is stretched back over this token) (F138).
+            pending_uncertain_ = true;
             return;
         }
         auto interval = owned_word_interval(start, end, core_start_, core_end_);
@@ -66,4 +72,28 @@ private:
     bool pending_uncertain_{false};
     std::vector<AsrWord> words_;
 };
+
+// Window seams (F166). Each 25 s window times the words near its core boundary with its own
+// audio context, so deciding ownership by each window's own midpoint could keep a straddling
+// word in both windows or in neither. Windows therefore collect words whose midpoint lies within
+// SEAM_SLACK_MS of their core (a small overlap, never a gap), and the join drops the second copy
+// of a word both windows kept.
+inline constexpr int64_t SEAM_SLACK_MS = 150;
+
+// The word's text without surrounding spaces and ASCII punctuation — "привет," and "привет"
+// are one word for the seam check.
+inline std::string seam_key(const std::string& t) {
+    auto skip = [](unsigned char c) { return c == ' ' || (c < 0x80 && std::ispunct(c)); };
+    size_t a = 0, b = t.size();
+    while (a < b && skip(static_cast<unsigned char>(t[a]))) ++a;
+    while (b > a && skip(static_cast<unsigned char>(t[b - 1]))) --b;
+    return t.substr(a, b - a);
+}
+
+// `next` (from the later window) repeats `prev` (the last word kept from the earlier window):
+// same word, and it starts before `prev` ended plus the slack.
+inline bool duplicate_at_seam(const AsrWord& prev, const AsrWord& next) {
+    const std::string key = seam_key(next.text);
+    return !key.empty() && key == seam_key(prev.text) && next.start_ms < prev.end_ms + SEAM_SLACK_MS;
+}
 }  // namespace transcriber

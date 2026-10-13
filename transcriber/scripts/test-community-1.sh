@@ -2,6 +2,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(mktemp -d /private/tmp/community-1-smoke.XXXXXX)
+# Remove the working directory on success; keep it (and say where) when the smoke fails.
+# shellcheck disable=SC2154  # `status` is assigned inside the trap string itself
+trap 'status=$?; if [[ $status -eq 0 ]]; then rm -rf "$root"; else echo "kept for inspection: $root" >&2; fi' EXIT
 model=${1:-.models/community-1}
 manifest="$PWD/Resources/community-1.lock.json"
 helper="$PWD/build/community-1/transcriber-diarizer"
@@ -24,5 +27,5 @@ assert 'minimum=0.5 zeroVote=true' in (root / 'speakers.log').read_text()
 previous = 'offline-v1;step=0.1;exclusive=false;embeddingSkip=none;otherDefaults=04e363c29d9a754022d602d6fe1468ab80a0f705'
 assert doc['diarization']['configurationSHA256'] != hashlib.sha256(previous.encode()).hexdigest()
 assert 'speaker-cache: hit' in (root / 'cached.log').read_text()
-print('Community-1 smoke passed:', root)
+print('Community-1 smoke passed')
 PY

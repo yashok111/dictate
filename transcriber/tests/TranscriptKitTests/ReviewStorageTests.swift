@@ -18,7 +18,7 @@ struct ReviewStorageTests {
         try manager.setAttributes([.posixPermissions: 0o000], ofItemAtPath: source.path)
         defer { try? manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: source.path) }
         let library = root.appendingPathComponent("library")
-        let controller = LibraryController(libraryRoot: library, resources: nil)
+        let controller = LibraryController(libraryRoot: library, resources: nil, defaults: isolatedTestDefaults())
         controller.importFiles([source])
         for _ in 0..<200 {
             if !controller.importing { break }
@@ -40,7 +40,7 @@ struct ReviewStorageTests {
         let bytes = Data("owned recording".utf8)
         try bytes.write(to: original)
         try manager.createSymbolicLink(at: linked, withDestinationURL: original)
-        let controller = LibraryController(libraryRoot: root.appendingPathComponent("library"), resources: nil)
+        let controller = LibraryController(libraryRoot: root.appendingPathComponent("library"), resources: nil, defaults: isolatedTestDefaults())
         controller.importFiles([linked])
         for _ in 0..<200 {
             if !controller.importing { break }

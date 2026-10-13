@@ -17,7 +17,7 @@ struct MeetingContextTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try Data("audio".utf8).write(to: source)
         let folder = root.appendingPathComponent("Library")
-        let library = LibraryController(libraryRoot: folder, resources: nil)
+        let library = LibraryController(libraryRoot: folder, resources: nil, defaults: isolatedTestDefaults())
         defer { library.shutdown() }
         library.requestImport([source])
         try modelCheck(library.recordings.isEmpty && !library.importing, "Opening context must not start import")

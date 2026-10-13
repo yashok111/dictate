@@ -90,7 +90,14 @@ done
 	exit 1
 }
 sync
-hdiutil detach "$staging/mount"
+# Finder or Spotlight often still holds the freshly laid-out volume: retry, then force.
+for ((attempt = 0; attempt < 5; attempt++)); do
+	hdiutil detach "$staging/mount" && break
+	sleep 2
+done
+if [[ -d $staging/mount ]] && mount | grep -q " on $staging/mount "; then
+	hdiutil detach -force "$staging/mount"
+fi
 mounted=false
 hdiutil convert "$staging/writable.dmg" -format UDZO -o "$staging/$output"
 if [[ $mode == developer-id ]]; then

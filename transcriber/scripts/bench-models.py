@@ -25,7 +25,14 @@ def main():
     os.umask(0o077)
     root = Path(__file__).resolve().parents[1]
     resources = root / "build/Transcriber.app/Contents/Resources"
-    config = json.loads((resources / "runtime.json").read_text())
+    runtime = resources / "runtime.json"
+    if not runtime.is_file():
+        parser.error(f"{runtime} not found — run scripts/build-app.sh (development mode) first")
+    config = json.loads(runtime.read_text())
+    if "profiles" not in config or not (resources / "transcriber-diarizer").is_file():
+        # A release bundle writes {"mode": "managed", ...} with no profiles and keeps the
+        # diarizer under Helpers/: this benchmark needs the development layout.
+        parser.error(f"{runtime} is not a development build (no profiles / diarizer); rebuild with scripts/build-app.sh")
     profiles = {profile["id"]: profile for profile in config["profiles"]}
     for name in args.profiles:
         if name not in profiles or not Path(profiles[name]["path"]).is_file():
@@ -105,6 +112,10 @@ def main():
                             )
                             last_report = report
                     code = child.wait()
+                    if previous_stage is not None:   # the last stage ends with the process, not with a next stage
+                        stage_seconds[previous_stage] = round(
+                            time.monotonic() - started - previous_time, 3
+                        )
                 finally:
                     if child.poll() is None:
                         os.killpg(child.pid, signal.SIGTERM)

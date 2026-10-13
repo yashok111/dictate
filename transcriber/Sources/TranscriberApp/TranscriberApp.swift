@@ -241,7 +241,7 @@ private struct RecordingDetail: View {
                         if selecting {
                             Text("Выбрано: \(selectedSegments.count)").font(.caption)
                             Menu("Назначить говорящего") {
-                                ForEach(transcript.speakers.keys.sorted(), id: \.self) { key in
+                                ForEach(transcript.speakers.keys.sorted { (Int($0) ?? Int.max, $0) < (Int($1) ?? Int.max, $1) }, id: \.self) { key in
                                     Button(transcript.speakers[key] ?? key) {
                                         library.assign(record.id, segments: selectedSegments, speaker: Int(key), merge: mergeAssigned)
                                         selectedSegments.removeAll()
@@ -437,7 +437,7 @@ private struct SegmentView: View {
                         Button("Переименовать…") { name = transcript.speakerName(speaker); renaming = true }
                         Divider()
                     }
-                    ForEach(transcript.speakers.keys.sorted(), id: \.self) { key in
+                    ForEach(transcript.speakers.keys.sorted { (Int($0) ?? Int.max, $0) < (Int($1) ?? Int.max, $1) }, id: \.self) { key in
                         Button(transcript.speakers[key] ?? key) { assign(Int(key)) }
                     }
                     Button("Не определён") { assign(nil) }

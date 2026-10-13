@@ -1,6 +1,7 @@
 """Provision pinned native ONNX Runtime, headers and the Russian alignment model."""
 import hashlib
 import json
+import os
 import shutil
 import tarfile
 from pathlib import Path
@@ -41,8 +42,17 @@ def main():
           "f3e0cbd86cc3f38dad30c97921b40e9a8bcc6f2c943777eb76ad77176993e417")
     with tarfile.open(archive) as source:
         name = "sherpa-onnx-v1.13.8-osx-arm64-shared-no-tts-lib/lib/libonnxruntime.dylib"
-        with source.extractfile(name) as data, (DEPS / "onnxruntime/libonnxruntime.dylib").open("wb") as target:
+        # Extract beside the target and rename over it: an interrupted extraction must never
+        # leave a truncated dylib for the next `make worker` to link against.
+        final = DEPS / "onnxruntime/libonnxruntime.dylib"
+        part = final.with_name(final.name + ".part")
+        member = source.getmember(name)
+        with source.extractfile(member) as data, part.open("wb") as target:
             shutil.copyfileobj(data, target)
+        if part.stat().st_size != member.size:
+            part.unlink(missing_ok=True)
+            raise RuntimeError("libonnxruntime.dylib extraction is truncated")
+        os.replace(part, final)
     catalog = json.loads((ROOT / "Resources/models.json").read_text())
     artifact = next(a for a in catalog["artifacts"] if a["id"] == "alignment-ru")
     fetch(artifact["url"], ROOT / ".models/alignment-ru.onnx", artifact["downloadSHA256"])

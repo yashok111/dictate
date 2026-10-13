@@ -6,8 +6,12 @@ options=()
 if [[ -n ${TRANSCRIBER_MANIFEST_OVERLAY:-} ]]; then
   options+=(-Xbuild-tools-swiftc -vfsoverlay -Xbuild-tools-swiftc "$TRANSCRIBER_MANIFEST_OVERLAY")
 fi
-swift build --build-system native -c release --product transcriber-diarizer "${options[@]}"
-bin=$(swift build --build-system native -c release --show-bin-path "${options[@]}")
+# ${options[@]+...}: macOS /bin/bash 3.2 under `set -u` aborts on an empty "${options[@]}".
+swift build --build-system native -c release --product transcriber-diarizer ${options[@]+"${options[@]}"}
+bin=$(swift build --build-system native -c release --show-bin-path ${options[@]+"${options[@]}"})
+# Fresh every build: a helper or resource bundle dropped from the SwiftPM product must not
+# survive here and be shipped by every later app (build-app.sh ditto's the whole directory).
+rm -rf build/community-1
 mkdir -p build/community-1
 cp "$bin/transcriber-diarizer" build/community-1/
 python3 - "$bin" "$PWD/build/community-1" <<'PYRES'

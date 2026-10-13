@@ -48,13 +48,15 @@ public final class ProcessRunner: @unchecked Sendable {
                         let data = pipe.fileHandleForReading.availableData
                         if data.isEmpty { break }
                         pending.append(data)
-                        if pending.count > 65_536 { pending.removeAll() }
                         while let end = pending.firstIndex(of: 10) {
                             let line = pending.prefix(upTo: end)
                             if let event = try? JSONDecoder().decode(WorkerProgress.self, from: line),
                                event.progress.isFinite { onProgress(event) }
                             pending.removeSubrange(...end)
                         }
+                        // Cap only the leftover PARTIAL line: capping before parsing dropped every
+                        // complete progress line a large read had brought in (F074).
+                        if pending.count > 65_536 { pending.removeAll() }
                     }
                     child.waitUntilExit()
                     self.lock.lock(); self.process = nil; let wasCancelled = self.cancelled; self.lock.unlock()

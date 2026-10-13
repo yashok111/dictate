@@ -5,6 +5,7 @@ app=${1:?Usage: test-release.sh ABSOLUTE_APP_PATH}
 python3 scripts/audit-bundle.py "$app"
 codesign --verify --deep --strict "$app"
 test_root=$(mktemp -d /private/tmp/transcriber-release-check.XXXXXX)
+trap 'rm -rf "$test_root"' EXIT   # a full copy of the release app; never leave it behind
 relocated="$test_root/Проверка Transcriber.app"
 ditto "$app" "$relocated"
 say -v Milena -o "$test_root/source.aiff" 'Сегодня мы проверяем приложение для расшифровки встреч. Все модели работают на этом компьютере.'

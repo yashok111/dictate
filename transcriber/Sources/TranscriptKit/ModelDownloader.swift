@@ -147,17 +147,19 @@ public actor ModelDownloader {
                     } catch {
                         try check(token)
                         let nsError = error as NSError
-                        if let data = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
-                            try saveResume(data, for: artifact)
-                        }
-                        // Resume data can point at expired CDN URLs or deleted temp files.
-                        // Discard unusable data; the next explicit retry uses the origin.
-                        if resume != nil {
-                            try? FileManager.default.removeItem(at: resumeFile)
-                            throw ModelError("Не удалось продолжить загрузку. Нажмите «Повторить», чтобы скачать этот файл заново.")
-                        }
+                        let fresh = nsError.userInfo[NSURLSessionDownloadTaskResumeData] as? Data
+                        if let fresh { try saveResume(fresh, for: artifact) }
                         let transient = nsError.domain == NSURLErrorDomain &&
                             [NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost, NSURLErrorNotConnectedToInternet].contains(nsError.code)
+                        // Resume data can point at expired CDN URLs or deleted temp files: a resumed
+                        // attempt that fails for another reason is fatal. A network blip during a
+                        // resumed attempt is not — it takes the retry path below with whatever resume
+                        // data it produced — and data the failure itself just produced is never
+                        // thrown away (F030, F162).
+                        if resume != nil && !transient {
+                            if fresh == nil { try? FileManager.default.removeItem(at: resumeFile) }
+                            throw ModelError("Не удалось продолжить загрузку. Нажмите «Повторить», чтобы скачать этот файл заново.")
+                        }
                         guard transient, retries < 2 else { throw error }
                         retries += 1; resume = loadResume(for: artifact)
                         try await Task.sleep(nanoseconds: UInt64(retries) * 1_000_000_000)
@@ -202,12 +204,15 @@ public actor ModelDownloader {
                 catch { state.error = "Не удалось сохранить продолжение загрузки: \(error.localizedDescription)" }
             }
             _ = try? await work?.value
+            // Finish INSIDE the shared operation: every caller awaiting it — not only the first —
+            // then sees busy cleared and the paused state, so a concurrent discard/resume right
+            // after a second pause() is not refused or silently ignored (F011).
+            pauseOperation = nil
+            current = nil; installation = nil; busy = false
+            state.phase = .paused; saveState(); publish()
         }
         pauseOperation = operation
         await operation.value
-        pauseOperation = nil
-        current = nil; installation = nil; busy = false
-        state.phase = .paused; saveState(); publish()
     }
 
     public func resume(profileID: String) async throws { try await install(profileID: profileID) }
@@ -217,6 +222,14 @@ public actor ModelDownloader {
         guard !busy else { throw ModelError("Дождитесь завершения другой загрузки.") }
         for artifact in try catalog.requiredArtifacts(for: profileID) {
             try? FileManager.default.removeItem(at: resumeURL(artifact.id))
+            // A bundle downloads leaf by leaf: each leaf keeps its own resume file, and verified
+            // leaves wait in the bundle's staging directory (F029, F073, F075, F105, F032).
+            if let files = artifact.bundleFiles {
+                for index in files.indices {
+                    try? FileManager.default.removeItem(at: resumeURL(artifact.leafArtifact(index).id))
+                }
+                await store.removeBundleStaging(artifactID: artifact.id)
+            }
         }
         state = ModelDownloadSnapshot(); saveState(); publish()
     }

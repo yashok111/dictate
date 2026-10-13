@@ -25,3 +25,4 @@ test-pipeline: build/test-pipeline
 	./build/test-pipeline
 test: worker test-pipeline
 	python3 tests/test_worker.py
+	python3 tests/test_prepared_pipeline.py

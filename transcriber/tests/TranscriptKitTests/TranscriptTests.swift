@@ -18,6 +18,15 @@ private func cleanTestTrash(_ ids: [UUID]) {
 }
 @testable import TranscriptKit
 
+/// A throwaway UserDefaults suite: a controller built on `.standard` would read the developer's
+/// own saved model preference and make profile-sensitive tests pass or fail per machine (F181).
+func isolatedTestDefaults() -> UserDefaults {
+    let suite = "transcriber-tests-" + UUID().uuidString
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    return defaults
+}
+
 struct TranscriptTests {
     @MainActor
     func testModelSelectionSurvivesRelaunch() throws {
@@ -91,7 +100,7 @@ struct TranscriptTests {
         var legacy = try JSONSerialization.jsonObject(with: Data(contentsOf: legacyURL)) as! [String: Any]
         legacy["noiseReduction"] = true
         try JSONSerialization.data(withJSONObject: legacy).write(to: legacyURL)
-        let controller = LibraryController(libraryRoot: store.root, resources: resources)
+        let controller = LibraryController(libraryRoot: store.root, resources: resources, defaults: isolatedTestDefaults())
         for _ in 0..<200 {
             if controller.recordings.first(where: { $0.id == second.id })?.state == .ready { break }
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -138,7 +147,7 @@ struct TranscriptTests {
         let cache = store.root.appendingPathComponent(".speaker-cache")
         try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         try Data("shared".utf8).write(to: cache.appendingPathComponent("turns.json"))
-        let controller = LibraryController(libraryRoot: store.root)
+        let controller = LibraryController(libraryRoot: store.root, defaults: isolatedTestDefaults())
         controller.selected = first.id
         controller.delete(first.id)
         try expectEqual(controller.recordings.map(\.id), [second.id])
@@ -163,7 +172,7 @@ struct TranscriptTests {
         var record = Recording(title: "Keep", sourceName: "source.wav"); record.state = .ready
         defer { cleanTestTrash([record.id]) }
         try store.save(record)
-        let controller = LibraryController(libraryRoot: root)
+        let controller = LibraryController(libraryRoot: root, defaults: isolatedTestDefaults())
         controller.selected = record.id
         for mode in [0o500, 0o000] {
             try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: root.path)
@@ -187,7 +196,7 @@ struct TranscriptTests {
         ], speakers: ["0": "Анна"], model: "old")
         try store.save(original)
         try Data("original audio".utf8).write(to: store.source(original))
-        let controller = LibraryController(libraryRoot: root)
+        let controller = LibraryController(libraryRoot: root, defaults: isolatedTestDefaults())
         controller.reprocess(original)
         for _ in 0..<200 {
             if !controller.importing { break }
@@ -239,7 +248,7 @@ struct TranscriptTests {
         defer { cleanTestTrash([record.id]) }
         try store.save(record)
         try Data("audio".utf8).write(to: store.source(record))
-        let controller = LibraryController(libraryRoot: libraryRoot, resources: resources)
+        let controller = LibraryController(libraryRoot: libraryRoot, resources: resources, defaults: isolatedTestDefaults())
         for _ in 0..<200 {
             if controller.preview(for: record.id) != nil { break }
             try await Task.sleep(nanoseconds: 10_000_000)
@@ -304,7 +313,7 @@ struct TranscriptTests {
         let store = try LibraryStore(root: root)
         let record = Recording(title: "Queued", sourceName: "source.wav")
         try store.save(record)
-        let controller = LibraryController(libraryRoot: root)
+        let controller = LibraryController(libraryRoot: root, defaults: isolatedTestDefaults())
         // The test bundle has no runtime configuration: a started attempt should
         // expose that error, not leave the restored job queued forever.
         try expectEqual(controller.recordings.first?.state, .failed)
@@ -317,7 +326,7 @@ struct TranscriptTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let a = root.appendingPathComponent("one.wav"), b = root.appendingPathComponent("два файла.wav")
         try Data("first".utf8).write(to: a); try Data("second".utf8).write(to: b)
-        let controller = LibraryController(libraryRoot: root.appendingPathComponent("library"))
+        let controller = LibraryController(libraryRoot: root.appendingPathComponent("library"), defaults: isolatedTestDefaults())
         controller.importFiles([a]); controller.importFiles([b])
         for _ in 0..<200 {
             if !controller.importing { break }

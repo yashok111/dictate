@@ -45,6 +45,7 @@ Task {
         ("download space preflight", ModelDownloadTests().testInsufficientSpaceDoesNotStartTransfer),
         ("download shared reuse and invalid resume", ModelDownloadTests().testSharedReuseAndInvalidResumeRecovery),
         ("download resume source binding", ModelDownloadTests().testResumeBoundToSource),
+        ("download discard and restore", ModelDownloadTests().testDiscardRemovesResumeAndRestorePauses),
         ("real HTTP model downloads", ModelDownloadTests().testRealHTTPTransport),
         ("download repeated clicks and late completion", ModelDownloadTests().testRepeatedInstallAndStaleCompletion),
         ("model publication and leases", ModelStoreTests().testVerifiedPublicationAndLeases),
@@ -59,6 +60,12 @@ Task {
         ("termination without window", lifecycleTests.testTerminationNotificationStopsWorkerWithoutAWindow)
     ]
     for (name, run) in reviewCases {
+        // The real-URLSession case needs the fixture server; without it the test returns at once,
+        // which must read as a skip, never as a pass (scripts/test-model-downloads.sh runs it).
+        if name == "real HTTP model downloads", ProcessInfo.processInfo.environment["TRANSCRIBER_TEST_HTTP"] == nil {
+            print("SKIP: \(name) (TRANSCRIBER_TEST_HTTP unset; run scripts/test-model-downloads.sh)")
+            continue
+        }
         do { try await run(); print("PASS: \(name)") }
         catch { failures += 1; print("FAIL: \(name): \(error)") }
     }

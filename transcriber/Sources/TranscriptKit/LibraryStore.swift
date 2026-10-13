@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public final class LibraryStore {
     public let root: URL
@@ -27,13 +28,23 @@ public final class LibraryStore {
                 NSLocalizedDescriptionKey: "Выберите обычный аудио- или видеофайл."
             ])
         }
+        // An extensionless source is stored as plain "source", not "source." (F165); the media
+        // stack identifies the container by its content.
+        let ext = source.pathExtension
         var record = Recording(title: title ?? source.deletingPathExtension().lastPathComponent,
-                               sourceName: "source.\(source.pathExtension)")
+                               sourceName: ext.isEmpty ? "source" : "source.\(ext)")
         record.meetingContext = context
         let folder = directory(record.id)
         let destination = try self.source(record)
         try manager.createDirectory(at: folder, withIntermediateDirectories: false,
                                     attributes: [.posixPermissions: 0o700])
+        // Hold an flock on a marker for the whole copy: load() treats a folder without
+        // recording.json as an abandoned import only when it can take this lock, which the kernel
+        // releases if the importing process quits or crashes (F035 review).
+        let marker = folder.appendingPathComponent(".importing")
+        let lockFD = open(marker.path, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+        if lockFD >= 0 { _ = flock(lockFD, LOCK_EX) }
+        defer { if lockFD >= 0 { close(lockFD) }; try? manager.removeItem(at: marker) }
         do {
             try manager.copyItem(at: resolved, to: destination)
             try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
@@ -69,12 +80,25 @@ public final class LibraryStore {
         for dir in try manager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) {
             guard let id = UUID(uuidString: dir.lastPathComponent) else { continue }
             let file = dir.appendingPathComponent("recording.json")
-            guard manager.fileExists(atPath: file.path) else { continue }
+            guard manager.fileExists(atPath: file.path) else {
+                // An import interrupted by a quit or crash leaves a record folder with a partial
+                // media copy and no recording.json: never listed, never cleaned (F035). An import
+                // still copying holds an flock on .importing; only a folder whose lock can be taken
+                // (or that has no marker at all) is abandoned, and it goes to the Trash.
+                let marker = dir.appendingPathComponent(".importing")
+                let fd = open(marker.path, O_RDWR | O_NOFOLLOW)
+                let abandoned = fd < 0 || flock(fd, LOCK_EX | LOCK_NB) == 0
+                if fd >= 0 { close(fd) }
+                if abandoned { try? manager.trashItem(at: dir, resultingItemURL: nil) }
+                continue
+            }
             do {
                 var record = try JSONDecoder().decode(Recording.self, from: Data(contentsOf: file))
                 guard record.id == id else { throw TranscriptError.invalidDocument }
                 try validate(record)
-                if record.state == .processing { record.state = .interrupted; try save(record) }
+                // A failed state save (read-only or full volume) must not hide a valid record: it
+                // is listed as interrupted either way, and the save is retried on its next change (F136).
+                if record.state == .processing { record.state = .interrupted; try? save(record) }
                 if [.interrupted, .cancelled, .failed, .ready].contains(record.state) {
                     for attempt in try manager.contentsOfDirectory(at:dir,includingPropertiesForKeys:nil)
                         where UUID(uuidString:attempt.lastPathComponent) != nil {
