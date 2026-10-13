@@ -1,0 +1,4 @@
+module CTranscriber {
+    header "transcriber_policy.h"
+    export *
+}

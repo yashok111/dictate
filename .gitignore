@@ -16,3 +16,12 @@
 .agents/skills/
 .claude/skills/
 *.d
+
+# Transcriber local build products, downloaded models, and Python caches
+/transcriber/.build/
+/transcriber/build/
+/transcriber/.deps/
+/transcriber/.models/
+/transcriber/.swiftpm/
+/transcriber/**/__pycache__/
+/transcriber/.DS_Store

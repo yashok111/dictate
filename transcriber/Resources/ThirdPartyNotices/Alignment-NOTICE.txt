@@ -1,0 +1,16 @@
+Russian forced alignment uses Wav2Vec2 XLSR-53 Russian, fine-tuned by Jonatas Grosman:
+https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-russian
+INT8 ONNX conversion:
+https://huggingface.co/onnx-community/wav2vec2-large-xlsr-53-russian-ONNX
+Revision df5ba1d9e0f9a34c44eec437b441f4ae43c842eb
+onnx/model_quantized.onnx: 317349970 bytes
+SHA256 027f226a26c4ad2bb8cd6e4f56038b9013afc3cf6ccf2cdf9aecb092c3726344
+Model repository license: Apache-2.0; see Alignment-LICENSE.txt.
+The model is downloaded separately and not embedded in the application.
+
+ONNX Runtime 1.28.2 is distributed with the app for alignment inference, under MIT.
+See onnxruntime-LICENSE.txt and onnxruntime-ThirdPartyNotices.txt.
+Binary source is the SHA-verified sherpa-onnx v1.13.8 macOS arm64 release archive;
+the sherpa inference libraries are not included or used.
+The app uses ONNX Runtime's backward-compatible C API version 22.
+No telemetry is enabled by this application. Inference uses local model files only.
