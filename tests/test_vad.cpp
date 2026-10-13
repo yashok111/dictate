@@ -197,9 +197,15 @@ TEST_CASE("Segmenter: cap and pause on the same frame do not arm the contiguous 
     CHECK(t.contiguousReopen);
 }
 
-TEST_CASE("Segmenter: after the floor rises, speech twice the noise level is still speech (bug-hunt F043 review)") {
-    Segmenter s;
-    for (int i = 0; i < 400; i++) s.observeIdle(0.020);    // steady 0.020 for ~12 s
-    CHECK_FALSE(s.isVoiced(0.020));                          // the steady noise is silence now
-    CHECK(s.isVoiced(0.045));                                // speech over it re-arms
+TEST_CASE("Segmenter: a raised floor never sits above what a room that was loud from the start gets (bug-hunt F043 review)") {
+    // The floor is raised to HALF the quiet level, then the ordinary idle adaptation takes over —
+    // so it ends where a take started in that room would be, never higher: the steady level reads
+    // as silence and speech clearly above it (SPEECH_FACTOR) reads as speech.
+    Segmenter raised;
+    for (int i = 0; i < 400; i++) raised.observeIdle(0.020);   // the room got louder mid-take
+    Segmenter fromStart; fromStart.noise = 0.020;               // the room was this loud all along
+    for (int i = 0; i < 400; i++) fromStart.observeIdle(0.020);
+    CHECK(raised.noise <= fromStart.noise + 1e-12);
+    CHECK_FALSE(raised.isVoiced(0.020));
+    CHECK(raised.isVoiced(0.080));
 }
