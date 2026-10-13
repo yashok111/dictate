@@ -384,10 +384,11 @@ public:
         const double tailSec = (seg_.inSpeech && cur_.size() >= (size_t)FRAME) ? (double)cur_.size() / WHISPER_SAMPLE_RATE : 0.0;
         size_t queued; { std::lock_guard<std::mutex> lk(qmu_); queued = q_.size(); }
         if (seg_.inSpeech && cur_.size() >= (size_t)FRAME) enqueue(std::move(cur_));
-        // Stopped right after a forced cut, before the continuation was confirmed: the carried
-        // tail (preroll_'s first tailSamples_) is the end of the utterance — decode it too.
-        else if (seg_.contiguousReopen && tailSamples_ >= (size_t)FRAME)
-            enqueue(std::vector<float>(preroll_.begin(), preroll_.begin() + (std::ptrdiff_t)tailSamples_));
+        // Stopped right after a forced cut, before the continuation was confirmed: preroll_ holds
+        // the carried tail AND every frame since the cut (speech too quiet or too short to confirm
+        // yet) — all of it contiguous with the closed segment, so decode all of it.
+        else if (seg_.contiguousReopen && preroll_.size() >= (size_t)FRAME)
+            enqueue(std::vector<float>(preroll_.begin(), preroll_.end()));
         cur_.clear(); seg_.inSpeech = false;
         { std::lock_guard<std::mutex> lk(qmu_); finishing_ = true; } qcv_.notify_all();
         if (worker_.joinable()) worker_.join();
@@ -500,7 +501,9 @@ private:
     }
 
     // Queue a copy of `n` samples as a segment from the realtime tap thread, reusing a recycled
-    // buffer (capacity SEG_SAMPLES) so steady state allocates nothing (gotcha #6).
+    // buffer (capacity SEG_SAMPLES) so steady state allocates nothing (gotcha #6). With the pool
+    // drained it allocates — the same bounded cold-start/backed-up fallback rotateSegment has, on
+    // a path that runs at most once per forced cut.
     void pushSegment(const float *p, size_t n) {
         std::vector<float> b;
         { std::lock_guard<std::mutex> lk(qmu_);
