@@ -40,9 +40,18 @@ inline bool load_wav_pcm16(const char *path, std::vector<float> &out, uint32_t *
             if (csz>16) fseek(f,(long)(csz-16)+(csz&1),SEEK_CUR);
         } else if (!memcmp(id,"data",4)) {
             if (!got_fmt || bits!=16 || channels==0 || channels>256) break;   // reject absurd channel counts (real formats ≤ 8; ambisonics ≤ 64)
+            // Clamp the declared size to the bytes actually in the file: a WAV cut short (an
+            // interrupted ffmpeg) or streamed with size 0xFFFFFFFF still holds usable audio (F046).
+            long here = ftell(f);
+            if (here >= 0 && (uint64_t)fst.st_size > (uint64_t)here) {
+                uint64_t avail = (uint64_t)fst.st_size - (uint64_t)here;
+                if ((uint64_t)csz > avail) csz = (uint32_t)avail;
+            } else if (here >= 0) csz = 0;
             if (csz > 256u*1024*1024) break;   // refuse an absurd data chunk (>256 MB) → no huge alloc / bad_alloc abort
             std::vector<int16_t> pcm(csz/2);
-            if (fread(pcm.data(),2,pcm.size(),f)!=pcm.size()) break;
+            size_t got = fread(pcm.data(),2,pcm.size(),f);
+            pcm.resize(got);                   // whatever is there (a short read mid-file is the same as truncation)
+            if (pcm.size() < channels) break;  // not even one frame
             out.clear(); out.reserve(pcm.size()/channels);
             for (size_t i=0; i+channels<=pcm.size(); i+=channels) {
                 int64_t acc=0; for (int c=0;c<channels;c++) acc+=pcm[i+c];   // 64-bit so the per-frame sum can't overflow on a high channel count

@@ -115,3 +115,7 @@ TEST_CASE("wd_reason_is_wedge: only the involuntary restarts are worth a snapsho
     CHECK_FALSE(wd_reason_is_wedge(""));
     CHECK_FALSE(wd_reason_is_wedge(nullptr));
 }
+
+TEST_CASE("wd_reason_is_wedge: a stuck graceful restart (deadline) is a wedge too (bug-hunt F153)") {
+    CHECK(wd_reason_is_wedge("deadline"));
+}

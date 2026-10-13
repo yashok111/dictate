@@ -180,3 +180,19 @@ TEST_CASE("preroll_overflow_armed: holds tail + a full close of silence beyond t
     CHECK(preroll_overflow((std::size_t)(PREROLL_FR + 1) * FRAME) == (std::size_t)FRAME);   // the normal budget is unchanged
 }
 
+TEST_CASE("Segmenter: a louder room raises the floor; speech dips do not (bug-hunt F043)") {
+    Segmenter s;                                   // floor starts at 1e-4
+    for (int i = 0; i < 400; i++) s.observeIdle(0.05);   // a fan comes on: constant 0.05
+    CHECK_FALSE(s.isVoiced(0.05));                 // after ~6 s the fan is the new floor
+    Segmenter t;
+    for (int i = 0; i < 400; i++) t.observeIdle(i % 10 == 0 ? 0.001 : 0.2);   // speech with dips
+    CHECK(t.isVoiced(0.2));                        // dips keep the floor low → speech stays voiced
+}
+TEST_CASE("Segmenter: cap and pause on the same frame do not arm the contiguous seam (bug-hunt F108)") {
+    Segmenter s; s.inSpeech = true; s.silenceRun = SILENCE_CLOSE_FR - 1;
+    CHECK(s.observeSpeech(0.0, /*tooLong=*/true));
+    CHECK_FALSE(s.contiguousReopen);
+    Segmenter t; t.inSpeech = true;
+    CHECK(t.observeSpeech(0.5, true));             // cap mid-speech → armed
+    CHECK(t.contiguousReopen);
+}

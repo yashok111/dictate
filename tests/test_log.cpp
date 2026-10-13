@@ -1,5 +1,6 @@
 #include "doctest.h"
 #include "dictate_log.h"
+#include <cmath>
 
 TEST_CASE("log feature flag is opt-in") {
     CHECK_FALSE(dlog::flag_enabled(nullptr));
@@ -87,4 +88,10 @@ TEST_CASE("hex codec round-trips arbitrary transcript bytes") {
     CHECK(decoded == input);
     CHECK_FALSE(dlog::hex_decode("0", &decoded));
     CHECK_FALSE(dlog::hex_decode("zz", &decoded));
+}
+
+TEST_CASE("json_escape repairs invalid UTF-8; number_field emits null for nan/inf (bug-hunt F052)") {
+    CHECK(dlog::json_escape("a\xD0") == "a\xEF\xBF\xBD");
+    CHECK(dlog::number_field("d", std::nan("")).value == "null");
+    CHECK(dlog::number_field("d", 1.0/0.0).value == "null");
 }

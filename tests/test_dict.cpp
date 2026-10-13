@@ -168,3 +168,8 @@ TEST_CASE("build_initial_prompt: budget truncates by priority, never exceeds the
     CHECK(p.find("слово0,") == 0);                           // first entry kept, at the front
     CHECK(p.find("слово499") == std::string::npos);          // last entry dropped by the budget
 }
+
+TEST_CASE("parse: a leading UTF-8 BOM does not defeat the first-line comment (bug-hunt F070)") {
+    auto v = parse_dictionary("\xEF\xBB\xBF# header\nKubernetes\n");
+    CHECK(v == std::vector<std::string>{"Kubernetes"});
+}

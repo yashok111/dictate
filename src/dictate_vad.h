@@ -63,6 +63,30 @@ struct Segmenter {
     bool   contiguousReopen = false;   // last close was a MAX_SEG forced cut → next seg skips pre-roll…
     int    sinceCut = 0;               // …unless ≥SILENCE_CLOSE_FR of real silence follows (a NEW utterance)
 
+    // Minimum-statistics floor (F043). `noise` adapts only on unvoiced frames, so a room that got
+    // louder than noise*SPEECH_FACTOR (a fan, music) made EVERY frame voiced and the floor could
+    // never rise: the take turned into back-to-back 20 s segments of noise. Track the quietest
+    // frame of each MINSTAT_BLOCK_FR block; when even the quietest frame of the last
+    // MINSTAT_BLOCKS blocks (~6 s) still reads as speech, that level is the new floor. Real
+    // speech has inter-word dips far below its peaks, so it does not trip this.
+    static constexpr int MINSTAT_BLOCK_FR = 50;   // ~1.5 s per block
+    static constexpr int MINSTAT_BLOCKS   = 4;
+    double blockMin = 1e9; int blockN = 0;
+    double blockMins[MINSTAT_BLOCKS] = {1e9, 1e9, 1e9, 1e9}; int blocksN = 0;
+
+    void trackFloor(double rms) {
+        if (rms < blockMin) blockMin = rms;
+        if (++blockN < MINSTAT_BLOCK_FR) return;
+        for (int i = 1; i < MINSTAT_BLOCKS; i++) blockMins[i - 1] = blockMins[i];
+        blockMins[MINSTAT_BLOCKS - 1] = blockMin;
+        if (blocksN < MINSTAT_BLOCKS) blocksN++;
+        blockMin = 1e9; blockN = 0;
+        if (blocksN < MINSTAT_BLOCKS) return;
+        double m = blockMins[0];
+        for (int i = 1; i < MINSTAT_BLOCKS; i++) m = std::min(m, blockMins[i]);
+        if (isVoiced(m)) noise = m;   // the quietest frame of ~6 s is still "speech" → the room got louder
+    }
+
     bool isVoiced(double rms) const { return rms > std::max(ABS_FLOOR, noise * SPEECH_FACTOR); }
 
     // What the caller must do with its pre-roll / open-segment buffers when speech onsets.
@@ -77,6 +101,7 @@ struct Segmenter {
     // and reports onset. The caller inserts+trims its pre-roll buffer around this call (use
     // preroll_overflow); on a non-`none` return it seeds the open segment accordingly.
     Onset observeIdle(double rms) {
+        trackFloor(rms);
         bool voiced = isVoiced(rms);
         if (!voiced) {
             noise = 0.95 * noise + 0.05 * rms;
@@ -98,11 +123,16 @@ struct Segmenter {
     // segment closes now; on a forced (tooLong) cut, arms the contiguous-reopen seam so the
     // next segment skips its pre-roll (the audio is contiguous — no duplicate at the seam).
     bool observeSpeech(double rms, bool tooLong) {
+        trackFloor(rms);
         bool voiced = isVoiced(rms);
         if (voiced) silenceRun = 0; else silenceRun++;
         if (silenceRun >= SILENCE_CLOSE_FR || tooLong) {
+            // A real pause closing the segment on the very frame the cap is hit is NOT a cut
+            // mid-utterance: arming the seam then would treat the next utterance as contiguous and
+            // drop its pre-roll, clipping the first word (F108).
+            const bool paused = silenceRun >= SILENCE_CLOSE_FR;
             inSpeech = false; silenceRun = 0; speechRun = 0;
-            if (tooLong) { contiguousReopen = true; sinceCut = 0; }
+            if (tooLong && !paused) { contiguousReopen = true; sinceCut = 0; }
             return true;
         }
         return false;
