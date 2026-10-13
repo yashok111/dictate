@@ -127,7 +127,13 @@ public actor ModelStore {
     }
     private func bundleStamp(_ directory: URL, artifact: ModelArtifact) -> [String]? {
         guard let files = artifact.bundleFiles else { return nil }
-        var stamp: [String] = []
+        // Every entry actually present, not only the listed files: verifyBundle rejects an extra
+        // file, so a file added after verification must invalidate the cache (F013 review).
+        guard let entries = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil) else { return nil }
+        let base = directory.standardizedFileURL.pathComponents.count
+        var stamp = (entries.compactMap { $0 as? URL }.map {
+            "entry:" + $0.standardizedFileURL.pathComponents.dropFirst(base).joined(separator: "/")
+        }).sorted()
         for file in files {
             guard let attributes = try? FileManager.default.attributesOfItem(atPath: directory.appendingPathComponent(file.path).path),
                   let size = attributes[.size] as? NSNumber, let modified = attributes[.modificationDate] as? Date,
