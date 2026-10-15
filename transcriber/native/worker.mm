@@ -185,7 +185,7 @@ NSMutableArray* transcribe_words(const PCM& pcm, const char* model, const char* 
         std::ostringstream content; content << stream.rdbuf();
         prompt = dict::build_initial_prompt(content.str());
     }
-    NSMutableArray* rows = [NSMutableArray array];
+    std::vector<transcriber::AsrWord> joined_words;
     constexpr size_t stride = sample_rate * 25;
     size_t skipped = 0, total = 0, skipped_samples = 0;
     for (size_t core = 0; core < pcm.size(); core += stride) {
@@ -231,23 +231,15 @@ NSMutableArray* transcribe_words(const PCM& pcm, const char* model, const char* 
                 int64_t(begin * 1000 / sample_rate) + whisper_full_get_segment_t1(ctx.get(), i) * 10);
             words.add(a, b, normalize_ws(whisper_full_get_segment_text(ctx.get(), i)));
         }
-        // Only the first words of this window can repeat the PREVIOUS window's last word — compare
-        // against that one, never against a word this window just added ("да да" stays).
-        NSDictionary* seam_prev = rows.lastObject;
-        int seam_checks = 3;
-        for (const auto& result : words.finish()) {
-            if (seam_prev && seam_checks > 0) {
-                --seam_checks;
-                transcriber::AsrWord prev{[seam_prev[@"startMS"] longLongValue], [seam_prev[@"endMS"] longLongValue],
-                                          std::string([seam_prev[@"text"] UTF8String] ?: ""), false};
-                if (transcriber::duplicate_at_seam(prev, result)) { seam_checks = 0; continue; }
-            }
-            NSString* word = [NSString stringWithUTF8String:result.text.c_str()];
-            if (!word) throw std::runtime_error("Неверная кодировка результата");
-            [rows addObject:@{@"startMS": @(result.start_ms), @"endMS": @(result.end_ms), @"text": word,
-                             @"timingUncertain": @(result.timing_uncertain)}];
-        }
+        transcriber::append_window_words(joined_words, words.finish());
         progress("transcribing", double(core_end) / pcm.size());
+    }
+    NSMutableArray* rows = [NSMutableArray arrayWithCapacity:joined_words.size()];
+    for (const auto& result : joined_words) {
+        NSString* word = [NSString stringWithUTF8String:result.text.c_str()];
+        if (!word) throw std::runtime_error("Неверная кодировка результата");
+        [rows addObject:@{@"startMS": @(result.start_ms), @"endMS": @(result.end_ms), @"text": word,
+                         @"timingUncertain": @(result.timing_uncertain)}];
     }
     fprintf(stderr, "vad: skipped=%zu total=%zu skipped_audio=%.3fs\n",
             skipped, total, double(skipped_samples) / sample_rate);

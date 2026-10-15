@@ -96,4 +96,28 @@ inline bool duplicate_at_seam(const AsrWord& prev, const AsrWord& next) {
     const std::string key = seam_key(next.text);
     return !key.empty() && key == seam_key(prev.text) && next.start_ms < prev.end_ms + SEAM_SLACK_MS;
 }
+
+// Context can shift timestamps around a window seam. Keep recognition order from each
+// window, but anchor any backwards-shifted word to the previous word so the combined
+// word list remains valid for alignment and finalization.
+inline void append_window_words(std::vector<AsrWord>& output, const std::vector<AsrWord>& incoming) {
+    const bool has_previous_window = !output.empty();
+    const AsrWord previous_window_last = has_previous_window ? output.back() : AsrWord{};
+    int seam_checks = has_previous_window ? 3 : 0;
+    for (auto word : incoming) {
+        if (seam_checks > 0) {
+            --seam_checks;
+            if (duplicate_at_seam(previous_window_last, word)) {
+                seam_checks = 0;
+                continue;
+            }
+        }
+        if (!output.empty() && word.start_ms < output.back().start_ms) {
+            word.start_ms = output.back().start_ms;
+            word.end_ms = std::max(word.end_ms, word.start_ms + 1);
+            word.timing_uncertain = true;
+        }
+        output.push_back(std::move(word));
+    }
+}
 }  // namespace transcriber
