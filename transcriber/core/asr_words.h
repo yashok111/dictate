@@ -24,7 +24,7 @@ public:
         if (start == end) {
             if (start < core_start_ || start >= core_end_) return;
             if (pending_.empty()) pending_start_ = start;
-            else pending_ += " ";
+            else pending_ += ' ';
             pending_ += text;
             // A zero-width word has no timing of its own: whatever it is merged into is not
             // reliably timed either (its start is stretched back over this token) (F138).

@@ -24,7 +24,7 @@ inline bool load_wav_pcm16(const char *path, std::vector<float> &out, uint32_t *
     FILE *f = fp.get();   // non-owning view; fp closes it (and the fd) on every return path (RAII, R.1)
     char riff[4], wave[4]; uint32_t riffsz = 0;
     if (fread(riff,1,4,f)!=4 || fread(&riffsz,4,1,f)!=1 || fread(wave,1,4,f)!=4 ||
-        memcmp(riff,"RIFF",4) || memcmp(wave,"WAVE",4)) return false;
+        memcmp(riff,"RIFF",4) != 0 || memcmp(wave,"WAVE",4) != 0) return false;
     uint16_t channels=1, bits=16; uint32_t srate=0; bool got_fmt=false, ok=false;
     for (;;) {
         char id[4]; uint32_t csz;

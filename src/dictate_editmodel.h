@@ -448,7 +448,7 @@ struct EditModel {
             if (!conf.empty()) { conf[gi - 1] = EM_CONF_SURE; conf.erase(conf.begin() + gi); }
             pos = 2 * (gi - 1) + 1;
         } else if (left) {
-            words[gi - 1] += "-";
+            words[gi - 1] += '-';
             if (!conf.empty()) conf[gi - 1] = EM_CONF_SURE;
             pos = 2 * (gi - 1) + 1;
         } else if (right) {

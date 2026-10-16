@@ -58,6 +58,7 @@ before changing it** — each one is the hard-won part:
 ```sh
 make                       # → ./dictate   (needs Xcode CLT + `brew install whisper-cpp`)
 make test                  # → tests/run   (doctest; host c++, NO brew/whisper — runs on Linux too)
+make -j8 tidy              # clang-tidy over src/dictate_*.h + transcriber/core (.clang-tidy; also in CI)
 ./dictate --file a.wav     # one-shot, no daemon: stream a 16 kHz mono WAV
 ./dictate --file a.wav --once   # single-pass (A/B vs streaming)
 ```

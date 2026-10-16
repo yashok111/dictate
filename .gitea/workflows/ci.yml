@@ -4,7 +4,7 @@
 # The APP build is macOS-only (AppKit/AVFoundation frameworks + Homebrew
 # libwhisper) and cannot run here. The doctest suite is deliberately portable
 # (plain `c++ -std=c++17 -pthread`, no frameworks) — verified on linux gcc:14,
-# 186 cases / 718 assertions green — so `make test` alone is the gate.
+# 186 cases / 718 assertions green — so `make test` (plus `make tidy` on the same code) is the gate.
 name: CI
 
 on:
@@ -21,3 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make test
+
+  # clang-tidy over the same portable C++ (config: .clang-tidy). The image has no clang-tidy;
+  # apt gives Ubuntu 24.04's (18), the Mac/dev box run a newer one — both are kept clean.
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq clang-tidy
+      - run: make -j"$(nproc)" tidy

@@ -7,6 +7,7 @@ int32_t tr_select_profile(const tr_profile* profiles, size_t count,
     if (!profiles || count > 64) return -1;
     try {
         std::vector<transcriber::Profile> items;
+        items.reserve(count);
         for (size_t i = 0; i < count; ++i)
             items.push_back({std::to_string(i), profiles[i].peak_bytes, profiles[i].quality_rank,
                              profiles[i].installed != 0});

@@ -53,6 +53,7 @@ inline Field number_field(std::string name, double value) {
 inline bool flag_enabled(const char *value) {
     if (!value || !*value) return false;
     std::string v;
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound): false positive, the loop stops at the NUL
     for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
         if (!std::isspace(*p)) v.push_back((char)std::tolower(*p));
     }
@@ -92,9 +93,9 @@ inline void append_json_pair(std::string &out, const std::string &name,
     out += json_escape(name);
     out += "\":";
     if (quoted) {
-        out += "\"";
+        out += '"';
         out += json_escape(value);
-        out += "\"";
+        out += '"';
     } else {
         out += value;
     }
