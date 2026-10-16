@@ -11,7 +11,7 @@ on real one-hour, 5–10-speaker meetings and on an 8 GB Mac.
 ## Install from DMG
 
 The packaged app requires **Apple Silicon and macOS 26 or later**. Open
-`Transcriber-0.2.5-arm64.dmg`, drag Transcriber into Applications, and open it.
+`Transcriber-0.3.0-arm64.dmg`, drag Transcriber into Applications, and open it.
 Homebrew, Python, and developer tools are not required on the destination Mac.
 
 On first launch, choose **Скачать и начать**. Turbo Q5 and the shared speech/voice

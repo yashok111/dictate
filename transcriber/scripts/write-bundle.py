@@ -20,8 +20,8 @@ with (bundle / "Contents/Info.plist").open("wb") as target:
             "CFBundleName": "Расшифровки",
             "CFBundleIconFile": "AppIcon",
             "CFBundlePackageType": "APPL",
-            "CFBundleVersion": "7",
-            "CFBundleShortVersionString": "0.2.5",
+            "CFBundleVersion": "8",
+            "CFBundleShortVersionString": "0.3.0",
             # Both modes compile the app for macOS 26 (build-app.sh `-target arm64-apple-macosx26.0`):
             # a lower floor let LaunchServices start a dev build that then fails to launch.
             "LSMinimumSystemVersion": "26.0",
