@@ -1,12 +1,12 @@
 # dictate — native macOS dictation (AVFoundation capture + whisper.cpp)
 # Links against Homebrew's libwhisper/libggml; needs Xcode CLT for the frameworks.
 
-# Resolve Homebrew prefixes only when a goal actually needs them — `make clean` / `make test`
-# don't (the unit tests link no whisper/ggml) — and fail early with an actionable message if a
-# dependency is missing. Resolve unless EVERY goal is brew-free; the default no-goal build and
+# Resolve Homebrew prefixes only when a goal actually needs them — `make clean` / `make test` /
+# `make tidy` don't (the unit tests link no whisper/ggml) — and fail early with an actionable
+# message if a dependency is missing. Resolve unless EVERY goal is brew-free; the default no-goal build and
 # any mac-only goal mixed in (e.g. `make test tsan`) still resolve. `$(or …,build)` makes the
 # no-goal case look like a real build target.
-ifneq ($(filter-out clean test,$(or $(MAKECMDGOALS),build)),)
+ifneq ($(filter-out clean test tidy,$(or $(MAKECMDGOALS),build)),)
 WHISPER := $(shell brew --prefix whisper-cpp 2>/dev/null)
 GGML    := $(shell brew --prefix ggml 2>/dev/null)
 ifeq ($(WHISPER),)
@@ -117,8 +117,21 @@ test: $(TEST_BIN)
 
 -include $(TEST_OBJS:.o=.d)
 
+# ── clang-tidy over the portable C++ (config: .clang-tidy) ───────────────────────
+# The test TUs pull in every src/dictate_*.h and transcriber/core header; c_api.cpp covers
+# policy.h. Same flags as the test build, so it runs wherever `make test` does (CI included).
+# Warnings are errors. dictate.mm needs the macOS SDK and is not covered. One clang-tidy per
+# TU, so `make -j tidy` runs them in parallel (~50 s serial).
+CLANG_TIDY ?= clang-tidy
+TIDY_SRCS  := $(wildcard tests/test_*.cpp) $(wildcard transcriber/core/*.cpp)
+
+tidy: $(TIDY_SRCS:%=tidy/%)
+
+tidy/%:
+	@$(CLANG_TIDY) --quiet $* -- -std=c++17 -pthread -I src -I tests
+
 clean:
 	rm -f $(BIN) $(BIN)-tsan $(BIN)-asan $(TEST_BIN) tests/*.o tests/*.d
 	rm -rf $(BIN).dSYM $(BIN)-tsan.dSYM $(BIN)-asan.dSYM $(TEST_BIN).dSYM
 
-.PHONY: build sign run post-build-check deploy clean tsan asan test
+.PHONY: build sign run post-build-check deploy clean tsan asan test tidy

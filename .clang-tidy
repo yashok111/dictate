@@ -1,0 +1,20 @@
+# clang-tidy for the portable C++ (src/dictate_*.h, transcriber/core) — `make tidy`, run in CI.
+# dictate.mm needs the macOS SDK and is not covered here.
+#
+# Disabled as noise on this code base (measured 2026-10-16, 0 real defects among them):
+#   bugprone-signed-bitwise          byte shifts in the WAV / UTF-8 / JSON decoders (85 hits)
+#   performance-enum-size            small enums; the int underlying type costs nothing here
+#   bugprone-easily-swappable-parameters, bugprone-narrowing-conversions
+#                                    flag most of the arithmetic helpers, never a real swap
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  clang-analyzer-*,
+  -bugprone-signed-bitwise,
+  -performance-enum-size,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions
+WarningsAsErrors: '*'
+# Paths arrive relative (`-I src`, `tests/../transcriber/core/…`); tests/doctest.h stays out.
+HeaderFilterRegex: '(^|/)(src|transcriber/core)/'

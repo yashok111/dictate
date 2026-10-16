@@ -32,7 +32,7 @@ inline std::string utf8_sanitize(const std::string &s) {
         if (c < 0x80) n = 1;
         else if (c >= 0xC2 && c <= 0xDF) n = 2;
         else if (c == 0xE0) { n = 3; lo = 0xA0; }                // no overlongs
-        else if (c >= 0xE1 && c <= 0xEC) n = 3;
+        else if (c >= 0xE1 && c <= 0xEC) n = 3;  // NOLINT(bugprone-branch-clone): one arm per UTF-8 lead range
         else if (c == 0xED) { n = 3; hi = 0x9F; }                // no surrogates
         else if (c >= 0xEE && c <= 0xEF) n = 3;
         else if (c == 0xF0) { n = 4; lo = 0x90; }
