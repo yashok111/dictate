@@ -9,7 +9,7 @@ LDFLAGS := -L$(WHISPER)/lib -L$(GGML)/lib \
  -Wl,-rpath,$(WHISPER)/lib -Wl,-rpath,$(GGML)/lib \
  -framework Foundation -framework AVFoundation -framework CoreMedia -framework AudioToolbox
 
-.PHONY: worker release-worker test test-pipeline
+.PHONY: worker release-worker test test-pipeline analyze
 worker: build/transcriber-worker
 release-worker: build/release/transcriber-worker
 build/release/transcriber-worker: native/worker.mm native/forced_alignment.h core/ctc_alignment.h native/speaker_cache.h native/prepared_audio.h native/transcript_rows.h native/vad_filter.h core/policy.h core/asr_words.h core/diarization.h core/vad.h ../src/dictate_dict.h ../src/dictate_text.h Makefile
@@ -26,3 +26,8 @@ test-pipeline: build/test-pipeline
 test: worker test-pipeline
 	python3 tests/test_worker.py
 	python3 tests/test_prepared_pipeline.py
+
+# Clang Static Analyzer over worker.mm (same flags as the top-level `make analyze`; needs the
+# same .deps as `make worker` — scripts/setup-deps.py).
+analyze: native/worker.mm
+	clang++ $(CXXFLAGS) --analyze -Xclang -analyzer-output=text -Xclang -analyzer-werror $< -o /dev/null
