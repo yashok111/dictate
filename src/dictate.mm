@@ -107,7 +107,11 @@ static std::string default_sock_path(void) {
     std::string dir = sock_dir_path();
     return dir.empty() ? std::string("/tmp/dictate.sock") : dir + "/dictate.sock";   // no HOME: last resort
 }
-static const std::string SOCK_PATH_S = getenv("DICTATE_SOCK") ? getenv("DICTATE_SOCK") : default_sock_path();
+static std::string sock_path_from_env(void) {
+    const char *s = getenv("DICTATE_SOCK");
+    return s ? std::string(s) : default_sock_path();
+}
+static const std::string SOCK_PATH_S = sock_path_from_env();
 static const char *SOCK_PATH  = SOCK_PATH_S.c_str();
 // The daemon's and the editor's stdout/stderr logs live in the same owner-only directory: a fixed
 // /tmp path let another local user pre-create or symlink it (F087, F024). Computed once at startup
@@ -1164,8 +1168,9 @@ static bool mkdir_private(const std::string &path) {
 // (the /tmp fallbacks are then in use) — false only when the directory cannot be made safe.
 static bool ensure_data_dir(void) {
     std::string dir = sock_dir_path();
-    if (dir.empty()) return true;
-    std::string local = std::string(getenv("HOME")) + "/.local", share = local + "/share";
+    const char *home = getenv("HOME");
+    if (dir.empty() || !home) return true;
+    std::string local = std::string(home) + "/.local", share = local + "/share";
     if (!mkdir_owner(local) || !mkdir_owner(share) || !mkdir_private(dir)) return false;
     struct stat ds;
     return stat(dir.c_str(), &ds) == 0 && S_ISDIR(ds.st_mode) && ds.st_uid == geteuid();
@@ -2966,9 +2971,10 @@ static int ensure_daemon(void) {
             // waits out the load — bounded now: a load hung on a stalled volume hung `start` with
             // it, forever (F099). And only a real "pong" counts as up.
             struct timeval tv{DAEMON_READY_SEC,0}; setsockopt(d,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-            write_all(d,"ping\n",5); char b[8]; ssize_t r=read(d,b,sizeof(b)); close(d);
+            write_all(d,"ping\n",5); char b[8]; ssize_t r=read(d,b,sizeof(b));
+            int rerr=errno; close(d);   // close() may overwrite errno
             if (r>=4 && !memcmp(b,"pong",4)) return 0;
-            if (r<0 && (errno==EAGAIN||errno==EWOULDBLOCK)) return -1;   // the load did not finish in time
+            if (r<0 && (rerr==EAGAIN||rerr==EWOULDBLOCK)) return -1;   // the load did not finish in time
         }
         struct timespec ts{0,DAEMON_POLL_NS}; nanosleep(&ts,nullptr);
     }
@@ -3701,9 +3707,10 @@ int main(int argc, char **argv) {
         signal(SIGPIPE, SIG_IGN);   // never die on a broken pipe (socket peer or stdout consumer gone)
         log_init_tz();              // cache the UTC offset before anything can log (see slog)
         const char *home=getenv("HOME");
-        std::string modelPath = getenv("WHISPER_MODEL") ? getenv("WHISPER_MODEL")
+        const char *envModel=getenv("WHISPER_MODEL"), *envLang=getenv("WHISPER_LANG");
+        std::string modelPath = envModel ? envModel
             : std::string(home?home:".")+"/.config/whisper/ggml-large-v3-turbo-q5_0.bin";
-        g_lang = getenv("WHISPER_LANG") ? getenv("WHISPER_LANG") : "ru";
+        g_lang = envLang ? envLang : "ru";
         g_nthreads = default_threads();
 
         // Silero VAD model (kills the silence hallucination). Default to v6.2.0 — the
@@ -3711,7 +3718,7 @@ int main(int argc, char **argv) {
         // older v5.1.2 file if only that one is on disk (older installs / a rollback via
         // WHISPER_VAD_MODEL). Disable with WHISPER_VAD=0; skip if absent.
         std::string vadPath;
-        if (getenv("WHISPER_VAD_MODEL")) vadPath = getenv("WHISPER_VAD_MODEL");
+        if (const char *envVad = getenv("WHISPER_VAD_MODEL")) vadPath = envVad;
         else {
             std::string dir = std::string(home?home:".")+"/.config/whisper/";
             struct stat vs0;
@@ -3730,7 +3737,8 @@ int main(int argc, char **argv) {
         // the path; WHISPER_PROMPT_MAXTOK tunes the ~224-token budget down if turbo loops (gotcha #11).
         const char *promptOff = getenv("WHISPER_PROMPT");
         if (!(promptOff && !strcmp(promptOff,"0"))) {
-            std::string dictPath = getenv("WHISPER_DICT") ? getenv("WHISPER_DICT")
+            const char *envDict = getenv("WHISPER_DICT");
+            std::string dictPath = envDict ? envDict
                 : std::string(home?home:".")+"/.config/whisper/dictionary.txt";
             std::ifstream df(dictPath);
             if (df) {
