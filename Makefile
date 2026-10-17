@@ -89,6 +89,16 @@ tsan: $(SRC) $(HDRS) Makefile
 asan: $(SRC) $(HDRS) Makefile
 	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer -g $(SRC) -o $(BIN)-asan $(LDFLAGS)
 
+# Clang Static Analyzer over dictate.mm (macOS only: needs the SDK + brew headers). Default
+# checkers — core, C++, deadcode, nullability, osx/Cocoa (retain/release, NSError), security,
+# unix (malloc, pthread) — on paths asan/tsan only see when a run reaches them. Path notes go
+# to stderr; any finding fails the target (-analyzer-werror). No binary, no plist report.
+# `make -C transcriber analyze` does the same for the transcriber's worker.mm.
+ANALYZE_FLAGS := --analyze -Xclang -analyzer-output=text -Xclang -analyzer-werror
+
+analyze: $(SRC) $(HDRS) Makefile
+	$(CXX) $(CXXFLAGS) $(ANALYZE_FLAGS) $(SRC) -o /dev/null
+
 # ── Unit tests (doctest; skill: cpp-testing) ─────────────────────────────────────
 # Compiles the pure-logic units extracted into src/dictate_*.h against the doctest
 # harness. Deliberately links NO whisper/ggml/AVFoundation/AppKit — the tested logic is
@@ -134,4 +144,4 @@ clean:
 	rm -f $(BIN) $(BIN)-tsan $(BIN)-asan $(TEST_BIN) tests/*.o tests/*.d
 	rm -rf $(BIN).dSYM $(BIN)-tsan.dSYM $(BIN)-asan.dSYM $(TEST_BIN).dSYM
 
-.PHONY: build sign run post-build-check deploy clean tsan asan test tidy
+.PHONY: build sign run post-build-check deploy clean tsan asan analyze test tidy
